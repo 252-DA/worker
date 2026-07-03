@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-worker"
+version = "0.1.0"
+description = "Async document processing workers for the chunking pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "document-chunk",
+    "bullmq>=2.0.0",
+    "redis>=5.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.scripts]
+document-worker = "worker.runners.document_worker:main"
+enrichment-worker = "worker.runners.enrichment_worker:main"
+outbox-worker = "worker.runners.outbox_worker:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.11.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+document-chunk = { path = "../packages-ai", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["worker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+asyncio_mode = "auto"
+addopts = "-v --cov=worker --cov-report=term-missing"

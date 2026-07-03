@@ -1,0 +1,54 @@
+# Standalone compose for worker services only.
+# Assumes infra (postgres, redis, qdrant, minio) is already running.
+# Usage: docker compose -f docker-compose.worker.yml up
+services:
+  document-worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    command: ["worker.runners.document_worker"]
+    env_file:
+      - ../packages-ai/.env
+    environment:
+      WORKER_TYPE: document
+      WORKER_CONCURRENCY: "3"
+      HEALTH_PORT: "8081"
+      METRICS__PORT: "9091"
+    ports:
+      - "8081:8081"
+      - "9091:9091"
+    restart: unless-stopped
+
+  enrichment-worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    command: ["worker.runners.enrichment_worker"]
+    env_file:
+      - ../packages-ai/.env
+    environment:
+      WORKER_TYPE: enrichment
+      WORKER_CONCURRENCY: "4"
+      HEALTH_PORT: "8082"
+      METRICS__PORT: "9092"
+    ports:
+      - "8082:8082"
+      - "9092:9092"
+    restart: unless-stopped
+
+  outbox-worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    command: ["worker.runners.outbox_worker"]
+    env_file:
+      - ../packages-ai/.env
+    environment:
+      WORKER_TYPE: outbox
+      WORKER_CONCURRENCY: "1"
+      HEALTH_PORT: "8083"
+      METRICS__PORT: "9093"
+    ports:
+      - "8083:8083"
+      - "9093:9093"
+    restart: unless-stopped
