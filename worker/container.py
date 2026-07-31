@@ -49,7 +49,7 @@ def build_metadata_store(settings: WorkerSettings) -> IMetadataStore:
         logger.warning("worker_container.init", component="NoopMetadataStore", reason="sql.disabled")
         return NoopMetadataStore()
     logger.debug("worker_container.init", component="PostgresMetadataStore")
-    return PostgresMetadataStore(settings.sql, settings.outbox)
+    return PostgresMetadataStore(settings.sql)
 
 
 def build_graph_store(settings: WorkerSettings) -> IGraphStore:
@@ -96,13 +96,48 @@ def build_vector_store(settings: WorkerSettings) -> QdrantAdapter:
 
 
 def build_llm_client(settings: WorkerSettings):
-    provider = settings.llm.provider
-    if provider == "gemini":
-        from document_chunk.adapters.llm.gemini_llm_client import GeminiLLMClient
+    from ai_runtime import AIRuntime, ModelConfig, build_model_client
+    from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
 
-        logger.debug("worker_container.init", component="GeminiLLMClient")
-        return GeminiLLMClient(settings.llm)
-    raise ValueError(f"Unknown LLM provider: {provider}")
+    if settings.llm.provider not in {"gemini", "openai-compatible", "deepseek"}:
+        raise ValueError(f"Unknown LLM provider: {settings.llm.provider}")
+
+    logger.debug(
+        "worker_container.init",
+        component="AIRuntimeLLMClient",
+        provider=settings.llm.provider,
+    )
+    model = build_model_client(
+        ModelConfig(
+            provider=settings.llm.provider,
+            model=settings.llm.model,
+            api_key=settings.llm.api_key,
+            base_url=settings.llm.base_url,
+            temperature=settings.llm.temperature,
+            timeout_seconds=settings.llm.timeout_seconds,
+            max_retries=settings.llm.max_retries,
+        )
+    )
+    return AIRuntimeLLMClient(AIRuntime(model))
+
+
+def build_learning_context_client(settings: WorkerSettings):
+    if not settings.learning_context_mcp.enabled:
+        return None
+
+    from ai_runtime.mcp import LearningContextClient, MCPToolClient
+
+    logger.debug(
+        "worker_container.init",
+        component="LearningContextClient",
+        url=settings.learning_context_mcp.url,
+    )
+    return LearningContextClient(
+        MCPToolClient(
+            url=settings.learning_context_mcp.url,
+            timeout_seconds=settings.learning_context_mcp.timeout_seconds,
+        )
+    )
 
 
 def build_job_queue(settings: WorkerSettings) -> BullMQAdapter:
@@ -146,6 +181,24 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
         )
 
 
+class CurriculumQuizContainer(BaseWorkerContainer):
+    """Dependencies for synchronous or queued curriculum-aware quiz generation."""
+
+    def __init__(self, settings: WorkerSettings) -> None:
+        super().__init__(settings)
+        from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
+
+        self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
+        self.llm_client = self._track("llm_client", build_llm_client(settings))
+        self.context_client = build_learning_context_client(settings)
+        self.generate_curriculum_quiz_use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=self.llm_client,
+            context_client=self.context_client,
+            fallback_to_local_context=settings.learning_context_mcp.fallback_to_local,
+        )
+
+
 class OutboxWorkerContainer(BaseWorkerContainer):
     """Build only the dependencies needed by the outbox projector worker."""
 
@@ -173,3 +226,9 @@ def build_enrichment_container(
 
 def build_outbox_container(settings: WorkerSettings | None = None) -> OutboxWorkerContainer:
     return OutboxWorkerContainer(settings or get_worker_settings("outbox"))
+
+
+def build_curriculum_quiz_container(
+    settings: WorkerSettings | None = None,
+) -> CurriculumQuizContainer:
+    return CurriculumQuizContainer(settings or get_worker_settings())

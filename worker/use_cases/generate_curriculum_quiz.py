@@ -2,10 +2,11 @@
 GenerateCurriculumQuizUseCase — generate quiz items aligned to a specific LO/chapter/assessment.
 
 Sibling to RunEnrichmentUseCase (course-scoped, not document-scoped).
-Runs synchronously in MVP (called from gRPC handler).
+Used by the queued content-generation worker and the legacy synchronous adapter.
 """
 import uuid
 from dataclasses import dataclass
+from typing import Protocol
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -28,6 +29,19 @@ _QUIZ_SCHEMA_HINT = (
     '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard",'
     '"lo_alignment_rationale":"..."}]}'
 )
+
+
+class QuizContextClient(Protocol):
+    def retrieve_quiz_context(
+        self,
+        course_id: str,
+        lo_code: str,
+        query: str | None = None,
+        bloom_level: str | None = None,
+        assessment_style: str = "quiz",
+        top_k: int = 5,
+    ):
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +118,14 @@ class GenerateCurriculumQuizUseCase:
         metadata_store: IMetadataStore,
         llm_client: ILLMClient,
         max_context_chars: int = 6000,
+        context_client: QuizContextClient | None = None,
+        fallback_to_local_context: bool = True,
     ) -> None:
         self._metadata_store = metadata_store
         self._llm_client = llm_client
         self._max_context_chars = max_context_chars
+        self._context_client = context_client
+        self._fallback_to_local_context = fallback_to_local_context
 
     def execute(
         self, request: GenerateCurriculumQuizRequest
@@ -141,29 +159,25 @@ class GenerateCurriculumQuizUseCase:
         if lo_obj is None:
             return Err(ProcessingError(f"LO {primary_lo_id} not found in curriculum"))
 
-        # 3. Fetch supporting chunks
-        chunks_result = self._metadata_store.list_chunks_for_lo(primary_lo_id)
-        if chunks_result.is_err():
-            return Err(chunks_result.error)
-
-        chunks = chunks_result.unwrap()
+        bloom = str(request.bloom_level or lo_obj.bloom_level or "understand")
+        context_result = self._load_context(
+            request=request,
+            primary_lo_id=primary_lo_id,
+            lo_code=lo_obj.code,
+            lo_statement=lo_obj.statement_vi,
+            bloom=bloom,
+        )
+        if context_result.is_err():
+            return Err(context_result.error)
+        context_parts, source_chunk_ids, source_document_id = context_result.unwrap()
+        if not context_parts or not source_chunk_ids or not source_document_id:
+            return Err(
+                ProcessingError(
+                    f"No grounded source chunks available for learning outcome {primary_lo_id}"
+                )
+            )
 
         # 4. Build prompt
-        context_parts: list[str] = []
-        total_chars = 0
-        source_chunk_ids: list[str] = []
-        for i, chunk in enumerate(chunks[:5], start=1):
-            text = chunk.content_text or ""
-            if not text.strip():
-                continue
-            snippet = f"[{i}] (chunk_id={chunk.chunk_id})\n{text[:1200]}"
-            if total_chars + len(snippet) > self._max_context_chars:
-                break
-            context_parts.append(snippet)
-            source_chunk_ids.append(chunk.chunk_id)
-            total_chars += len(snippet)
-
-        bloom = request.bloom_level or lo_obj.bloom_level or "understand"
         prompt = self._build_prompt(
             course_title=stored_course.title_vi,
             lo_code=lo_obj.code,
@@ -192,17 +206,21 @@ class GenerateCurriculumQuizUseCase:
         question_ids: list[str] = []
         stored_items: list[StoredQuizItem] = []
 
-        dummy_doc_id = f"_curriculum_{request.course_id}"
-        dummy_chunk_id = source_chunk_ids[0] if source_chunk_ids else f"_lo_{primary_lo_id}"
+        primary_chunk_id = source_chunk_ids[0]
 
         for idx, q in enumerate(payload.questions[: request.count]):
             qid = str(uuid.uuid4())
             question_ids.append(qid)
+            valid_source_ids = tuple(
+                source_id
+                for source_id in q.source_chunk_ids
+                if source_id in source_chunk_ids
+            )
             item = StoredQuizItem(
                 question_id=qid,
-                document_id=dummy_doc_id,
-                primary_chunk_id=dummy_chunk_id,
-                source_chunk_ids=tuple(q.source_chunk_ids or source_chunk_ids[:3]),
+                document_id=source_document_id,
+                primary_chunk_id=primary_chunk_id,
+                source_chunk_ids=valid_source_ids or tuple(source_chunk_ids[:3]),
                 heading_path=(),
                 question=q.question,
                 choices=tuple(q.choices),
@@ -214,25 +232,18 @@ class GenerateCurriculumQuizUseCase:
             )
             stored_items.append(item)
 
-        # Persist individually (not grouped by document like run_enrichment)
-        # Use upsert with lo_id via raw SQL workaround: store in standard quiz_items
-        # and rely on extra columns added in schema
-        persist_result = self._metadata_store.persist_enrichment_batch(
-            document_id=dummy_doc_id,
-            lesson_cards=[],
+        persist_result = self._metadata_store.persist_curriculum_quiz_items(
+            lo_id=primary_lo_id,
+            bloom_level=bloom,
             quiz_items=stored_items,
-            concepts=[],
-            chunk_concepts=[],
         )
         if persist_result.is_err():
-            logger.warning(
+            logger.error(
                 "generate_curriculum_quiz.persist_failed",
                 lo_id=primary_lo_id,
                 error=str(persist_result.error),
             )
-
-        # Update lo_id column separately (best-effort)
-        self._set_lo_id_on_quiz_items(question_ids, primary_lo_id, bloom)
+            return Err(persist_result.error)
 
         logger.info(
             "generate_curriculum_quiz.done",
@@ -247,6 +258,84 @@ class GenerateCurriculumQuizUseCase:
             question_ids=question_ids,
         ))
 
+    def _load_context(
+        self,
+        request: GenerateCurriculumQuizRequest,
+        primary_lo_id: str,
+        lo_code: str,
+        lo_statement: str,
+        bloom: str,
+    ) -> Result[tuple[list[str], list[str], str | None], Exception]:
+        if self._context_client is not None:
+            try:
+                context = self._context_client.retrieve_quiz_context(
+                    course_id=request.course_id,
+                    lo_code=lo_code,
+                    query=lo_statement,
+                    bloom_level=bloom,
+                    assessment_style=request.style,
+                    top_k=5,
+                )
+                parts: list[str] = []
+                source_ids: list[str] = []
+                source_document_id: str | None = None
+                total_chars = 0
+                for index, chunk in enumerate(context.chunks, start=1):
+                    content = chunk.content.strip()
+                    if not content:
+                        continue
+                    snippet = (
+                        f"[{index}] (chunk_id={chunk.chunk_id}, "
+                        f"page={chunk.page_number or 'n/a'})\n{content}"
+                    )
+                    if parts and total_chars + len(snippet) > self._max_context_chars:
+                        break
+                    parts.append(snippet)
+                    source_ids.append(chunk.chunk_id)
+                    source_document_id = source_document_id or chunk.document_id
+                    total_chars += len(snippet)
+                if parts:
+                    logger.info(
+                        "generate_curriculum_quiz.context.mcp",
+                        lo_id=primary_lo_id,
+                        chunks=len(parts),
+                    )
+                    return Ok((parts, source_ids, source_document_id))
+            except Exception as exc:
+                if not self._fallback_to_local_context:
+                    return Err(
+                        ProcessingError(
+                            "MCP quiz-context retrieval failed",
+                            cause=exc,
+                        )
+                    )
+                logger.warning(
+                    "generate_curriculum_quiz.context.mcp_failed",
+                    lo_id=primary_lo_id,
+                    error=str(exc),
+                )
+
+        chunks_result = self._metadata_store.list_chunks_for_lo(primary_lo_id)
+        if chunks_result.is_err():
+            return Err(chunks_result.error)
+
+        context_parts: list[str] = []
+        total_chars = 0
+        source_chunk_ids: list[str] = []
+        source_document_id: str | None = None
+        for index, chunk in enumerate(chunks_result.unwrap()[:5], start=1):
+            text = (chunk.content_text or "").strip()
+            if not text:
+                continue
+            snippet = f"[{index}] (chunk_id={chunk.chunk_id})\n{text[:1200]}"
+            if context_parts and total_chars + len(snippet) > self._max_context_chars:
+                break
+            context_parts.append(snippet)
+            source_chunk_ids.append(chunk.chunk_id)
+            source_document_id = source_document_id or chunk.document_id
+            total_chars += len(snippet)
+        return Ok((context_parts, source_chunk_ids, source_document_id))
+
     def _resolve_lo_ids(
         self, request: GenerateCurriculumQuizRequest
     ) -> Result[list[str], Exception]:
@@ -256,7 +345,19 @@ class GenerateCurriculumQuizUseCase:
 
         if kind == "lo":
             full_code = code if code.startswith("L.O.") else f"L.O.{code}"
-            return Ok([f"{course_id}:{full_code}"])
+            curriculum_result = self._metadata_store.get_curriculum(course_id)
+            if curriculum_result.is_err():
+                return Err(curriculum_result.error)
+            curriculum = curriculum_result.unwrap()
+            if curriculum is None:
+                return Ok([])
+            _, _, learning_outcomes, _ = curriculum
+            matching = [
+                lo.lo_id
+                for lo in learning_outcomes
+                if lo.code == full_code or lo.lo_id == code
+            ]
+            return Ok(matching)
 
         if kind == "chapter":
             result = self._metadata_store.list_los_by_chapter(course_id, code)
@@ -310,23 +411,3 @@ class GenerateCurriculumQuizUseCase:
             '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard",'
             '"lo_alignment_rationale":"...","source_chunk_ids":["..."]}]}'
         )
-
-    def _set_lo_id_on_quiz_items(
-        self,
-        question_ids: list[str],
-        lo_id: str,
-        bloom_level: str | None,
-    ) -> None:
-        """Best-effort: update lo_id/bloom_level columns added by ALTER TABLE."""
-        try:
-            store = self._metadata_store
-            # Only works for PostgresMetadataStore — skip gracefully for noop
-            with store._connection() as conn:  # type: ignore[attr-defined]
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        "UPDATE quiz_items SET lo_id = %s, bloom_level = %s WHERE id = %s;",
-                        [(lo_id, bloom_level, qid) for qid in question_ids],
-                    )
-                conn.commit()
-        except Exception as exc:
-            logger.warning("generate_curriculum_quiz.lo_id_update_failed", error=str(exc))

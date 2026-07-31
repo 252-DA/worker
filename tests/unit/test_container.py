@@ -18,6 +18,7 @@ from worker.container import (
     build_file_storage,
     build_graph_store,
     build_job_queue,
+    build_learning_context_client,
     build_llm_client,
     build_metadata_store,
     build_outbox_container,
@@ -127,14 +128,27 @@ class TestBuildFunctions:
     def test_build_llm_client_gemini(self):
         settings = WorkerSettings()
         client = build_llm_client(settings)
-        from document_chunk.adapters.llm.gemini_llm_client import GeminiLLMClient
-        assert isinstance(client, GeminiLLMClient)
+        from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
+
+        assert isinstance(client, AIRuntimeLLMClient)
 
     def test_build_llm_client_unknown_provider_raises(self):
         settings = WorkerSettings()
         settings.core.llm.provider = "unknown"
         with pytest.raises(ValueError, match="Unknown LLM provider"):
             build_llm_client(settings)
+
+    def test_learning_context_client_disabled_by_default(self):
+        settings = WorkerSettings()
+        assert build_learning_context_client(settings) is None
+
+    def test_learning_context_client_enabled(self):
+        settings = WorkerSettings()
+        settings.learning_context_mcp.enabled = True
+        client = build_learning_context_client(settings)
+        from ai_runtime.mcp import LearningContextClient
+
+        assert isinstance(client, LearningContextClient)
 
     def test_build_job_queue(self):
         settings = WorkerSettings()

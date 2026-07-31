@@ -8,7 +8,7 @@ from document_chunk.infrastructure.config import Settings as CoreSettings
 
 
 class WorkerRuntimeConfig(BaseSettings):
-    type: Literal["document", "enrichment", "outbox"] = "document"
+    type: Literal["document", "enrichment", "outbox", "content_generation"] = "document"
     concurrency: int = 3
     shutdown_grace_seconds: float = 30.0
     service_name: str | None = None
@@ -28,9 +28,21 @@ class HealthConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HEALTH_")
 
 
+class LearningContextMcpConfig(BaseSettings):
+    enabled: bool = False
+    url: str = "http://mcp-server:8001/mcp"
+    timeout_seconds: float = 30
+    fallback_to_local: bool = True
+
+    model_config = SettingsConfigDict(env_prefix="LEARNING_CONTEXT_MCP_")
+
+
 class WorkerSettings(BaseSettings):
     worker: WorkerRuntimeConfig = Field(default_factory=WorkerRuntimeConfig)
     health: HealthConfig = Field(default_factory=HealthConfig)
+    learning_context_mcp: LearningContextMcpConfig = Field(
+        default_factory=LearningContextMcpConfig
+    )
     core: CoreSettings = Field(default_factory=CoreSettings)
 
     model_config = SettingsConfigDict(
@@ -65,10 +77,6 @@ class WorkerSettings(BaseSettings):
         return self.core.redis
 
     @property
-    def outbox(self):
-        return self.core.outbox
-
-    @property
     def parser(self):
         return self.core.parser
 
@@ -94,7 +102,15 @@ class WorkerSettings(BaseSettings):
 
 
 @lru_cache
-def get_worker_settings(worker_type: Literal["document", "enrichment", "outbox"] | None = None) -> WorkerSettings:
+def get_worker_settings(
+    worker_type: Literal[
+        "document",
+        "enrichment",
+        "outbox",
+        "content_generation",
+    ]
+    | None = None,
+) -> WorkerSettings:
     settings = WorkerSettings()
     if worker_type is None or settings.worker.type == worker_type:
         return settings

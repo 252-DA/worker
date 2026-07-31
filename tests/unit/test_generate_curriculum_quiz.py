@@ -1,6 +1,7 @@
 """
 Tests for worker/use_cases/generate_curriculum_quiz.py.
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from document_chunk.domain.ports.metadata_store import (
@@ -71,7 +72,7 @@ class TestGenerateCurriculumQuizUseCase:
                 content_text="AI là một lĩnh vực của khoa học máy tính.",
             )
         ])
-        mock_metadata_store.persist_enrichment_batch.return_value = Ok(None)
+        mock_metadata_store.persist_curriculum_quiz_items.return_value = Ok(None)
         mock_llm_client.model_id = "gemini-test"
         mock_llm_client.generate.return_value = Ok(
             '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
@@ -123,8 +124,15 @@ class TestGenerateCurriculumQuizUseCase:
             )],
             [],
         ))
-        mock_metadata_store.list_chunks_for_lo.return_value = Ok([])
-        mock_metadata_store.persist_enrichment_batch.return_value = Ok(None)
+        mock_metadata_store.list_chunks_for_lo.return_value = Ok([
+            StoredChunkMetadata(
+                chunk_id="chunk-chapter",
+                document_id="doc-chapter",
+                chunk_index=0,
+                content_text="Nội dung của chương.",
+            )
+        ])
+        mock_metadata_store.persist_curriculum_quiz_items.return_value = Ok(None)
         mock_llm_client.model_id = "gemini-test"
         mock_llm_client.generate.return_value = Ok(
             '{"questions":[{"question":"Q?","choices":["W","X","Y","Z"],'
@@ -226,3 +234,115 @@ class TestGenerateCurriculumQuizUseCase:
         )
 
         assert result.is_err()
+
+    def test_uses_mcp_context_and_filters_unknown_source_ids(
+        self,
+        mock_metadata_store,
+        mock_llm_client,
+    ):
+        lo_id = "course-001:L.O.1.1"
+        mock_metadata_store.get_curriculum.return_value = Ok((
+            StoredCourse(course_id="course-001", code="CS101", title_vi="Nhập môn AI"),
+            [],
+            [StoredLearningOutcome(
+                lo_id=lo_id,
+                course_id="course-001",
+                code="L.O.1.1",
+                parent_code=None,
+                statement_vi="Hiểu khái niệm AI",
+                bloom_level="understand",
+            )],
+            [],
+        ))
+        mock_metadata_store.persist_curriculum_quiz_items.return_value = Ok(None)
+        mock_llm_client.model_id = "gemini-test"
+        mock_llm_client.generate.return_value = Ok(
+            '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
+            '"correct_index":0,"explanation":"...","difficulty":"easy",'
+            '"lo_alignment_rationale":"...","source_chunk_ids":'
+            '["hallucinated","chunk-mcp"]}]}'
+        )
+        context_client = MagicMock()
+        context_client.retrieve_quiz_context.return_value = SimpleNamespace(
+            chunks=[
+                SimpleNamespace(
+                    chunk_id="chunk-mcp",
+                    document_id="doc-mcp",
+                    page_number=7,
+                    content="Grounded MCP context",
+                )
+            ]
+        )
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+            context_client=context_client,
+        )
+
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001",
+                target_kind="lo",
+                target_code="L.O.1.1",
+                count=1,
+            )
+        )
+
+        assert result.is_ok()
+        persist_kwargs = (
+            mock_metadata_store.persist_curriculum_quiz_items.call_args.kwargs
+        )
+        assert persist_kwargs["lo_id"] == lo_id
+        assert persist_kwargs["quiz_items"][0].source_chunk_ids == ("chunk-mcp",)
+        assert "Grounded MCP context" in mock_llm_client.generate.call_args.args[0]
+
+    def test_quiz_persistence_failure_is_returned(
+        self,
+        mock_metadata_store,
+        mock_llm_client,
+    ):
+        lo_id = "course-001:L.O.1.1"
+        mock_metadata_store.get_curriculum.return_value = Ok((
+            StoredCourse(course_id="course-001", code="CS101", title_vi="Nhập môn AI"),
+            [],
+            [StoredLearningOutcome(
+                lo_id=lo_id,
+                course_id="course-001",
+                code="L.O.1.1",
+                parent_code=None,
+                statement_vi="Hiểu khái niệm AI",
+                bloom_level="understand",
+            )],
+            [],
+        ))
+        mock_metadata_store.list_chunks_for_lo.return_value = Ok([
+            StoredChunkMetadata(
+                chunk_id="chunk-001",
+                document_id="doc-001",
+                chunk_index=0,
+                content_text="AI là một lĩnh vực của khoa học máy tính.",
+            )
+        ])
+        mock_metadata_store.persist_curriculum_quiz_items.return_value = Err(
+            RuntimeError("database unavailable")
+        )
+        mock_llm_client.generate.return_value = Ok(
+            '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
+            '"correct_index":0,"explanation":"...","difficulty":"easy",'
+            '"lo_alignment_rationale":"..."}]}'
+        )
+
+        result = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+        ).execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001",
+                target_kind="lo",
+                target_code="L.O.1.1",
+                count=1,
+            )
+        )
+
+        assert result.is_err()
+        assert "database unavailable" in str(result.error)

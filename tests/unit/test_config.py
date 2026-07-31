@@ -8,6 +8,7 @@ import pytest
 
 from worker.config import (
     HealthConfig,
+    LearningContextMcpConfig,
     WorkerRuntimeConfig,
     WorkerSettings,
     get_worker_settings,
@@ -47,11 +48,20 @@ class TestHealthConfig:
         assert cfg.port == 8081
 
 
+class TestLearningContextMcpConfig:
+    def test_defaults(self):
+        cfg = LearningContextMcpConfig()
+        assert cfg.enabled is False
+        assert cfg.url.endswith("/mcp")
+        assert cfg.fallback_to_local is True
+
+
 class TestWorkerSettings:
     def test_default_creation(self):
         settings = WorkerSettings()
         assert settings.worker is not None
         assert settings.health is not None
+        assert settings.learning_context_mcp is not None
         assert settings.core is not None
         assert settings.app.log_level == "INFO"
 
@@ -63,7 +73,6 @@ class TestWorkerSettings:
         assert settings.sql is settings.core.sql
         assert settings.neo4j is settings.core.neo4j
         assert settings.redis is settings.core.redis
-        assert settings.outbox is settings.core.outbox
         assert settings.parser is settings.core.parser
         assert settings.chunker is settings.core.chunker
         assert settings.embedder is settings.core.embedder

@@ -1,3 +1,4 @@
+from document_chunk.domain.outbox_events import OutboxEventType
 from document_chunk.domain.ports.metadata_store import IngestionStatus, StoredChunkMetadata
 from document_chunk.shared.result import Err, Ok
 
@@ -70,7 +71,10 @@ class TestRunEnrichmentUseCase:
         lesson_cards = persist_kwargs["lesson_cards"]
         quiz_items = persist_kwargs["quiz_items"]
         assert persist_kwargs["document_id"] == sample_document.id
-        assert persist_kwargs["outbox_event_type"] == "concept_graph_project"
+        assert (
+            persist_kwargs["outbox_event_type"]
+            == OutboxEventType.CONCEPT_GRAPH_PROJECT
+        )
         assert lesson_cards[0].document_id == sample_document.id
         assert lesson_cards[0].source_chunk_ids == ("chunk-001", "chunk-002")
         assert lesson_cards[0].heading_path == ("Giải tích", "Đạo hàm")

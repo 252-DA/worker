@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "document-chunk",
+    "ai-runtime-sdk[gemini,openai]",
     "bullmq>=2.0.0",
     "redis>=5.0.0",
     "pydantic-settings>=2.0.0",
@@ -20,6 +21,7 @@ dependencies = [
 document-worker = "worker.runners.document_worker:main"
 enrichment-worker = "worker.runners.enrichment_worker:main"
 outbox-worker = "worker.runners.outbox_worker:main"
+content-generation-worker = "worker.runners.content_generation_worker:main"
 
 [dependency-groups]
 dev = [
@@ -34,6 +36,7 @@ default-groups = ["dev"]
 
 [tool.uv.sources]
 document-chunk = { path = "../packages-ai", editable = true }
+ai-runtime-sdk = { path = "../ai-sdk", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["."]

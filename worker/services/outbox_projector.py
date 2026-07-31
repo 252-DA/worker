@@ -1,22 +1,32 @@
+from document_chunk.domain.entities.document import DocumentType
+from document_chunk.domain.outbox_events import (
+    OutboxEventType,
+    OutboxRelayEvent,
+    normalize_outbox_event_type,
+)
 from document_chunk.domain.ports.graph_store import (
     GraphChunk,
     GraphChunkConcept,
     GraphConcept,
+    GraphDocument,
     IGraphStore,
 )
-from document_chunk.domain.ports.metadata_store import IMetadataStore, IngestionStatus, OutboxEvent
+from document_chunk.domain.ports.metadata_store import IMetadataStore, IngestionStatus
 from document_chunk.domain.ports.vector_store import IVectorStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 logger = get_logger(__name__)
 
-_EVENT_HEADING_GRAPH_PROJECT = "heading_graph_project"
-_EVENT_CONCEPT_GRAPH_PROJECT = "concept_graph_project"
-_EVENT_DOCUMENT_DELETED = "document_deleted"
-
 
 class OutboxProjector:
+    """Apply one outbox relay event to the appropriate derived store.
+
+    PostgreSQL outbox ownership belongs to the Core API relay. This service only
+    consumes durable BullMQ jobs, so it must never fetch or mutate outbox rows.
+    BullMQ owns retries for projection failures.
+    """
+
     def __init__(
         self,
         metadata_store: IMetadataStore,
@@ -27,124 +37,127 @@ class OutboxProjector:
         self._graph_store = graph_store
         self._vector_store = vector_store
 
-    def run_once(self, limit: int = 100) -> Result[int, Exception]:
-        pending_result = self._metadata_store.fetch_pending_outbox(limit=limit)
-        if pending_result.is_err():
-            return pending_result
+    def process(self, event: OutboxRelayEvent) -> Result[None, Exception]:
+        try:
+            event_type = normalize_outbox_event_type(event.event_type)
 
-        processed = 0
-        for event in pending_result.unwrap():
-            result = self._process_event(event)
-            if result.is_err():
-                logger.error("outbox_projector.event_failed", event_id=event.id, error=str(result.error))
-            else:
-                processed += 1
+            if event_type == OutboxEventType.HEADING_GRAPH_PROJECT:
+                return self._project_headings(event)
+            if event_type == OutboxEventType.CONCEPT_GRAPH_PROJECT:
+                return self._project_concepts(event)
+            if event_type == OutboxEventType.DOCUMENT_DELETED:
+                return self._delete_document(event)
+            if event_type == OutboxEventType.LESSON_PUBLISHED:
+                logger.info(
+                    "outbox_projector.lesson_published_noop",
+                    event_id=event.event_id,
+                    aggregate_id=event.aggregate_id,
+                )
+                return Ok(None)
 
-        return Ok(processed)
+            return Err(
+                ValueError(
+                    f"outbox event {event_type.value!r} is not supported by the projection worker"
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return Err(ValueError(f"invalid outbox relay event {event.event_id}: {exc}"))
 
-    def _process_event(self, event: OutboxEvent) -> Result[None, Exception]:
-        if event.event_type == _EVENT_HEADING_GRAPH_PROJECT:
-            return self._project_headings(event)
-        if event.event_type == _EVENT_CONCEPT_GRAPH_PROJECT:
-            return self._project_concepts(event)
-        if event.event_type == _EVENT_DOCUMENT_DELETED:
-            return self._delete_document(event)
-
-        done_result = self._metadata_store.mark_outbox_done(event.id)
-        if done_result.is_err():
-            return done_result
-        return Ok(None)
-
-    def _project_headings(self, event: OutboxEvent) -> Result[None, Exception]:
+    def _project_headings(self, event: OutboxRelayEvent) -> Result[None, Exception]:
         payload = event.payload
-        ensure_result = self._ensure_document_still_exists(event, payload["document_id"])
+        document_id = self._required_string(payload, "document_id")
+        ensure_result = self._ensure_document_still_exists(document_id)
         if ensure_result.is_err():
             return ensure_result
         if ensure_result.unwrap() is False:
             return Ok(None)
 
         chunks_payload = payload.get("chunks", [])
-        chunks = [
-            GraphChunk(
-                chunk_id=item["chunk_id"],
-                chunk_index=item["chunk_index"],
-                heading_path=tuple(item.get("heading_path", [])),
-            )
-            for item in chunks_payload
-        ]
+        if not isinstance(chunks_payload, list):
+            return Err(ValueError("heading projection payload.chunks must be a list"))
 
-        upsert_result = self._graph_store.upsert_heading_graph(
-            document_id=payload["document_id"],
-            course_id=payload.get("course_id"),
-            owner_id=payload.get("owner_id"),
+        try:
+            document = GraphDocument(
+                document_id=document_id,
+                document_name=self._required_string(payload, "document_name"),
+                doc_type=DocumentType(self._required_string(payload, "doc_type").lower()),
+            )
+            chunks = [
+                GraphChunk(
+                    chunk_id=self._required_string(item, "chunk_id"),
+                    chunk_index=int(item["chunk_index"]),
+                    heading_path=tuple(item.get("heading_path", [])),
+                    page_number=item.get("page_number"),
+                    language=item.get("language"),
+                )
+                for item in chunks_payload
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            return Err(ValueError(f"invalid heading projection payload: {exc}"))
+
+        return self._graph_store.upsert_heading_graph(
+            document=document,
+            course_id=self._optional_string(payload, "course_id"),
+            owner_id=self._optional_string(payload, "owner_id"),
             chunks=chunks,
         )
-        if upsert_result.is_err():
-            fail_result = self._metadata_store.mark_outbox_failed(
-                event.id,
-                str(upsert_result.error),
-            )
-            if fail_result.is_err():
-                return fail_result
-            return Err(upsert_result.error)
 
-        done_result = self._metadata_store.mark_outbox_done(event.id)
-        if done_result.is_err():
-            return done_result
-        return Ok(None)
-
-    def _delete_document(self, event: OutboxEvent) -> Result[None, Exception]:
-        document_id = event.payload["document_id"]
+    def _delete_document(self, event: OutboxRelayEvent) -> Result[None, Exception]:
+        try:
+            document_id = self._required_string(event.payload, "document_id")
+        except (TypeError, ValueError) as exc:
+            return Err(exc)
 
         vector_result = self._vector_store.delete_by_document(document_id)
         if vector_result.is_err():
-            fail_result = self._metadata_store.mark_outbox_failed(event.id, str(vector_result.error))
-            if fail_result.is_err():
-                return fail_result
-            return Err(vector_result.error)
+            return vector_result
 
-        graph_result = self._graph_store.delete_document(document_id)
-        if graph_result.is_err():
-            fail_result = self._metadata_store.mark_outbox_failed(event.id, str(graph_result.error))
-            if fail_result.is_err():
-                return fail_result
-            return Err(graph_result.error)
+        return self._graph_store.delete_document(document_id)
 
-        done_result = self._metadata_store.mark_outbox_done(event.id)
-        if done_result.is_err():
-            return done_result
-        return Ok(None)
-
-    def _project_concepts(self, event: OutboxEvent) -> Result[None, Exception]:
+    def _project_concepts(self, event: OutboxRelayEvent) -> Result[None, Exception]:
         payload = event.payload
-        document_id = payload["document_id"]
-        ensure_result = self._ensure_document_still_exists(event, document_id)
+        try:
+            document_id = self._required_string(payload, "document_id")
+        except (TypeError, ValueError) as exc:
+            return Err(exc)
+
+        ensure_result = self._ensure_document_still_exists(document_id)
         if ensure_result.is_err():
             return ensure_result
         if ensure_result.unwrap() is False:
             return Ok(None)
 
-        concepts = [
-            GraphConcept(
-                concept_id=item["concept_id"],
-                name=item["name"],
-                canonical_name=item["canonical_name"],
-                slug=item["slug"],
-                category=item.get("category", "other"),
-                language=item.get("language"),
-                domain=item.get("domain"),
-            )
-            for item in payload.get("concepts", [])
-        ]
-        mentions = [
-            GraphChunkConcept(
-                chunk_id=item["chunk_id"],
-                concept_id=item["concept_id"],
-                confidence=float(item.get("confidence", 1.0)),
-                source=item.get("source", "heading"),
-            )
-            for item in payload.get("mentions", [])
-        ]
+        concepts_payload = payload.get("concepts", [])
+        mentions_payload = payload.get("mentions", [])
+        if not isinstance(concepts_payload, list):
+            return Err(ValueError("concept projection payload.concepts must be a list"))
+        if not isinstance(mentions_payload, list):
+            return Err(ValueError("concept projection payload.mentions must be a list"))
+
+        try:
+            concepts = [
+                GraphConcept(
+                    concept_id=self._required_string(item, "concept_id"),
+                    name=self._required_string(item, "name"),
+                    canonical_name=self._required_string(item, "canonical_name"),
+                    slug=self._required_string(item, "slug"),
+                    category=str(item.get("category") or "other"),
+                    language=self._optional_string(item, "language"),
+                    domain=self._optional_string(item, "domain"),
+                )
+                for item in concepts_payload
+            ]
+            mentions = [
+                GraphChunkConcept(
+                    chunk_id=self._required_string(item, "chunk_id"),
+                    concept_id=self._required_string(item, "concept_id"),
+                    confidence=float(item.get("confidence", 1.0)),
+                    source=str(item.get("source") or "heading"),
+                )
+                for item in mentions_payload
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            return Err(ValueError(f"invalid concept projection payload: {exc}"))
 
         upsert_result = self._graph_store.upsert_concept_graph(
             document_id=document_id,
@@ -152,26 +165,15 @@ class OutboxProjector:
             mentions=mentions,
         )
         if upsert_result.is_err():
-            fail_result = self._metadata_store.mark_outbox_failed(event.id, str(upsert_result.error))
-            if fail_result.is_err():
-                return fail_result
-            return Err(upsert_result.error)
+            return upsert_result
 
-        status_result = self._metadata_store.update_document_status(
+        return self._metadata_store.update_document_status(
             document_id,
             IngestionStatus.ENRICHED,
         )
-        if status_result.is_err():
-            return status_result
-
-        done_result = self._metadata_store.mark_outbox_done(event.id)
-        if done_result.is_err():
-            return done_result
-        return Ok(None)
 
     def _ensure_document_still_exists(
         self,
-        event: OutboxEvent,
         document_id: str,
     ) -> Result[bool, Exception]:
         context_result = self._metadata_store.get_document_context(document_id)
@@ -181,7 +183,27 @@ class OutboxProjector:
         if context_result.unwrap() is not None:
             return Ok(True)
 
-        done_result = self._metadata_store.mark_outbox_done(event.id)
-        if done_result.is_err():
-            return done_result
+        logger.info(
+            "outbox_projector.stale_document_skipped",
+            document_id=document_id,
+        )
         return Ok(False)
+
+    @staticmethod
+    def _required_string(payload: dict, key: str) -> str:
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be an object")
+
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"payload.{key} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _optional_string(payload: dict, key: str) -> str | None:
+        value = payload.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"payload.{key} must be a string or null")
+        return value

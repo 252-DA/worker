@@ -1,24 +1,67 @@
-"""
-Outbox worker — polls PostgreSQL outbox and projects derived-store updates.
+"""BullMQ worker for outbox-driven graph and vector projections.
 
 Run:
     python -m worker.runners.outbox_worker
 """
+
 import asyncio
 
+from bullmq.custom_errors import UnrecoverableError
+
+from document_chunk.domain.outbox_events import OutboxRelayEvent
+from document_chunk.domain.ports.job_queue import OUTBOX_RELAY_QUEUE_NAME
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
 from worker.container import build_outbox_container
 from worker.runtime import (
+    build_redis_options,
     install_signal_handlers,
     maybe_start_health_server,
     setup_worker_runtime,
     shutdown_runtime,
-    sleep_until_stop,
 )
 
 logger = get_logger(__name__)
+
+
+async def _process_job(container, bull_job, job_token):
+    del job_token
+
+    try:
+        event = OutboxRelayEvent.from_mapping(bull_job.data)
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.error(
+            "outbox_worker.invalid_event",
+            job_id=getattr(bull_job, "id", None),
+            error=str(exc),
+        )
+        raise UnrecoverableError(f"invalid outbox relay event: {exc}") from exc
+
+    result = await asyncio.to_thread(container.outbox_projector.process, event)
+    if result.is_err():
+        error = result.error
+        logger.error(
+            "outbox_worker.projection_failed",
+            event_id=event.event_id,
+            event_type=event.event_type.value,
+            error=str(error),
+        )
+        if isinstance(error, (KeyError, TypeError, ValueError)):
+            raise UnrecoverableError(f"invalid outbox projection event: {error}") from error
+        raise error
+
+    logger.info(
+        "outbox_worker.event_completed",
+        event_id=event.event_id,
+        event_type=event.event_type.value,
+        aggregate_id=event.aggregate_id,
+    )
+    return {
+        "event_id": event.event_id,
+        "event_type": event.event_type.value,
+        "aggregate_id": event.aggregate_id,
+    }
 
 
 async def _main() -> None:
@@ -29,31 +72,30 @@ async def _main() -> None:
     stop_event = asyncio.Event()
     install_signal_handlers(stop_event)
 
+    from bullmq import Worker
+
+    worker = Worker(
+        OUTBOX_RELAY_QUEUE_NAME,
+        lambda job, job_token: _process_job(container, job, job_token),
+        {
+            "connection": build_redis_options(settings),
+            "concurrency": settings.worker.concurrency,
+        },
+    )
     logger.info(
         "outbox_worker.started",
-        batch_size=settings.outbox.batch_size,
-        poll_interval_seconds=settings.outbox.poll_interval_seconds,
+        queue=OUTBOX_RELAY_QUEUE_NAME,
+        concurrency=settings.worker.concurrency,
     )
 
     try:
-        while not stop_event.is_set():
-            result = container.outbox_projector.run_once(limit=settings.outbox.batch_size)
-            if result.is_err():
-                logger.error("outbox_worker.poll_failed", error=str(result.error))
-            else:
-                processed = result.unwrap()
-                if processed:
-                    logger.info("outbox_worker.batch_processed", processed=processed)
-
-            await sleep_until_stop(
-                stop_event,
-                timeout_seconds=settings.outbox.poll_interval_seconds,
-            )
+        await stop_event.wait()
     finally:
         await shutdown_runtime(
             stop_event=stop_event,
             container=container,
             health_server=health_server,
+            bullmq_worker=worker,
             timeout_seconds=settings.worker.shutdown_grace_seconds,
         )
 

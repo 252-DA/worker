@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from document_chunk.domain.exceptions import ProcessingError
+from document_chunk.domain.outbox_events import OutboxEventType
 from document_chunk.domain.ports.llm_client import ILLMClient
 from document_chunk.domain.ports.metadata_store import (
     IMetadataStore,
@@ -31,8 +32,6 @@ from document_chunk.shared.tracing import get_tracer
 
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
-
-_EVENT_CONCEPT_GRAPH_PROJECT = "concept_graph_project"
 
 _CARDS_SYSTEM_PROMPT = (
     "You are a teaching assistant that creates concise micro-learning lesson cards. "
@@ -187,10 +186,10 @@ class RunEnrichmentUseCase:
                         return self._fail_to_done(document_id, quiz_result.error)
                     quiz_items.extend(quiz_result.unwrap())
 
-                event_type: str | None = None
+                event_type: OutboxEventType | None = None
                 outbox_payload: dict | None = None
                 if concepts or mentions:
-                    event_type = _EVENT_CONCEPT_GRAPH_PROJECT
+                    event_type = OutboxEventType.CONCEPT_GRAPH_PROJECT
                     outbox_payload = {
                         "document_id": document_id,
                         "concepts": [

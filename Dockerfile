@@ -15,8 +15,12 @@ WORKDIR /app
 COPY --from=uv /uv /uvx /bin/
 
 # Copy packages-ai as editable dependency
-COPY packages-ai/pyproject.toml packages-ai/uv.lock* /app/packages-ai/
+COPY packages-ai/pyproject.toml packages-ai/uv.lock* packages-ai/README.md /app/packages-ai/
 COPY packages-ai/src/ /app/packages-ai/src/
+
+# Copy shared AI runtime SDK
+COPY ai-sdk/pyproject.toml ai-sdk/README.md /app/ai-sdk/
+COPY ai-sdk/src/ /app/ai-sdk/src/
 
 # Copy worker
 COPY worker/pyproject.toml worker/uv.lock /app/worker/
