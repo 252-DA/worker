@@ -5,29 +5,26 @@ Sibling to RunEnrichmentUseCase (course-scoped, not document-scoped).
 Used by the queued content-generation worker and the legacy synchronous adapter.
 """
 import uuid
-from dataclasses import dataclass
 from typing import Protocol
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 
+from document_chunk.application.dto.generation_dto import (
+    GenerateCurriculumQuizRequest,
+    GenerateCurriculumQuizResponse,
+)
+from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.ports.llm_client import ILLMClient
 from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredQuizItem
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
-from worker.use_cases._llm_json import generate_structured_payload
 
 logger = get_logger(__name__)
 
 _QUIZ_SYSTEM_PROMPT = (
     "You are an assessment writer for a university course. "
     "Return strict JSON only."
-)
-
-_QUIZ_SCHEMA_HINT = (
-    '{"questions":[{"question":"...","choices":["...","...","...","..."],'
-    '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard",'
-    '"lo_alignment_rationale":"..."}]}'
 )
 
 
@@ -84,28 +81,6 @@ class _CurriculumQuestion(BaseModel):
 
 class _CurriculumQuizPayload(BaseModel):
     questions: list[_CurriculumQuestion] = Field(min_length=1)
-
-
-# ---------------------------------------------------------------------------
-# Request / Response
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GenerateCurriculumQuizRequest:
-    course_id: str
-    target_kind: str    # "lo" | "chapter" | "assessment"
-    target_code: str
-    style: str = "quiz" # "quiz" | "midterm" | "final"
-    bloom_level: str | None = None
-    count: int = 5
-
-
-@dataclass
-class GenerateCurriculumQuizResponse:
-    course_id: str
-    lo_id: str
-    quiz_count: int
-    question_ids: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +170,6 @@ class GenerateCurriculumQuizUseCase:
             prompt=prompt,
             system=_QUIZ_SYSTEM_PROMPT,
             schema_model=_CurriculumQuizPayload,
-            repair_schema_hint=_QUIZ_SCHEMA_HINT,
         )
         if payload_result.is_err():
             return Err(payload_result.error)
@@ -322,7 +296,7 @@ class GenerateCurriculumQuizUseCase:
         context_parts: list[str] = []
         total_chars = 0
         source_chunk_ids: list[str] = []
-        source_document_id: str | None = None
+        local_document_id: str | None = None
         for index, chunk in enumerate(chunks_result.unwrap()[:5], start=1):
             text = (chunk.content_text or "").strip()
             if not text:
@@ -332,9 +306,9 @@ class GenerateCurriculumQuizUseCase:
                 break
             context_parts.append(snippet)
             source_chunk_ids.append(chunk.chunk_id)
-            source_document_id = source_document_id or chunk.document_id
+            local_document_id = local_document_id or chunk.document_id
             total_chars += len(snippet)
-        return Ok((context_parts, source_chunk_ids, source_document_id))
+        return Ok((context_parts, source_chunk_ids, local_document_id))
 
     def _resolve_lo_ids(
         self, request: GenerateCurriculumQuizRequest

@@ -6,14 +6,14 @@ Enrichment stays asynchronous and retryable:
 
 If enrichment fails, document status falls back to DONE so search remains available.
 """
-import json
 import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 
+from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.outbox_events import OutboxEventType
 from document_chunk.domain.ports.llm_client import ILLMClient
@@ -41,7 +41,6 @@ _QUIZ_SYSTEM_PROMPT = (
     "You are an assessment writer that creates multiple-choice questions from academic content. "
     "Return strict JSON only."
 )
-_REPAIR_SYSTEM_PROMPT = "You repair malformed model outputs into strict JSON."
 
 
 class _GeneratedCard(BaseModel):
@@ -369,7 +368,8 @@ class RunEnrichmentUseCase:
         section: _SectionContext,
     ) -> Result[list[StoredLessonCard], Exception]:
         prompt = self._build_cards_prompt(section)
-        payload_result = self._generate_structured_payload(
+        payload_result = generate_structured_payload(
+            llm_client=self._llm_client,
             prompt=prompt,
             system=_CARDS_SYSTEM_PROMPT,
             schema_model=_GeneratedCardsPayload,
@@ -402,7 +402,8 @@ class RunEnrichmentUseCase:
         section: _SectionContext,
     ) -> Result[list[StoredQuizItem], Exception]:
         prompt = self._build_quiz_prompt(section)
-        payload_result = self._generate_structured_payload(
+        payload_result = generate_structured_payload(
+            llm_client=self._llm_client,
             prompt=prompt,
             system=_QUIZ_SYSTEM_PROMPT,
             schema_model=_GeneratedQuizPayload,
@@ -431,51 +432,6 @@ class RunEnrichmentUseCase:
                 for index, question in enumerate(payload.questions)
             ]
         )
-
-    def _generate_structured_payload(
-        self,
-        prompt: str,
-        system: str,
-        schema_model: type[BaseModel],
-        repair_schema_name: str,
-    ) -> Result[BaseModel, Exception]:
-        first_result = self._llm_client.generate(prompt, system=system)
-        if first_result.is_err():
-            return Err(first_result.error)
-
-        parsed_result = self._parse_model_output(first_result.unwrap(), schema_model)
-        if parsed_result.is_ok():
-            return parsed_result
-
-        repair_prompt = self._build_repair_prompt(
-            invalid_output=first_result.unwrap(),
-            schema_name=repair_schema_name,
-        )
-        repair_result = self._llm_client.generate(repair_prompt, system=_REPAIR_SYSTEM_PROMPT)
-        if repair_result.is_err():
-            return Err(repair_result.error)
-
-        repaired_parse_result = self._parse_model_output(repair_result.unwrap(), schema_model)
-        if repaired_parse_result.is_ok():
-            return repaired_parse_result
-
-        return Err(
-            ProcessingError(
-                f"LLM returned invalid {repair_schema_name} JSON after one repair attempt",
-                cause=repaired_parse_result.error,
-            )
-        )
-
-    def _parse_model_output(
-        self,
-        raw_text: str,
-        schema_model: type[BaseModel],
-    ) -> Result[BaseModel, Exception]:
-        try:
-            payload = json.loads(self._extract_json_block(raw_text))
-            return Ok(schema_model.model_validate(payload))
-        except (json.JSONDecodeError, ValidationError) as exc:
-            return Err(ProcessingError("Invalid structured output from LLM", cause=exc))
 
     def _build_cards_prompt(self, section: _SectionContext) -> str:
         heading_path = " > ".join(section.heading_path)
@@ -509,20 +465,6 @@ class RunEnrichmentUseCase:
             f"{section.content_text}"
         )
 
-    def _build_repair_prompt(self, invalid_output: str, schema_name: str) -> str:
-        schema_hint = (
-            '{"cards":[{"title":"...","bullets":["..."],"key_insight":"..."}]}'
-            if schema_name == "cards"
-            else '{"questions":[{"question":"...","choices":["...","...","...","..."],'
-            '"correct_index":0,"explanation":"...","difficulty":"easy"}]}'
-        )
-        return (
-            "Rewrite the following content into strict JSON only.\n"
-            f"Target schema ({schema_name}): {schema_hint}\n"
-            "Do not add markdown fences or explanations.\n\n"
-            f"{invalid_output}"
-        )
-
     def _effective_heading_path(self, chunk: StoredChunkMetadata) -> tuple[str, ...]:
         if chunk.heading_path:
             return chunk.heading_path
@@ -531,16 +473,9 @@ class RunEnrichmentUseCase:
     def _chunk_text(self, chunk: StoredChunkMetadata) -> str:
         if chunk.content_text and chunk.content_text.strip():
             return chunk.content_text.strip()
-        if chunk.enriched_content and chunk.enriched_content.strip():
-            return chunk.enriched_content.strip()
+        if chunk.embedding_input and chunk.embedding_input.strip():
+            return chunk.embedding_input.strip()
         return ""
-
-    def _extract_json_block(self, raw_text: str) -> str:
-        trimmed = raw_text.strip()
-        fenced_match = re.search(r"```(?:json)?\s*(.*?)```", trimmed, flags=re.DOTALL)
-        if fenced_match:
-            return fenced_match.group(1).strip()
-        return trimmed
 
     def _fail_to_done(self, document_id: str, error: Exception) -> Result[RunEnrichmentResponse, Exception]:
         self._metadata_store.update_document_status(
