@@ -20,7 +20,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Tái tạo layout ~/DA: worker/ và packages-ai/ nằm cạnh nhau
+      # Tái tạo layout ~/DA: worker/, packages-ai/ và ai-sdk/ nằm cạnh nhau
       - uses: actions/checkout@v4
         with:
           path: worker
@@ -31,6 +31,10 @@ jobs:
           ref: dev
           ssh-key: ${{ secrets.CORE_CHUNKING_DEPLOY_KEY }}
           path: packages-ai
+
+      - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
+        with:
+          path: ai-sdk
 
       - uses: astral-sh/setup-uv@v5
 
@@ -58,6 +62,10 @@ jobs:
           ref: dev
           ssh-key: ${{ secrets.CORE_CHUNKING_DEPLOY_KEY }}
           path: packages-ai
+
+      - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
+        with:
+          path: ai-sdk
 
       - uses: docker/build-push-action@v6
         with:
