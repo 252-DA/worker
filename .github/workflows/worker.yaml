@@ -25,11 +25,8 @@ jobs:
         with:
           path: worker
 
-      - uses: actions/checkout@v4
+      - uses: 252-DA/core-chunking/.github/actions/materialize@a82c16963c8cebb79d543e31e1a328d18ad78e0e
         with:
-          repository: 252-DA/core-chunking
-          ref: dev
-          ssh-key: ${{ secrets.CORE_CHUNKING_DEPLOY_KEY }}
           path: packages-ai
 
       - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
@@ -56,11 +53,8 @@ jobs:
         with:
           path: worker
 
-      - uses: actions/checkout@v4
+      - uses: 252-DA/core-chunking/.github/actions/materialize@a82c16963c8cebb79d543e31e1a328d18ad78e0e
         with:
-          repository: 252-DA/core-chunking
-          ref: dev
-          ssh-key: ${{ secrets.CORE_CHUNKING_DEPLOY_KEY }}
           path: packages-ai
 
       - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
