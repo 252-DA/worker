@@ -7,6 +7,7 @@ Enrichment stays asynchronous and retryable:
 If enrichment fails, document status falls back to DONE so search remains available.
 """
 import re
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field, field_validator
 from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.outbox_events import OutboxEventType
-from document_chunk.domain.ports.llm_client import ILLMClient
+from document_chunk.domain.ports.llm_client import ILLMClient, LLMUsage
 from document_chunk.domain.ports.metadata_store import (
     IMetadataStore,
     IngestionStatus,
@@ -28,6 +29,8 @@ from document_chunk.domain.ports.metadata_store import (
 )
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
+
+from worker.llm_role import LlmRole
 from document_chunk.shared.tracing import get_tracer
 
 logger = get_logger(__name__)
@@ -130,16 +133,34 @@ class RunEnrichmentResponse:
     quiz_count: int
 
 
+# llm_usage_logs.status CHECK chỉ nhận ba giá trị này, phân biệt hoa thường.
+_USAGE_OK = "OK"
+_USAGE_ERROR = "ERROR"
+
+
+class _UsageAccumulator:
+    """Cộng dồn token của mọi lần gọi trong một bước, kể cả lần sửa JSON."""
+
+    def __init__(self) -> None:
+        self.total = LLMUsage()
+
+    def __call__(self, usage: LLMUsage) -> None:
+        self.total = self.total + usage
+
+
 class RunEnrichmentUseCase:
     def __init__(
         self,
         metadata_store: IMetadataStore,
         llm_client: ILLMClient,
         max_section_chars: int = 6000,
+        llm_provider: str = "unknown",
+        llm_profile: str | None = None,
     ) -> None:
         self._metadata_store = metadata_store
         self._llm_client = llm_client
         self._max_section_chars = max_section_chars
+        self._role = LlmRole(client=llm_client, provider=llm_provider, profile=llm_profile)
 
     def execute(self, request: RunEnrichmentRequest) -> Result[RunEnrichmentResponse, Exception]:
         document_id = request.document_id
@@ -407,12 +428,21 @@ class RunEnrichmentUseCase:
         section: _SectionContext,
     ) -> Result[list[StoredLessonCard], Exception]:
         prompt = self._build_cards_prompt(section)
+        started = time.monotonic()
+        usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._llm_client,
             prompt=prompt,
             system=_CARDS_SYSTEM_PROMPT,
             schema_model=_GeneratedCardsPayload,
             repair_schema_name="cards",
+            on_usage=usage,
+        )
+        self._log_usage(
+            use_case="enrichment_cards",
+            status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            usage=usage.total,
         )
         if payload_result.is_err():
             return Err(payload_result.error)
@@ -441,12 +471,21 @@ class RunEnrichmentUseCase:
         section: _SectionContext,
     ) -> Result[list[StoredQuizItem], Exception]:
         prompt = self._build_quiz_prompt(section)
+        started = time.monotonic()
+        usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._llm_client,
             prompt=prompt,
             system=_QUIZ_SYSTEM_PROMPT,
             schema_model=_GeneratedQuizPayload,
             repair_schema_name="quiz",
+            on_usage=usage,
+        )
+        self._log_usage(
+            use_case="enrichment_quiz",
+            status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            usage=usage.total,
         )
         if payload_result.is_err():
             return Err(payload_result.error)
@@ -471,6 +510,40 @@ class RunEnrichmentUseCase:
                 for index, question in enumerate(payload.questions)
             ]
         )
+
+    def _log_usage(
+        self,
+        *,
+        use_case: str,
+        status: str,
+        latency_ms: int,
+        usage: LLMUsage,
+    ) -> None:
+        """
+        Ghi chi phí/độ trễ, không bao giờ chặn enrichment.
+
+        Trước đây đường enrichment không ghi dòng nào vào ``llm_usage_logs``,
+        nên toàn bộ token của đường sinh tự động — đường chạy mỗi lần ingest —
+        không được đo. ``course_id`` để None: enrichment làm việc trên document
+        và section, khoá học chỉ suy ra được qua LO của từng chunk.
+        """
+        result = self._metadata_store.record_llm_usage(
+            provider=self._role.provider,
+            model=self._role.model_id,
+            use_case=use_case,
+            status=status,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            cost_usd=usage.cost_usd,
+            latency_ms=latency_ms,
+        )
+        if result.is_err():
+            logger.warning(
+                "run_enrichment.usage_log_failed",
+                use_case=use_case,
+                profile=self._role.profile,
+                error=str(result.error),
+            )
 
     def _build_cards_prompt(self, section: _SectionContext) -> str:
         heading_path = " > ".join(section.heading_path)
