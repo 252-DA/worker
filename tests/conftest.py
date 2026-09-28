@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.support import as_llm_client
 from document_chunk.domain.entities.chunk import Chunk, ChunkMetadata
 from document_chunk.domain.entities.document import Document, DocumentType, ElementType, ParsedDocument, Section
 from document_chunk.domain.entities.embedding import Embedding
@@ -187,6 +188,7 @@ def mock_metadata_store(
     store.upsert_chunk_concepts.return_value = Ok(None)
     store.persist_enrichment_batch.return_value = Ok("event-001")
     store.persist_curriculum_quiz_items.return_value = Ok(None)
+    store.record_llm_usage.return_value = Ok(None)
     store.list_lesson_cards.return_value = Ok([])
     store.list_quiz_items.return_value = Ok([])
     store.get.return_value = Ok(sample_document)
@@ -217,4 +219,4 @@ def mock_job_queue() -> MagicMock:
 def mock_llm_client() -> MagicMock:
     client = MagicMock()
     client.model_id = "gemini-test"
-    return client
+    return as_llm_client(client)

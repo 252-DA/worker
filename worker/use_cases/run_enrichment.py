@@ -173,17 +173,56 @@ class RunEnrichmentUseCase:
 
                 lesson_cards: list[StoredLessonCard] = []
                 quiz_items: list[StoredQuizItem] = []
+                failed_sections: list[str] = []
 
+                # O1: một section lỗi thì bỏ qua section đó, không huỷ cả tài
+                # liệu. Trước đây lỗi ở section thứ n làm mất toàn bộ card/quiz
+                # của n-1 section trước đó, sau khi bản nháp cũ đã bị soft-delete.
                 for section in sections:
+                    section_label = " / ".join(section.heading_path) or f"section {len(failed_sections) + 1}"
+
                     cards_result = self._generate_cards(section)
                     if cards_result.is_err():
-                        return self._fail_to_done(document_id, cards_result.error)
-                    lesson_cards.extend(cards_result.unwrap())
+                        failed_sections.append(section_label)
+                        logger.warning(
+                            "run_enrichment.section_cards_failed",
+                            document_id=document_id,
+                            section=section_label,
+                            error=str(cards_result.error),
+                        )
+                    else:
+                        lesson_cards.extend(cards_result.unwrap())
 
                     quiz_result = self._generate_quiz(section)
                     if quiz_result.is_err():
-                        return self._fail_to_done(document_id, quiz_result.error)
-                    quiz_items.extend(quiz_result.unwrap())
+                        if section_label not in failed_sections:
+                            failed_sections.append(section_label)
+                        logger.warning(
+                            "run_enrichment.section_quiz_failed",
+                            document_id=document_id,
+                            section=section_label,
+                            error=str(quiz_result.error),
+                        )
+                    else:
+                        quiz_items.extend(quiz_result.unwrap())
+
+                # Mọi section đều hỏng: không có gì để lưu, và ghi đè bản nháp cũ
+                # bằng rỗng thì tệ hơn là dừng lại báo lỗi.
+                if sections and len(failed_sections) == len(sections):
+                    return self._fail_to_done(
+                        document_id,
+                        ProcessingError(
+                            f"Tất cả {len(sections)} section đều sinh lỗi; "
+                            f"không ghi đè nội dung đang có."
+                        ),
+                    )
+                if failed_sections:
+                    logger.warning(
+                        "run_enrichment.partial",
+                        document_id=document_id,
+                        failed_sections=len(failed_sections),
+                        total_sections=len(sections),
+                    )
 
                 event_type: OutboxEventType | None = None
                 outbox_payload: dict | None = None

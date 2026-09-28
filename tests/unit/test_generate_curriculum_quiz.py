@@ -294,7 +294,12 @@ class TestGenerateCurriculumQuizUseCase:
         )
         assert persist_kwargs["lo_id"] == lo_id
         assert persist_kwargs["quiz_items"][0].source_chunk_ids == ("chunk-mcp",)
-        assert "Grounded MCP context" in mock_llm_client.generate.call_args.args[0]
+        # The verifier pass (added alongside Reflexion) also calls generate(), so
+        # check every call rather than assuming the quiz prompt is the last one.
+        assert any(
+            "Grounded MCP context" in call.args[0]
+            for call in mock_llm_client.generate.call_args_list
+        )
 
     def test_quiz_persistence_failure_is_returned(
         self,
@@ -346,3 +351,234 @@ class TestGenerateCurriculumQuizUseCase:
 
         assert result.is_err()
         assert "database unavailable" in str(result.error)
+
+
+class TestVerifyAndRefine:
+    """Chain-of-Verification + Reflexion pass added between generation and persistence."""
+
+    def _curriculum_ok(self, mock_metadata_store, lo_id, source_text="Some source text."):
+        mock_metadata_store.get_curriculum.return_value = Ok((
+            StoredCourse(course_id="course-001", code="CS101", title_vi="Nhập môn AI"),
+            [],
+            [StoredLearningOutcome(
+                lo_id=lo_id,
+                course_id="course-001",
+                code="L.O.1.1",
+                parent_code=None,
+                statement_vi="Hiểu khái niệm AI",
+                bloom_level="understand",
+            )],
+            [],
+        ))
+        mock_metadata_store.list_chunks_for_lo.return_value = Ok([
+            StoredChunkMetadata(
+                chunk_id="chunk-001",
+                document_id="doc-001",
+                chunk_index=0,
+                content_text=source_text,
+            )
+        ])
+        mock_metadata_store.persist_curriculum_quiz_items.return_value = Ok(None)
+
+    def test_verifier_passes_through_when_all_supported(
+        self, mock_metadata_store, mock_llm_client
+    ):
+        lo_id = "course-001:L.O.1.1"
+        self._curriculum_ok(mock_metadata_store, lo_id)
+        mock_llm_client.model_id = "gemini-test"
+        mock_llm_client.generate.side_effect = [
+            Ok(
+                '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
+                '"correct_index":0,"explanation":"...","difficulty":"easy"}]}'
+            ),
+            Ok('{"verdicts":[{"question_index":0,"verdict":"supported","reason":"ok"}]}'),
+        ]
+
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+        )
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001", target_kind="lo", target_code="L.O.1.1", count=1,
+            )
+        )
+
+        assert result.is_ok()
+        # generate() + verify() only — a supported verdict never triggers a regen call.
+        assert mock_llm_client.generate.call_count == 2
+        persisted = mock_metadata_store.persist_curriculum_quiz_items.call_args.kwargs[
+            "quiz_items"
+        ]
+        assert persisted[0].question == "AI là gì?"
+
+    def test_reflexion_regenerates_failing_question(
+        self, mock_metadata_store, mock_llm_client
+    ):
+        lo_id = "course-001:L.O.1.1"
+        self._curriculum_ok(
+            mock_metadata_store, lo_id, "Dijkstra requires non-negative edge weights."
+        )
+        mock_llm_client.model_id = "gemini-test"
+        mock_llm_client.generate.side_effect = [
+            Ok(
+                '{"questions":[{"question":"Does Dijkstra allow negative weights?",'
+                '"choices":["Yes","No","Sometimes","Never"],"correct_index":0,'
+                '"explanation":"wrong claim","difficulty":"medium"}]}'
+            ),
+            Ok(
+                '{"verdicts":[{"question_index":0,"verdict":"contradicted",'
+                '"reason":"Source says weights must be non-negative"}]}'
+            ),
+            Ok(
+                '{"question":"What edge-weight constraint does Dijkstra require?",'
+                '"choices":["Non-negative","Negative","Zero only","Any"],"correct_index":0,'
+                '"explanation":"Per source, weights must be non-negative",'
+                '"difficulty":"medium"}'
+            ),
+            Ok(
+                '{"verdicts":[{"question_index":0,"verdict":"supported",'
+                '"reason":"matches source"}]}'
+            ),
+        ]
+
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+        )
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001", target_kind="lo", target_code="L.O.1.1", count=1,
+            )
+        )
+
+        assert result.is_ok()
+        # generate, verify(fail), regenerate, verify(pass).
+        assert mock_llm_client.generate.call_count == 4
+        persisted = mock_metadata_store.persist_curriculum_quiz_items.call_args.kwargs[
+            "quiz_items"
+        ]
+        assert persisted[0].question == "What edge-weight constraint does Dijkstra require?"
+
+    def test_verifier_error_does_not_block_persistence(
+        self, mock_metadata_store, mock_llm_client
+    ):
+        """A verifier that can't be parsed is inconclusive, not a rejection —
+        the original question still reaches the human reviewer."""
+        lo_id = "course-001:L.O.1.1"
+        self._curriculum_ok(mock_metadata_store, lo_id)
+        mock_llm_client.model_id = "gemini-test"
+        mock_llm_client.generate.side_effect = [
+            Ok(
+                '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
+                '"correct_index":0,"explanation":"...","difficulty":"easy"}]}'
+            ),
+            Ok("not valid json at all"),
+            Ok("still not valid json"),
+        ]
+
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+        )
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001", target_kind="lo", target_code="L.O.1.1", count=1,
+            )
+        )
+
+        assert result.is_ok()
+        persisted = mock_metadata_store.persist_curriculum_quiz_items.call_args.kwargs[
+            "quiz_items"
+        ]
+        assert persisted[0].question == "AI là gì?"
+
+    def test_verify_exhausts_retries_and_drops_the_question(
+        self, mock_metadata_store, mock_llm_client
+    ):
+        """
+        V2: hết lượt sửa mà câu vẫn không bám được nguồn thì **không lưu**.
+
+        Chính sách cũ lưu lần thử cuối kèm một dòng log, tức là đẩy việc phát
+        hiện câu sai sang người duyệt — ngược với mục đích của vòng kiểm tra.
+        Ở đây chỉ có một câu và nó bị loại, nên không còn gì để lưu và request
+        báo lỗi thay vì lưu một câu đã biết là sai.
+        """
+        lo_id = "course-001:L.O.1.1"
+        self._curriculum_ok(mock_metadata_store, lo_id)
+        mock_llm_client.model_id = "gemini-test"
+        always_contradicted = Ok(
+            '{"verdicts":[{"question_index":0,"verdict":"contradicted","reason":"still wrong"}]}'
+        )
+        mock_llm_client.generate.side_effect = [
+            Ok(
+                '{"questions":[{"question":"Q0","choices":["A","B","C","D"],'
+                '"correct_index":0,"explanation":"e0","difficulty":"easy"}]}'
+            ),
+            always_contradicted,
+            Ok(
+                '{"question":"Q1","choices":["A","B","C","D"],"correct_index":0,'
+                '"explanation":"e1","difficulty":"easy"}'
+            ),
+            always_contradicted,
+            Ok(
+                '{"question":"Q2","choices":["A","B","C","D"],"correct_index":0,'
+                '"explanation":"e2","difficulty":"easy"}'
+            ),
+            always_contradicted,
+        ]
+
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+            max_verification_retries=2,
+        )
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001", target_kind="lo", target_code="L.O.1.1", count=1,
+            )
+        )
+
+        assert result.is_err()
+        mock_metadata_store.persist_curriculum_quiz_items.assert_not_called()
+
+    def test_usage_is_logged_for_generate_and_verify(
+        self, mock_metadata_store, mock_llm_client
+    ):
+        lo_id = "course-001:L.O.1.1"
+        self._curriculum_ok(mock_metadata_store, lo_id)
+        mock_llm_client.model_id = "gemini-test"
+        mock_llm_client.generate.side_effect = [
+            Ok(
+                '{"questions":[{"question":"AI là gì?","choices":["A","B","C","D"],'
+                '"correct_index":0,"explanation":"...","difficulty":"easy"}]}'
+            ),
+            Ok('{"verdicts":[{"question_index":0,"verdict":"supported","reason":"ok"}]}'),
+        ]
+
+        use_case = GenerateCurriculumQuizUseCase(
+            metadata_store=mock_metadata_store,
+            llm_client=mock_llm_client,
+            llm_provider="gemini",
+        )
+        result = use_case.execute(
+            GenerateCurriculumQuizRequest(
+                course_id="course-001", target_kind="lo", target_code="L.O.1.1", count=1,
+            )
+        )
+
+        assert result.is_ok()
+        use_cases_logged = [
+            call.kwargs["use_case"]
+            for call in mock_metadata_store.record_llm_usage.call_args_list
+        ]
+        assert use_cases_logged == ["quiz_generation", "quiz_verification"]
+        trace_ids = {
+            call.kwargs["trace_id"]
+            for call in mock_metadata_store.record_llm_usage.call_args_list
+        }
+        assert len(trace_ids) == 1  # one correlation id per execute() call
+        assert all(
+            call.kwargs["provider"] == "gemini"
+            for call in mock_metadata_store.record_llm_usage.call_args_list
+        )

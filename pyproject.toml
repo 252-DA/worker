@@ -10,11 +10,20 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "document-chunk",
+    "document-chunk[embeddings,remote-embedding,ocr]",
     "ai-runtime-sdk[gemini,openai]",
     "bullmq>=2.0.0",
     "redis>=5.0.0",
     "pydantic-settings>=2.0.0",
+    # torch is transitive via document-chunk[embeddings] — listed directly
+    # so tool.uv.sources.torch below actually applies, see
+    # embedding-service/pyproject.toml for the full explanation.
+    "torch",
+    # torchvision (transitive via docling → transformers image processors) must
+    # come from the same CPU index as torch: the PyPI build is compiled against
+    # the default torch and fails with "operator torchvision::nms does not
+    # exist" next to torch+cpu, which breaks docling OCR/layout on image pages.
+    "torchvision",
 ]
 
 [project.scripts]
@@ -34,9 +43,17 @@ dev = [
 [tool.uv]
 default-groups = ["dev"]
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv.sources]
 document-chunk = { path = "../packages-ai", editable = true }
 ai-runtime-sdk = { path = "../ai-sdk", editable = true }
+da-service-sdk = { path = "../service-sdk", editable = true }
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
 
 [tool.setuptools.packages.find]
 where = ["."]

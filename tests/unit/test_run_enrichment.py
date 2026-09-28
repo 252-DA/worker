@@ -230,3 +230,84 @@ class TestRunEnrichmentUseCase:
             "status": IngestionStatus.DONE,
             "error_msg": "sql down",
         }
+
+
+class TestSectionFailureIsolation:
+    """
+    O1 — một section lỗi làm mất card/quiz của cả tài liệu.
+
+    Vòng lặp cũ `return self._fail_to_done(...)` ngay khi một section lỗi, nên
+    mọi thứ đã sinh cho các section trước đó bị vứt — sau khi bản nháp cũ đã bị
+    soft-delete. Status vẫn là DONE nên nhìn từ ngoài như thành công.
+    """
+
+    def _chunks(self, document_id, sections):
+        return [
+            StoredChunkMetadata(
+                chunk_id=f"chunk-{i}",
+                document_id=document_id,
+                chunk_index=i,
+                heading_path=(heading,),
+                heading_level=1,
+                language="vi",
+                content_text=f"Nội dung của {heading} đủ dài để sinh thẻ học.",
+            )
+            for i, heading in enumerate(sections)
+        ]
+
+    def _cards(self, name):
+        return Ok(
+            f'{{"cards":[{{"title":"{name}","bullets":["a","b"],'
+            f'"key_insight":"{name} quan trọng."}}]}}'
+        )
+
+    def _quiz(self, name):
+        return Ok(
+            f'{{"questions":[{{"question":"{name}?","choices":["A","B","C","D"],'
+            f'"correct_index":0,"explanation":"vì {name}","difficulty":"easy"}}]}}'
+        )
+
+    def test_one_failing_section_keeps_the_others(
+        self, sample_document, sample_document_context, mock_metadata_store, mock_llm_client,
+    ):
+        mock_metadata_store.get_document_context.return_value = Ok(sample_document_context)
+        mock_metadata_store.list_chunks.return_value = Ok(
+            self._chunks(sample_document.id, ["Chương 1", "Chương 2", "Chương 3"])
+        )
+        # Section 2 hỏng cả thẻ lẫn quiz; mỗi lần hỏng tiêu hai lượt gọi
+        # (bản đầu + một lần sửa JSON). Hai section còn lại bình thường.
+        mock_llm_client.generate.side_effect = [
+            self._cards("Chương 1"), self._quiz("Chương 1"),
+            Ok("không phải JSON"), Ok("vẫn không phải JSON"),
+            Ok("không phải JSON"), Ok("vẫn không phải JSON"),
+            self._cards("Chương 3"), self._quiz("Chương 3"),
+        ]
+
+        use_case = RunEnrichmentUseCase(
+            metadata_store=mock_metadata_store, llm_client=mock_llm_client,
+        )
+        result = use_case.execute(RunEnrichmentRequest(document_id=sample_document.id))
+
+        assert result.is_ok(), str(result.error)
+        mock_metadata_store.persist_enrichment_batch.assert_called_once()
+        kwargs = mock_metadata_store.persist_enrichment_batch.call_args.kwargs
+        titles = {c.title for c in kwargs["lesson_cards"]}
+        assert titles == {"Chương 1", "Chương 3"}
+
+    def test_all_sections_failing_does_not_overwrite_with_nothing(
+        self, sample_document, sample_document_context, mock_metadata_store, mock_llm_client,
+    ):
+        """Không còn gì để lưu thì dừng lại, đừng ghi đè nội dung đang có bằng rỗng."""
+        mock_metadata_store.get_document_context.return_value = Ok(sample_document_context)
+        mock_metadata_store.list_chunks.return_value = Ok(
+            self._chunks(sample_document.id, ["Chương 1", "Chương 2"])
+        )
+        mock_llm_client.generate.side_effect = [Ok("rác")] * 8
+
+        use_case = RunEnrichmentUseCase(
+            metadata_store=mock_metadata_store, llm_client=mock_llm_client,
+        )
+        result = use_case.execute(RunEnrichmentRequest(document_id=sample_document.id))
+
+        assert result.is_err()
+        mock_metadata_store.persist_enrichment_batch.assert_not_called()

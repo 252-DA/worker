@@ -31,6 +31,67 @@ class ContentGenerationJob:
     scope: dict[str, Any]
 
 
+def _request_id_from_job_data(data: Any) -> str | None:
+    """
+    Lấy lại ``request_id`` từ một job mà ``_parse_job`` không đọc được.
+
+    Không parse được thì không có ``ContentGenerationJob``, nhưng dòng
+    ``content_generation_requests`` vẫn đang nằm ở QUEUED. FE chặn mọi yêu cầu
+    mới của khoá học khi còn một dòng QUEUED/RUNNING, mà không có endpoint huỷ
+    và không job nào dọn dòng treo — nên bỏ qua ở đây là khoá cứng việc sinh
+    quiz của cả khoá học cho tới khi ai đó sửa tay trong DB.
+
+    Outbox đặt ``aggregate_id = request_id`` (`outbox.service.ts`), nên vẫn lấy
+    lại được id kể cả khi chính ``payload`` mới là phần hỏng.
+    """
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("payload")
+    if isinstance(payload, dict):
+        request_id = payload.get("request_id")
+        if isinstance(request_id, str) and request_id.strip():
+            return request_id.strip()
+    aggregate_id = data.get("aggregate_id")
+    if isinstance(aggregate_id, str) and aggregate_id.strip():
+        return aggregate_id.strip()
+    return None
+
+
+def _fail_unparsed_request(container, data: Any, exc: Exception) -> None:
+    """
+    Đánh dấu FAILED cho một job hỏng, best-effort.
+
+    Không bao giờ được che lỗi gốc: chỗ gọi vẫn raise ``UnrecoverableError``
+    ngay sau đó, nên mọi trục trặc ở đây chỉ được ghi log.
+    """
+    request_id = _request_id_from_job_data(data)
+    if request_id is None:
+        logger.error(
+            "content_generation_worker.job.unidentifiable",
+            error=str(exc),
+            reason="không lấy được request_id; dòng QUEUED phải dọn tay",
+        )
+        return
+    try:
+        result = container.metadata_store.update_content_generation_request(
+            request_id=request_id,
+            status="FAILED",
+            last_error=f"invalid content-generation job: {exc}",
+        )
+        if result.is_err():
+            logger.error(
+                "content_generation_worker.job.fail_mark_failed",
+                request_id=request_id,
+                error=str(result.error),
+            )
+    except Exception as update_exc:  # pragma: no cover - chỉ khi store hỏng hẳn
+        logger.error(
+            "content_generation_worker.job.fail_mark_raised",
+            request_id=request_id,
+            error=str(update_exc),
+        )
+
+
 def _parse_job(data: Any) -> ContentGenerationJob:
     if not isinstance(data, dict):
         raise ValueError("job data must be an object")
@@ -84,6 +145,7 @@ def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
         target_code=target_code,
         style=str(scope.get("style") or "quiz"),
         bloom_level=scope.get("bloom_level") or scope.get("bloomLevel") or scope.get("bloom"),
+        source_document_ids=scope.get("source_document_ids"),
         count=int(scope.get("count") or 5),
     )
 
@@ -93,6 +155,7 @@ async def _process_job(container, bull_job, job_token):
     try:
         job = _parse_job(bull_job.data)
     except (KeyError, TypeError, ValueError) as exc:
+        _fail_unparsed_request(container, bull_job.data, exc)
         raise UnrecoverableError(f"invalid content-generation job: {exc}") from exc
 
     try:

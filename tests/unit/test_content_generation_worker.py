@@ -78,3 +78,64 @@ async def test_unsupported_content_type_marks_request_failed():
     update = container.metadata_store.update_content_generation_request
     assert update.call_args.kwargs["request_id"] == "request-1"
     assert update.call_args.kwargs["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_job_still_marks_request_failed():
+    """
+    Job hỏng mà không đánh dấu FAILED thì dòng nằm mãi ở QUEUED, và FE chặn
+    mọi yêu cầu sinh quiz sau đó của khoá học bằng 409.
+    """
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.return_value = Ok(None)
+    data = _job_data()
+    data["payload"]["scope"] = "không-phải-object"
+
+    with pytest.raises(UnrecoverableError):
+        await _process_job(container, SimpleNamespace(data=data), None)
+
+    update = container.metadata_store.update_content_generation_request
+    assert update.call_args.kwargs["request_id"] == "request-1"
+    assert update.call_args.kwargs["status"] == "FAILED"
+    assert "scope" in update.call_args.kwargs["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_request_id_recovered_from_aggregate_id_when_payload_is_broken():
+    """Outbox đặt aggregate_id = request_id, nên payload hỏng hẳn vẫn cứu được."""
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.return_value = Ok(None)
+    data = {
+        "event_id": "event-1",
+        "event_type": "CONTENT_GENERATION_REQUESTED",
+        "aggregate_id": "request-42",
+        "payload": None,
+    }
+
+    with pytest.raises(UnrecoverableError):
+        await _process_job(container, SimpleNamespace(data=data), None)
+
+    update = container.metadata_store.update_content_generation_request
+    assert update.call_args.kwargs["request_id"] == "request-42"
+    assert update.call_args.kwargs["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_job_without_any_request_id_does_not_crash():
+    container = MagicMock()
+
+    with pytest.raises(UnrecoverableError):
+        await _process_job(container, SimpleNamespace(data={"payload": None}), None)
+
+    container.metadata_store.update_content_generation_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failing_to_mark_failed_does_not_mask_the_original_error():
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.side_effect = RuntimeError("db down")
+    data = _job_data()
+    data["payload"]["scope"] = 123
+
+    with pytest.raises(UnrecoverableError):
+        await _process_job(container, SimpleNamespace(data=data), None)
