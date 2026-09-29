@@ -1,3 +1,6 @@
+import os
+from typing import TYPE_CHECKING
+
 from document_chunk.adapters.chunkers.structural import build_chunker as create_chunker
 from document_chunk.domain.ports.chunker import IChunker
 from document_chunk.adapters.embedders.bge_embedder import BgeEmbedder
@@ -16,10 +19,15 @@ from document_chunk.domain.ports.graph_store import IGraphStore
 from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 
+from ai_runtime.catalog import ENRICHMENT, QUIZ_GENERATION, QUIZ_VERIFICATION
+
 from worker.config import WorkerSettings, get_worker_settings
 from worker.services.outbox_projector import OutboxProjector
 from worker.use_cases.run_enrichment import RunEnrichmentUseCase
 from worker.use_cases.run_pipeline import RunPipelineUseCase
+
+if TYPE_CHECKING:
+    from ai_runtime import ModelProfile
 
 logger = get_logger(__name__)
 
@@ -101,30 +109,88 @@ def build_vector_store(settings: WorkerSettings) -> QdrantAdapter:
     return QdrantAdapter(settings.qdrant)
 
 
-def build_llm_client(settings: WorkerSettings):
-    from ai_runtime import AIRuntime, ModelConfig, build_model_client
+# Cấu hình LLM__* của thời "một model cho cả process". Còn bất kỳ biến nào
+# trong số này được đặt thì nó vẫn thắng mọi default trong catalog, để một
+# deployment chưa kịp đổi sang LLM_PROFILE__* không âm thầm chạy model khác.
+_LEGACY_ENV_VARS = ("LLM__PROVIDER", "LLM__MODEL", "LLM__BASE_URL")
+_LEGACY_PROFILE_NAME = "env-llm"
+_SUPPORTED_PROVIDERS = ("gemini", "openai-compatible", "deepseek")
+
+
+def _legacy_profile(llm) -> "ModelProfile":
+    """Dựng một profile từ LLM__* để giai đoạn chuyển tiếp không đứt."""
+    from ai_runtime import ModelProfile
+
+    if llm.provider not in _SUPPORTED_PROVIDERS:
+        raise ValueError(f"Unknown LLM provider: {llm.provider}")
+    return ModelProfile(
+        name=_LEGACY_PROFILE_NAME,
+        provider=llm.provider,
+        model=llm.model,
+        # Key của profile này đến từ settings (đọc cả .env), nên
+        # build_model_registry bơm nó vào env mapping dưới tên dưới đây.
+        key_env=("LLM__API_KEY",),
+        base_url=llm.base_url or None,
+        temperature=llm.temperature,
+        timeout_seconds=float(llm.timeout_seconds),
+        max_retries=llm.max_retries,
+        internal=True,
+    )
+
+
+def build_model_registry(settings: WorkerSettings):
+    """
+    Registry phân giải "task nào dùng model nào", thay cho một client/process.
+
+    Thứ tự: LLM_PROFILE__<TASK> → LLM_PROFILE → LLM__* (nếu còn đặt) →
+    TASK_DEFAULTS trong catalog của ai-sdk.
+    """
+    from ai_runtime import EnvConfigSource, ModelRegistry
+    from ai_runtime.catalog import PROFILES
+
+    legacy = _legacy_profile(settings.llm)  # luôn dựng để provider sai lộ ra ngay
+    prefer_legacy = any(os.environ.get(name, "").strip() for name in _LEGACY_ENV_VARS)
+
+    env = dict(os.environ)
+    if settings.llm.api_key:
+        env[legacy.key_env[0]] = settings.llm.api_key
+
+    registry = ModelRegistry(
+        source=EnvConfigSource(
+            env=env,
+            fallback_profile=legacy.name if prefer_legacy else None,
+        ),
+        profiles={**PROFILES, legacy.name: legacy},
+        env=env,
+    )
+    if prefer_legacy:
+        logger.warning(
+            "worker_container.llm_legacy_env",
+            provider=legacy.provider,
+            model=legacy.model,
+            hint="LLM__* vẫn đang ghi đè; chuyển sang LLM_PROFILE__<TASK> để tách model theo task",
+        )
+    return registry
+
+
+def build_llm_client(settings: WorkerSettings, task: str = ENRICHMENT):
+    """Client cho một task, dựng registry riêng — dùng ở chỗ gọi lẻ và test."""
+    return build_llm_client_for(build_model_registry(settings), task)
+
+
+def build_llm_client_for(registry, task: str):
     from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
 
-    if settings.llm.provider not in {"gemini", "openai-compatible", "deepseek"}:
-        raise ValueError(f"Unknown LLM provider: {settings.llm.provider}")
-
-    logger.debug(
-        "worker_container.init",
-        component="AIRuntimeLLMClient",
-        provider=settings.llm.provider,
+    resolved = registry.resolve(task)
+    logger.info(
+        "worker_container.llm_resolved",
+        task=task,
+        profile=resolved.profile.name,
+        provider=resolved.provider,
+        model=resolved.model_id,
+        chosen_by=resolved.binding.source,
     )
-    model = build_model_client(
-        ModelConfig(
-            provider=settings.llm.provider,
-            model=settings.llm.model,
-            api_key=settings.llm.api_key,
-            base_url=settings.llm.base_url,
-            temperature=settings.llm.temperature,
-            timeout_seconds=settings.llm.timeout_seconds,
-            max_retries=settings.llm.max_retries,
-        )
-    )
-    return AIRuntimeLLMClient(AIRuntime(model))
+    return AIRuntimeLLMClient(resolved.runtime(), profile=resolved.profile)
 
 
 def build_learning_context_client(settings: WorkerSettings):
@@ -220,11 +286,16 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
-        self.llm_client = self._track("llm_client", build_llm_client(settings))
+        self.model_registry = build_model_registry(settings)
+        self.llm_client = self._track(
+            "llm_client", build_llm_client_for(self.model_registry, ENRICHMENT)
+        )
         self.run_enrichment_use_case = RunEnrichmentUseCase(
             metadata_store=self.metadata_store,
             llm_client=self.llm_client,
             max_section_chars=settings.llm.max_section_chars,
+            llm_provider=self.llm_client.provider,
+            llm_profile=self.llm_client.profile_name,
         )
 
 
@@ -233,17 +304,39 @@ class CurriculumQuizContainer(BaseWorkerContainer):
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
+        from worker.llm_role import LlmRole
         from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
 
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
-        self.llm_client = self._track("llm_client", build_llm_client(settings))
+        self.model_registry = build_model_registry(settings)
+        # Người viết câu và người chấm là hai model khác nhau trong cùng một
+        # process: model vừa viết một câu sai có xu hướng chấm là câu đúng.
+        # Hai task trỏ cùng profile thì registry trả lại đúng một client.
+        self.llm_client = self._track(
+            "llm_client", build_llm_client_for(self.model_registry, QUIZ_GENERATION)
+        )
+        self.verifier_llm_client = self._track(
+            "verifier_llm_client", build_llm_client_for(self.model_registry, QUIZ_VERIFICATION)
+        )
+        if self.llm_client.profile_name == self.verifier_llm_client.profile_name:
+            logger.warning(
+                "worker_container.quiz_judge_is_writer",
+                profile=self.llm_client.profile_name,
+                hint="đặt LLM_PROFILE__QUIZ_VERIFICATION khác LLM_PROFILE__QUIZ_GENERATION",
+            )
         self.context_client = build_learning_context_client(settings)
         self.generate_curriculum_quiz_use_case = GenerateCurriculumQuizUseCase(
             metadata_store=self.metadata_store,
             llm_client=self.llm_client,
             context_client=self.context_client,
             fallback_to_local_context=settings.learning_context_mcp.fallback_to_local,
-            llm_provider=settings.llm.provider,
+            llm_provider=self.llm_client.provider,
+            llm_profile=self.llm_client.profile_name,
+            verifier=LlmRole(
+                client=self.verifier_llm_client,
+                provider=self.verifier_llm_client.provider,
+                profile=self.verifier_llm_client.profile_name,
+            ),
         )
 
 

@@ -26,6 +26,8 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredQui
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
+from worker.llm_role import LlmRole
+
 logger = get_logger(__name__)
 
 # Namespace cố định để quiz_id tất định theo (LO, nội dung câu hỏi): worker retry
@@ -140,15 +142,19 @@ class GenerateCurriculumQuizUseCase:
         context_client: QuizContextClient | None = None,
         fallback_to_local_context: bool = True,
         llm_provider: str = "unknown",
+        llm_profile: str | None = None,
+        verifier: LlmRole | None = None,
         max_verification_retries: int = 2,
     ) -> None:
         self._metadata_store = metadata_store
-        self._llm_client = llm_client
         self._max_context_chars = max_context_chars
         self._context_client = context_client
         self._fallback_to_local_context = fallback_to_local_context
-        self._llm_provider = llm_provider
         self._max_verification_retries = max_verification_retries
+        # Viết câu và sinh lại câu bị loại đều là việc của writer; chấm là việc
+        # của judge. Không truyền judge thì cả hai là một model, như trước đây.
+        self._writer = LlmRole(client=llm_client, provider=llm_provider, profile=llm_profile)
+        self._verifier = verifier or self._writer
 
     def execute(
         self, request: GenerateCurriculumQuizRequest
@@ -233,13 +239,14 @@ class GenerateCurriculumQuizUseCase:
         started = time.monotonic()
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
-            llm_client=self._llm_client,
+            llm_client=self._writer.client,
             prompt=prompt,
             system=_QUIZ_SYSTEM_PROMPT,
             schema_model=_CurriculumQuizPayload,
             on_usage=usage,
         )
         self._log_usage(
+            role=self._writer,
             use_case="quiz_generation",
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
@@ -312,7 +319,7 @@ class GenerateCurriculumQuizUseCase:
                 explanation=q.explanation,
                 difficulty=q.difficulty,
                 question_index=idx,
-                model_id=self._llm_client.model_id,
+                model_id=self._writer.client.model_id,
             )
             stored_items.append(item)
 
@@ -586,7 +593,7 @@ class GenerateCurriculumQuizUseCase:
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
-            llm_client=self._llm_client,
+            llm_client=self._verifier.client,
             prompt=prompt,
             system=_VERIFIER_SYSTEM_PROMPT,
             schema_model=_QuizVerificationPayload,
@@ -594,6 +601,7 @@ class GenerateCurriculumQuizUseCase:
             on_usage=usage,
         )
         self._log_usage(
+            role=self._verifier,
             use_case="quiz_verification",
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
@@ -623,7 +631,7 @@ class GenerateCurriculumQuizUseCase:
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
-            llm_client=self._llm_client,
+            llm_client=self._writer.client,
             prompt=prompt,
             system=_REGEN_SYSTEM_PROMPT,
             schema_model=_CurriculumQuestion,
@@ -631,6 +639,7 @@ class GenerateCurriculumQuizUseCase:
             on_usage=usage,
         )
         self._log_usage(
+            role=self._writer,
             use_case="quiz_regeneration",
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
@@ -709,6 +718,7 @@ class GenerateCurriculumQuizUseCase:
     def _log_usage(
         self,
         *,
+        role: LlmRole,
         use_case: str,
         status: str,
         latency_ms: int,
@@ -725,8 +735,8 @@ class GenerateCurriculumQuizUseCase:
         """
         usage = usage or LLMUsage()
         result = self._metadata_store.record_llm_usage(
-            provider=self._llm_provider,
-            model=self._llm_client.model_id,
+            provider=role.provider,
+            model=role.client.model_id,
             use_case=use_case,
             status=status,
             course_id=course_id,
@@ -740,5 +750,6 @@ class GenerateCurriculumQuizUseCase:
             logger.warning(
                 "generate_curriculum_quiz.usage_log_failed",
                 use_case=use_case,
+                profile=role.profile,
                 error=str(result.error),
             )
