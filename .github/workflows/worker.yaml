@@ -20,7 +20,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Tái tạo layout ~/DA: worker/, packages-ai/ và ai-sdk/ nằm cạnh nhau
+      # Tái tạo layout ~/DA: worker/, packages-ai/, ai-sdk/ và service-sdk/ nằm cạnh nhau
       - uses: actions/checkout@v4
         with:
           path: worker
@@ -32,6 +32,11 @@ jobs:
       - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
         with:
           path: ai-sdk
+
+      # service-sdk chưa có repo riêng — lấy từ thư mục service-sdk/ của da-platform
+      - uses: 252-DA/da-platform/service-sdk/.github/actions/materialize@dfd4b0b9db9c7320865ac55541530c623c0cf1c8
+        with:
+          path: service-sdk
 
       - uses: astral-sh/setup-uv@v5
 
@@ -60,6 +65,11 @@ jobs:
       - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
         with:
           path: ai-sdk
+
+      # service-sdk chưa có repo riêng — lấy từ thư mục service-sdk/ của da-platform
+      - uses: 252-DA/da-platform/service-sdk/.github/actions/materialize@dfd4b0b9db9c7320865ac55541530c623c0cf1c8
+        with:
+          path: service-sdk
 
       - uses: docker/build-push-action@v6
         with:
