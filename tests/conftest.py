@@ -188,6 +188,7 @@ def mock_metadata_store(
     store.upsert_chunk_concepts.return_value = Ok(None)
     store.persist_enrichment_batch.return_value = Ok("event-001")
     store.persist_curriculum_quiz_items.return_value = Ok(None)
+    store.persist_curriculum_lesson_cards.return_value = Ok(None)
     store.record_llm_usage.return_value = Ok(None)
     store.list_lesson_cards.return_value = Ok([])
     store.list_quiz_items.return_value = Ok([])

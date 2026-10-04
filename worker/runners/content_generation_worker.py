@@ -1,4 +1,4 @@
-"""BullMQ worker for grounded curriculum quiz-generation requests."""
+"""BullMQ worker for grounded, LO-scoped quiz and lesson-card generation requests."""
 
 import asyncio
 from dataclasses import dataclass
@@ -19,6 +19,11 @@ from worker.runtime import (
     shutdown_runtime,
 )
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizRequest
+from worker.use_cases.generate_lesson_cards import (
+    DEFAULT_CARD_COUNT,
+    MAX_CARD_COUNT,
+    GenerateLessonCardsRequest,
+)
 
 logger = get_logger(__name__)
 
@@ -109,14 +114,7 @@ def _parse_job(data: Any) -> ContentGenerationJob:
     )
 
 
-def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
-    if job.content_type != "quiz":
-        raise ValueError(
-            f"content-generation worker currently supports type='quiz', got "
-            f"{job.content_type!r}"
-        )
-
-    scope = job.scope
+def _target_from_scope(scope: dict[str, Any]) -> tuple[str, str]:
     target_kind = str(scope.get("target_kind") or scope.get("targetKind") or "")
     target_code = str(scope.get("target_code") or scope.get("targetCode") or "")
 
@@ -138,7 +136,15 @@ def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
         raise ValueError(
             "scope must include target_kind/target_code or an LO/chapter/assessment code"
         )
+    return target_kind, target_code
 
+
+def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
+    if job.content_type != "quiz":
+        raise ValueError(f"expected type='quiz', got {job.content_type!r}")
+
+    scope = job.scope
+    target_kind, target_code = _target_from_scope(scope)
     return GenerateCurriculumQuizRequest(
         course_id=job.course_id,
         target_kind=target_kind,
@@ -150,6 +156,47 @@ def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
     )
 
 
+def _card_request(job: ContentGenerationJob) -> GenerateLessonCardsRequest:
+    if job.content_type != "card":
+        raise ValueError(f"expected type='card', got {job.content_type!r}")
+
+    scope = job.scope
+    target_kind, target_code = _target_from_scope(scope)
+    count = int(scope.get("count") or DEFAULT_CARD_COUNT)
+    if not 1 <= count <= MAX_CARD_COUNT:
+        raise ValueError(f"card count must be between 1 and {MAX_CARD_COUNT}, got {count}")
+    return GenerateLessonCardsRequest(
+        course_id=job.course_id,
+        target_kind=target_kind,
+        target_code=target_code,
+        count=count,
+        source_document_ids=scope.get("source_document_ids"),
+    )
+
+
+def _plan(container, job: ContentGenerationJob):
+    """(use case, request) cho loại nội dung của job; ValueError nếu không hỗ trợ."""
+    if job.content_type == "quiz":
+        return container.generate_curriculum_quiz_use_case, _quiz_request(job)
+    if job.content_type == "card":
+        return container.generate_lesson_cards_use_case, _card_request(job)
+    raise ValueError(
+        f"content-generation worker supports type='quiz' or 'card', got {job.content_type!r}"
+    )
+
+
+def _generated_ids(content_type: str, response) -> tuple[int, dict[str, Any]]:
+    if content_type == "card":
+        return response.card_count, {
+            "card_count": response.card_count,
+            "card_ids": response.card_ids,
+        }
+    return response.quiz_count, {
+        "quiz_count": response.quiz_count,
+        "question_ids": response.question_ids,
+    }
+
+
 async def _process_job(container, bull_job, job_token):
     del job_token
     try:
@@ -159,7 +206,7 @@ async def _process_job(container, bull_job, job_token):
         raise UnrecoverableError(f"invalid content-generation job: {exc}") from exc
 
     try:
-        request = _quiz_request(job)
+        use_case, request = _plan(container, job)
     except (TypeError, ValueError) as exc:
         container.metadata_store.update_content_generation_request(
             request_id=job.request_id,
@@ -176,7 +223,7 @@ async def _process_job(container, bull_job, job_token):
     if running_result.is_err():
         raise running_result.error
 
-    result = container.generate_curriculum_quiz_use_case.execute(request)
+    result = use_case.execute(request)
     if result.is_err():
         container.metadata_store.update_content_generation_request(
             request_id=job.request_id,
@@ -186,10 +233,11 @@ async def _process_job(container, bull_job, job_token):
         raise result.error
 
     response = result.unwrap()
+    generated_count, generated = _generated_ids(job.content_type, response)
     completed_result = container.metadata_store.update_content_generation_request(
         request_id=job.request_id,
         status="SUCCEEDED",
-        generated_count=response.quiz_count,
+        generated_count=generated_count,
         last_error=None,
     )
     if completed_result.is_err():
@@ -199,15 +247,15 @@ async def _process_job(container, bull_job, job_token):
         "content_generation_worker.job.completed",
         request_id=job.request_id,
         course_id=job.course_id,
+        content_type=job.content_type,
         lo_id=response.lo_id,
-        quiz_count=response.quiz_count,
+        generated_count=generated_count,
     )
     return {
         "request_id": job.request_id,
         "course_id": response.course_id,
         "lo_id": response.lo_id,
-        "quiz_count": response.quiz_count,
-        "question_ids": response.question_ids,
+        **generated,
     }
 
 

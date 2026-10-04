@@ -300,12 +300,13 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
 
 
 class CurriculumQuizContainer(BaseWorkerContainer):
-    """Dependencies for synchronous or queued curriculum-aware quiz generation."""
+    """Dependencies for queued, LO-scoped quiz and lesson-card generation."""
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
         from worker.llm_role import LlmRole
         from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
+        from worker.use_cases.generate_lesson_cards import GenerateLessonCardsUseCase
 
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.model_registry = build_model_registry(settings)
@@ -325,6 +326,11 @@ class CurriculumQuizContainer(BaseWorkerContainer):
                 hint="đặt LLM_PROFILE__QUIZ_VERIFICATION khác LLM_PROFILE__QUIZ_GENERATION",
             )
         self.context_client = build_learning_context_client(settings)
+        verifier = LlmRole(
+            client=self.verifier_llm_client,
+            provider=self.verifier_llm_client.provider,
+            profile=self.verifier_llm_client.profile_name,
+        )
         self.generate_curriculum_quiz_use_case = GenerateCurriculumQuizUseCase(
             metadata_store=self.metadata_store,
             llm_client=self.llm_client,
@@ -332,11 +338,19 @@ class CurriculumQuizContainer(BaseWorkerContainer):
             fallback_to_local_context=settings.learning_context_mcp.fallback_to_local,
             llm_provider=self.llm_client.provider,
             llm_profile=self.llm_client.profile_name,
-            verifier=LlmRole(
-                client=self.verifier_llm_client,
-                provider=self.verifier_llm_client.provider,
-                profile=self.verifier_llm_client.profile_name,
-            ),
+            verifier=verifier,
+        )
+        # Card dùng chung cặp writer/judge của quiz: catalog của ai-sdk chưa có
+        # task riêng cho card, và cả hai đều là "viết nội dung bám nguồn rồi
+        # để model khác chấm". Chi phí vẫn tách được qua use_case card_*.
+        self.generate_lesson_cards_use_case = GenerateLessonCardsUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=self.llm_client,
+            context_client=self.context_client,
+            fallback_to_local_context=settings.learning_context_mcp.fallback_to_local,
+            llm_provider=self.llm_client.provider,
+            llm_profile=self.llm_client.profile_name,
+            verifier=verifier,
         )
 
 

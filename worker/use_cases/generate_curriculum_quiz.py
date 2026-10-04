@@ -6,7 +6,7 @@ Used by the queued content-generation worker and the legacy synchronous adapter.
 """
 import time
 import uuid
-from typing import Literal, Protocol
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -27,6 +27,8 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
+from worker.use_cases.verification import verify_and_refine
 
 logger = get_logger(__name__)
 
@@ -62,19 +64,6 @@ class _UsageAccumulator:
 
     def __call__(self, usage: LLMUsage) -> None:
         self.total = self.total + usage
-
-
-class QuizContextClient(Protocol):
-    def retrieve_quiz_context(
-        self,
-        course_id: str,
-        lo_code: str,
-        query: str | None = None,
-        bloom_level: str | None = None,
-        assessment_style: str = "quiz",
-        top_k: int = 5,
-    ):
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +136,13 @@ class GenerateCurriculumQuizUseCase:
         max_verification_retries: int = 2,
     ) -> None:
         self._metadata_store = metadata_store
-        self._max_context_chars = max_context_chars
-        self._context_client = context_client
-        self._fallback_to_local_context = fallback_to_local_context
+        self._context = LoContextLoader(
+            metadata_store=metadata_store,
+            context_client=context_client,
+            fallback_to_local_context=fallback_to_local_context,
+            max_context_chars=max_context_chars,
+            log_prefix="generate_curriculum_quiz",
+        )
         self._max_verification_retries = max_verification_retries
         # Viết câu và sinh lại câu bị loại đều là việc của writer; chấm là việc
         # của judge. Không truyền judge thì cả hai là một model, như trước đây.
@@ -357,121 +350,22 @@ class GenerateCurriculumQuizUseCase:
         lo_statement: str,
         bloom: str,
     ) -> Result[tuple[list[str], list[str], str | None], Exception]:
-        # Module launches must use only the selected chapter's lecture sources.
-        # Generic MCP retrieval has no document filter, so use local LO mappings
-        # for this explicit scope and never fall back to another chapter.
-        if self._context_client is not None and request.source_document_ids is None:
-            try:
-                context = self._context_client.retrieve_quiz_context(
-                    course_id=request.course_id,
-                    lo_code=lo_code,
-                    query=lo_statement,
-                    bloom_level=bloom,
-                    assessment_style=request.style,
-                    top_k=5,
-                )
-                parts: list[str] = []
-                source_ids: list[str] = []
-                source_document_id: str | None = None
-                total_chars = 0
-                for index, chunk in enumerate(context.chunks, start=1):
-                    content = chunk.content.strip()
-                    if not content:
-                        continue
-                    snippet = (
-                        f"[{index}] (chunk_id={chunk.chunk_id}, "
-                        f"page={chunk.page_number or 'n/a'})\n{content}"
-                    )
-                    if parts and total_chars + len(snippet) > self._max_context_chars:
-                        break
-                    parts.append(snippet)
-                    source_ids.append(chunk.chunk_id)
-                    source_document_id = source_document_id or chunk.document_id
-                    total_chars += len(snippet)
-                if parts:
-                    logger.info(
-                        "generate_curriculum_quiz.context.mcp",
-                        lo_id=primary_lo_id,
-                        chunks=len(parts),
-                    )
-                    return Ok((parts, source_ids, source_document_id))
-            except Exception as exc:
-                if not self._fallback_to_local_context:
-                    return Err(
-                        ProcessingError(
-                            "MCP quiz-context retrieval failed",
-                            cause=exc,
-                        )
-                    )
-                logger.warning(
-                    "generate_curriculum_quiz.context.mcp_failed",
-                    lo_id=primary_lo_id,
-                    error=str(exc),
-                )
-
-        chunks_result = self._metadata_store.list_chunks_for_lo(primary_lo_id)
-        if chunks_result.is_err():
-            return Err(chunks_result.error)
-
-        context_parts: list[str] = []
-        total_chars = 0
-        source_chunk_ids: list[str] = []
-        local_document_id: str | None = None
-        candidates = chunks_result.unwrap()
-        if request.source_document_ids is not None:
-            # psycopg returns UUID objects even though the metadata port types
-            # IDs as strings. Normalize before comparing with JSON job IDs.
-            allowed_documents = {str(value) for value in request.source_document_ids}
-            candidates = [c for c in candidates if str(c.document_id) in allowed_documents]
-        for index, chunk in enumerate(candidates[:5], start=1):
-            text = (chunk.content_text or "").strip()
-            if not text:
-                continue
-            snippet = f"[{index}] (chunk_id={chunk.chunk_id})\n{text[:1200]}"
-            if context_parts and total_chars + len(snippet) > self._max_context_chars:
-                break
-            context_parts.append(snippet)
-            source_chunk_ids.append(str(chunk.chunk_id))
-            local_document_id = local_document_id or str(chunk.document_id)
-            total_chars += len(snippet)
-        return Ok((context_parts, source_chunk_ids, local_document_id))
+        return self._context.load(
+            course_id=request.course_id,
+            lo_id=primary_lo_id,
+            lo_code=lo_code,
+            lo_statement=lo_statement,
+            bloom=bloom,
+            style=request.style,
+            source_document_ids=request.source_document_ids,
+        )
 
     def _resolve_lo_ids(
         self, request: GenerateCurriculumQuizRequest
     ) -> Result[list[str], Exception]:
-        kind = request.target_kind
-        code = request.target_code
-        course_id = request.course_id
-
-        if kind == "lo":
-            full_code = code if code.startswith("L.O.") else f"L.O.{code}"
-            curriculum_result = self._metadata_store.get_curriculum(course_id)
-            if curriculum_result.is_err():
-                return Err(curriculum_result.error)
-            curriculum = curriculum_result.unwrap()
-            if curriculum is None:
-                return Ok([])
-            _, _, learning_outcomes, _ = curriculum
-            matching = [
-                lo.lo_id
-                for lo in learning_outcomes
-                if lo.code == full_code or lo.lo_id == code
-            ]
-            return Ok(matching)
-
-        if kind == "chapter":
-            result = self._metadata_store.list_los_by_chapter(course_id, code)
-            if result.is_err():
-                return Err(result.error)
-            return Ok([lo.lo_id for lo in result.unwrap()])
-
-        if kind == "assessment":
-            result = self._metadata_store.list_los_by_assessment(course_id, code)
-            if result.is_err():
-                return Err(result.error)
-            return Ok([lo.lo_id for lo in result.unwrap()])
-
-        return Err(ProcessingError(f"Unknown target_kind: {kind!r}"))
+        return self._context.resolve_lo_ids(
+            request.course_id, request.target_kind, request.target_code
+        )
 
     def _build_prompt(
         self,
@@ -536,11 +430,7 @@ class GenerateCurriculumQuizUseCase:
         lý do để giữ lại nội dung: người duyệt trong `review.service.ts` vẫn là
         cổng cuối.
         """
-        current = list(questions)
-        if not current:
-            return current, []
-
-        for attempt in range(self._max_verification_retries + 1):
+        def find_failing(current: list[_CurriculumQuestion]) -> dict[int, str] | None:
             verdicts = self._run_verifier(
                 questions=current,
                 context_parts=context_parts,
@@ -548,38 +438,26 @@ class GenerateCurriculumQuizUseCase:
                 course_id=course_id,
             )
             if verdicts is None:
-                return current, []
+                return None
+            return {v.question_index: v.reason for v in verdicts if v.verdict != "supported"}
 
-            failing = {
-                v.question_index: v.reason
-                for v in verdicts
-                if v.verdict != "supported" and 0 <= v.question_index < len(current)
-            }
-            if not failing:
-                return current, []
-
-            if attempt == self._max_verification_retries:
-                logger.warning(
-                    "generate_curriculum_quiz.verify.exhausted",
-                    trace_id=trace_id,
-                    still_failing=sorted(failing.keys()),
-                )
-                rejected = [(current[i], reason) for i, reason in sorted(failing.items())]
-                kept = [q for i, q in enumerate(current) if i not in failing]
-                return kept, rejected
-
-            for index, reason in failing.items():
-                fixed = self._run_regeneration(
-                    original=current[index],
-                    reason=reason,
-                    context_parts=context_parts,
-                    trace_id=trace_id,
-                    course_id=course_id,
-                )
-                if fixed is not None:
-                    current[index] = fixed
-
-        return current, []
+        return verify_and_refine(
+            questions,
+            find_failing=find_failing,
+            regenerate=lambda original, reason: self._run_regeneration(
+                original=original,
+                reason=reason,
+                context_parts=context_parts,
+                trace_id=trace_id,
+                course_id=course_id,
+            ),
+            max_retries=self._max_verification_retries,
+            on_exhausted=lambda still_failing: logger.warning(
+                "generate_curriculum_quiz.verify.exhausted",
+                trace_id=trace_id,
+                still_failing=still_failing,
+            ),
+        )
 
     def _run_verifier(
         self,
