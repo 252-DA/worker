@@ -27,6 +27,7 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.prompts import curriculum_quiz as prompts
 from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
 from worker.use_cases.verification import verify_and_refine
 
@@ -39,22 +40,6 @@ _QUIZ_ID_NAMESPACE = uuid.UUID("6f9b5f1e-3a4d-5c7b-8e2f-1d0a9c8b7e64")
 # llm_usage_logs.status CHECK chỉ nhận ba giá trị này, phân biệt hoa thường.
 _USAGE_OK = "OK"
 _USAGE_ERROR = "ERROR"
-
-_QUIZ_SYSTEM_PROMPT = (
-    "You are an assessment writer for a university course. "
-    "Return strict JSON only."
-)
-
-_VERIFIER_SYSTEM_PROMPT = (
-    "You are a strict fact-checker for a university assessment. "
-    "Return strict JSON only."
-)
-
-_REGEN_SYSTEM_PROMPT = (
-    "You are an assessment writer fixing one rejected question. "
-    "Return strict JSON only."
-)
-
 
 class _UsageAccumulator:
     """Cộng dồn token của mọi lần gọi trong một bước (kể cả lần sửa JSON)."""
@@ -217,7 +202,7 @@ class GenerateCurriculumQuizUseCase:
             )
 
         # 4. Build prompt
-        prompt = self._build_prompt(
+        prompt = prompts.generation(
             course_title=stored_course.title_vi,
             lo_code=lo_obj.code,
             lo_vi=lo_obj.statement_vi,
@@ -233,14 +218,14 @@ class GenerateCurriculumQuizUseCase:
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_QUIZ_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_CurriculumQuizPayload,
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="quiz_generation",
+            use_case=prompt.name,
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -367,45 +352,6 @@ class GenerateCurriculumQuizUseCase:
             request.course_id, request.target_kind, request.target_code
         )
 
-    def _build_prompt(
-        self,
-        course_title: str,
-        lo_code: str,
-        lo_vi: str,
-        lo_en: str | None,
-        bloom: str,
-        style: str,
-        count: int,
-        context_parts: list[str],
-    ) -> str:
-        style_desc = {
-            "quiz": "quick recall / comprehension",
-            "midterm": "mixed application and analysis",
-            "final": "integrative synthesis across topics",
-        }.get(style, style)
-
-        lo_line = f"{lo_code} — {lo_vi}"
-        if lo_en:
-            lo_line += f" ({lo_en})"
-
-        context_text = "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-
-        return (
-            f"You are creating an assessment item for course: {course_title}\n"
-            f"Target Learning Outcome: {lo_line}\n"
-            f"Bloom level required: {bloom}\n"
-            f"Assessment style: {style} ({style_desc})\n"
-            "Use the language of the source content (Vietnamese unless source is English).\n\n"
-            f"Source excerpts (each with chunk_id):\n{context_text}\n\n"
-            f"Generate {count} multiple-choice questions strictly aligned to the LO.\n"
-            "Each question MUST have exactly 4 choices, one correct_index (0-3), "
-            "an explanation, and a lo_alignment_rationale.\n"
-            "Return strict JSON:\n"
-            '{"questions":[{"question":"...","choices":["...","...","...","..."],'
-            '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard",'
-            '"lo_alignment_rationale":"...","source_chunk_ids":["..."]}]}'
-        )
-
     # ------------------------------------------------------------------
     # Verification + Reflexion
     # ------------------------------------------------------------------
@@ -467,20 +413,20 @@ class GenerateCurriculumQuizUseCase:
         trace_id: str,
         course_id: str,
     ) -> list[_QuestionVerdict] | None:
-        prompt = self._build_verification_prompt(context_parts, questions)
+        prompt = prompts.verification(context_parts, questions)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._verifier.client,
-            prompt=prompt,
-            system=_VERIFIER_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_QuizVerificationPayload,
             repair_schema_name="QuizVerification",
             on_usage=usage,
         )
         self._log_usage(
             role=self._verifier,
-            use_case="quiz_verification",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -505,20 +451,20 @@ class GenerateCurriculumQuizUseCase:
         trace_id: str,
         course_id: str,
     ) -> _CurriculumQuestion | None:
-        prompt = self._build_regeneration_prompt(context_parts, original, reason)
+        prompt = prompts.regeneration(context_parts, original, reason)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_REGEN_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_CurriculumQuestion,
             repair_schema_name="CurriculumQuestion",
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="quiz_regeneration",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -533,65 +479,6 @@ class GenerateCurriculumQuizUseCase:
             )
             return None
         return result.unwrap()
-
-    def _build_verification_prompt(
-        self,
-        context_parts: list[str],
-        questions: list[_CurriculumQuestion],
-    ) -> str:
-        context_text = (
-            "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-        )
-        questions_text = "\n\n".join(
-            f"[{idx}] Question: {q.question}\n"
-            f"Choices: {list(q.choices)}\n"
-            "Marked correct: "
-            f"{q.choices[q.correct_index] if 0 <= q.correct_index < len(q.choices) else '(invalid index)'}\n"
-            f"Explanation: {q.explanation}"
-            for idx, q in enumerate(questions)
-        )
-        return (
-            "You are checking a multiple-choice quiz for factual correctness. "
-            "Using ONLY the source excerpts below (not outside knowledge), check "
-            "each question.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Questions to check:\n{questions_text}\n\n"
-            "For each question index, decide:\n"
-            '- "supported": the marked-correct choice and explanation are accurate '
-            "per the source, AND the other three choices are clearly wrong (not "
-            "arguably correct too).\n"
-            '- "contradicted": the marked-correct choice is wrong, the explanation '
-            "misstates the source, or another choice is also defensible as correct.\n"
-            '- "not_enough_evidence": the source excerpts do not cover this enough '
-            "to check.\n"
-            "Return strict JSON:\n"
-            '{"verdicts":[{"question_index":0,'
-            '"verdict":"supported|contradicted|not_enough_evidence","reason":"..."}]}'
-        )
-
-    def _build_regeneration_prompt(
-        self,
-        context_parts: list[str],
-        original: _CurriculumQuestion,
-        reason: str,
-    ) -> str:
-        context_text = (
-            "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-        )
-        return (
-            "A fact-checker rejected the following multiple-choice question because "
-            "it is not properly grounded in the source excerpts below. Rewrite it so "
-            "the problem is fixed. Keep the same topic and difficulty; you may change "
-            "the wording, choices, or correct_index as needed.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Rejected question: {original.question}\n"
-            f"Rejected choices: {list(original.choices)}\n"
-            f"Fact-checker feedback: {reason}\n\n"
-            "Return strict JSON for ONE corrected question:\n"
-            '{"question":"...","choices":["...","...","...","..."],"correct_index":0,'
-            '"explanation":"...","difficulty":"easy|medium|hard",'
-            '"lo_alignment_rationale":"...","source_chunk_ids":["..."]}'
-        )
 
     def _log_usage(
         self,

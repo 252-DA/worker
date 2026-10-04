@@ -9,7 +9,6 @@ card im lặng khi chunk chưa được map LO.
 Một card là một ý, đọc trong 1–3 phút, và mọi câu trong đó phải có trong đoạn
 nguồn. ``check_question``/``check_answer`` là mặt lật của flashcard.
 """
-import json
 import re
 import time
 import uuid
@@ -27,6 +26,7 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.prompts import lesson_cards as prompts
 from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
 from worker.use_cases.verification import verify_and_refine
 
@@ -54,22 +54,6 @@ _NULL_STRINGS = {"", "null", "none", "n/a", "na", "-", "không có"}
 # llm_usage_logs.status CHECK chỉ nhận ba giá trị này, phân biệt hoa thường.
 _USAGE_OK = "OK"
 _USAGE_ERROR = "ERROR"
-
-_CARDS_SYSTEM_PROMPT = (
-    "You are an instructional designer writing micro-learning cards for a university course. "
-    "Return strict JSON only."
-)
-
-_VERIFIER_SYSTEM_PROMPT = (
-    "You are a strict fact-checker for university learning material. "
-    "Return strict JSON only."
-)
-
-_REGEN_SYSTEM_PROMPT = (
-    "You are an instructional designer fixing one rejected micro-learning card. "
-    "Return strict JSON only."
-)
-
 
 class _UsageAccumulator:
     """Cộng dồn token của mọi lần gọi trong một bước (kể cả lần sửa JSON)."""
@@ -250,27 +234,28 @@ class GenerateLessonCardsUseCase:
                 f"No grounded source chunks available for learning outcome {lo.lo_id}"
             ))
 
-        prompt = self._build_prompt(
+        prompt = prompts.generation(
             course_title=target.course.title_vi,
             lo_code=lo.code,
             lo_vi=lo.statement_vi,
             lo_en=lo.statement_en,
             count=request.count,
+            max_bullets=_MAX_BULLETS,
             context_parts=context_parts,
         )
         started = time.monotonic()
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_CARDS_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_LessonCardsPayload,
             repair_schema_name="LessonCards",
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="card_generation",
+            use_case=prompt.name,
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -396,47 +381,6 @@ class GenerateLessonCardsUseCase:
             model_id=self._writer.client.model_id,
         )
 
-    def _build_prompt(
-        self,
-        course_title: str,
-        lo_code: str,
-        lo_vi: str,
-        lo_en: str | None,
-        count: int,
-        context_parts: list[str],
-    ) -> str:
-        lo_line = f"{lo_code} — {lo_vi}"
-        if lo_en:
-            lo_line += f" ({lo_en})"
-        context_text = "\n\n".join(context_parts)
-
-        return (
-            f"You are writing micro-learning cards for course: {course_title}\n"
-            f"Target Learning Outcome: {lo_line}\n"
-            "Use the language of the source content (Vietnamese unless source is English).\n\n"
-            f"Source excerpts (each with chunk_id):\n{context_text}\n\n"
-            f"Write {count} lesson cards that together help a learner reach this LO. "
-            "Order them so that earlier cards introduce what later cards build on.\n"
-            "Rules:\n"
-            "- One idea per card. If a title needs \"and\", split it into two cards.\n"
-            "- Cards must not repeat each other.\n"
-            "- Every statement must be supported by the source excerpts. Do not add outside facts.\n"
-            "- title: a short name for the idea, at most 10 words.\n"
-            "- key_insight: the 1-2 sentences a learner must remember if they read nothing else.\n"
-            f"- bullets: 2-{_MAX_BULLETS} short points explaining the idea, at most 25 words each.\n"
-            "- example: a concrete example taken from the source, or null if the source has none.\n"
-            "- misconception: a common misunderstanding, only if the source states or clearly "
-            "implies it; otherwise null.\n"
-            "- check_question: one short question a learner answers from memory to test this "
-            "card. Not a yes/no question.\n"
-            "- check_answer: the correct answer in 1-2 sentences.\n"
-            "- source_chunk_ids: the chunk_ids this card is based on.\n"
-            "Return strict JSON:\n"
-            '{"cards":[{"title":"...","key_insight":"...","bullets":["...","..."],'
-            '"example":"... or null","misconception":"... or null",'
-            '"check_question":"...","check_answer":"...","source_chunk_ids":["..."]}]}'
-        )
-
     # ------------------------------------------------------------------
     # Verification + Reflexion
     # ------------------------------------------------------------------
@@ -448,20 +392,20 @@ class GenerateLessonCardsUseCase:
         trace_id: str,
         course_id: str,
     ) -> dict[int, str] | None:
-        prompt = self._build_verification_prompt(context_parts, cards)
+        prompt = prompts.verification(context_parts, cards)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._verifier.client,
-            prompt=prompt,
-            system=_VERIFIER_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_CardVerificationPayload,
             repair_schema_name="CardVerification",
             on_usage=usage,
         )
         self._log_usage(
             role=self._verifier,
-            use_case="card_verification",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -490,20 +434,20 @@ class GenerateLessonCardsUseCase:
         trace_id: str,
         course_id: str,
     ) -> _LessonCard | None:
-        prompt = self._build_regeneration_prompt(context_parts, original, reason)
+        prompt = prompts.regeneration(context_parts, original, reason)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_REGEN_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_LessonCard,
             repair_schema_name="LessonCard",
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="card_regeneration",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -518,63 +462,6 @@ class GenerateLessonCardsUseCase:
             )
             return None
         return result.unwrap()
-
-    def _build_verification_prompt(
-        self,
-        context_parts: list[str],
-        cards: list[_LessonCard],
-    ) -> str:
-        context_text = "\n\n".join(context_parts)
-        cards_text = "\n\n".join(
-            f"[{idx}] Title: {card.title}\n"
-            f"Key insight: {card.key_insight}\n"
-            f"Bullets: {card.bullets}\n"
-            f"Example: {card.example or '(none)'}\n"
-            f"Misconception: {card.misconception or '(none)'}\n"
-            f"Check question: {card.check_question}\n"
-            f"Check answer: {card.check_answer}"
-            for idx, card in enumerate(cards)
-        )
-        return (
-            "You are checking micro-learning cards for factual correctness. "
-            "Using ONLY the source excerpts below (not outside knowledge), check "
-            "each card.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Cards to check:\n{cards_text}\n\n"
-            "For each card index, decide:\n"
-            '- "supported": every statement in the key insight, bullets, example and '
-            "misconception is backed by the source, AND the check answer correctly "
-            "answers the check question according to the source.\n"
-            '- "contradicted": any statement misstates the source, or the check answer '
-            "is wrong.\n"
-            '- "not_enough_evidence": the card makes claims the source excerpts do not '
-            "cover.\n"
-            "Return strict JSON:\n"
-            '{"verdicts":[{"card_index":0,'
-            '"verdict":"supported|contradicted|not_enough_evidence","reason":"..."}]}'
-        )
-
-    def _build_regeneration_prompt(
-        self,
-        context_parts: list[str],
-        original: _LessonCard,
-        reason: str,
-    ) -> str:
-        context_text = "\n\n".join(context_parts)
-        rejected = json.dumps(original.model_dump(), ensure_ascii=False)
-        return (
-            "A fact-checker rejected the following micro-learning card because it is "
-            "not properly grounded in the source excerpts below. Rewrite it so the "
-            "problem is fixed. Keep the same idea; remove anything the source does "
-            "not support.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Rejected card: {rejected}\n"
-            f"Fact-checker feedback: {reason}\n\n"
-            "Return strict JSON for ONE corrected card:\n"
-            '{"title":"...","key_insight":"...","bullets":["...","..."],'
-            '"example":"... or null","misconception":"... or null",'
-            '"check_question":"...","check_answer":"...","source_chunk_ids":["..."]}'
-        )
 
     def _log_usage(
         self,
