@@ -25,11 +25,11 @@ jobs:
         with:
           path: worker
 
-      - uses: 252-DA/core-chunking/.github/actions/materialize@3d3e2172136863f196ee77376525b08bc78bad57
+      - uses: 252-DA/core-chunking/.github/actions/materialize@ef385cddba8cc716f779f93a54b287828e0e8ed0
         with:
           path: packages-ai
 
-      - uses: 252-DA/ai-sdk/.github/actions/materialize@6435f97d31c72e2b4aadfa9a42d684e2e963bdfd
+      - uses: 252-DA/ai-sdk/.github/actions/materialize@d9b39ce3c90d9031e6ec459e6610000795b3d57f
         with:
           path: ai-sdk
 
@@ -58,11 +58,11 @@ jobs:
         with:
           path: worker
 
-      - uses: 252-DA/core-chunking/.github/actions/materialize@3d3e2172136863f196ee77376525b08bc78bad57
+      - uses: 252-DA/core-chunking/.github/actions/materialize@ef385cddba8cc716f779f93a54b287828e0e8ed0
         with:
           path: packages-ai
 
-      - uses: 252-DA/ai-sdk/.github/actions/materialize@6435f97d31c72e2b4aadfa9a42d684e2e963bdfd
+      - uses: 252-DA/ai-sdk/.github/actions/materialize@d9b39ce3c90d9031e6ec459e6610000795b3d57f
         with:
           path: ai-sdk
 
