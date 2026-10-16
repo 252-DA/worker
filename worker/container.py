@@ -475,6 +475,17 @@ class AnswerGradingContainer(BaseWorkerContainer):
             grader=self.roles.role(QUIZ_VERIFICATION),
         )
 
+    @property
+    def grade_micro_content_answers_use_case(self):
+        """Chấm câu tự luận Micro Content theo rubric."""
+        from worker.services.micro_content_grading_store import MicroContentGradingStore
+        from worker.use_cases.grade_micro_content_answers import GradeMicroContentAnswersUseCase
+
+        return GradeMicroContentAnswersUseCase(
+            store=MicroContentGradingStore(self.settings.sql),
+            grader=self.roles.role(QUIZ_VERIFICATION),
+        )
+
 
 class OutboxWorkerContainer(BaseWorkerContainer):
     """Build only the dependencies needed by the outbox projector worker."""

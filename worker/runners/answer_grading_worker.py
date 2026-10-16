@@ -69,6 +69,26 @@ def parse_grading_job(data: Any) -> GradeShortAnswersRequest:
     )
 
 
+def parse_micro_content_grading_job(data: Any):
+    from worker.use_cases.grade_micro_content_answers import GradeMicroContentAnswersRequest
+
+    if not isinstance(data, dict) or not isinstance(data.get("payload"), dict):
+        raise ValueError("grading job must carry an outbox payload")
+    payload = data["payload"]
+    attempt_id = payload.get("attempt_id") or data.get("aggregate_id")
+    course_id = payload.get("course_id")
+    micro_content_id = payload.get("micro_content_id") or ""
+    if not isinstance(attempt_id, str) or not isinstance(course_id, str):
+        raise ValueError("grading job needs attempt_id and course_id")
+    answer_ids = _ids(payload, "answer_ids")
+    return GradeMicroContentAnswersRequest(
+        attempt_id=attempt_id,
+        course_id=course_id,
+        micro_content_id=micro_content_id,
+        answer_ids=answer_ids,
+    )
+
+
 def is_final_attempt(bull_job: Any) -> bool:
     """``attemptsMade`` đếm số lần đã thất bại, nên lần đang chạy là lần thứ +1."""
     opts = getattr(bull_job, "opts", None) or {}
@@ -78,6 +98,28 @@ def is_final_attempt(bull_job: Any) -> bool:
 
 async def process_grading_job(container, bull_job, job_token):
     del job_token
+    event_type = bull_job.data.get("event_type") if isinstance(bull_job.data, dict) else None
+
+    if event_type == "MICRO_CONTENT_GRADING_REQUESTED":
+        try:
+            req = parse_micro_content_grading_job(bull_job.data)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UnrecoverableError(f"invalid micro-content grading job: {exc}") from exc
+
+        result = await asyncio.to_thread(
+            container.grade_micro_content_answers_use_case.execute,
+            req,
+            final_attempt=is_final_attempt(bull_job),
+        )
+        if result.is_err():
+            raise result.error
+        res = result.unwrap()
+        return {
+            "attempt_id": req.attempt_id,
+            "graded": res.graded,
+            "needs_review": res.needs_review,
+        }
+
     try:
         request = parse_grading_job(bull_job.data)
     except (KeyError, TypeError, ValueError) as exc:
