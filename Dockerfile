@@ -2,10 +2,10 @@
 FROM ghcr.io/astral-sh/uv:0.6.14 AS uv
 FROM python:3.10-slim
 
+# Không đặt LLM__* ở đây: model chọn theo task (web hoặc LLM_PROFILE__<TASK>),
+# xem docs/model-routing-design.md.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    LLM__PROVIDER=gemini \
-    LLM__MODEL=gemini-3-flash-preview
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

@@ -31,20 +31,11 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.prompts import enrichment as prompts
 from document_chunk.shared.tracing import get_tracer
 
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
-
-_CARDS_SYSTEM_PROMPT = (
-    "You are a teaching assistant that creates concise micro-learning lesson cards. "
-    "Return strict JSON only."
-)
-_QUIZ_SYSTEM_PROMPT = (
-    "You are an assessment writer that creates multiple-choice questions from academic content. "
-    "Return strict JSON only."
-)
-
 
 class _GeneratedCard(BaseModel):
     title: str
@@ -427,19 +418,19 @@ class RunEnrichmentUseCase:
         self,
         section: _SectionContext,
     ) -> Result[list[StoredLessonCard], Exception]:
-        prompt = self._build_cards_prompt(section)
+        prompt = prompts.cards(section)
         started = time.monotonic()
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._llm_client,
-            prompt=prompt,
-            system=_CARDS_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_GeneratedCardsPayload,
             repair_schema_name="cards",
             on_usage=usage,
         )
         self._log_usage(
-            use_case="enrichment_cards",
+            use_case=prompt.name,
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             usage=usage.total,
@@ -470,19 +461,19 @@ class RunEnrichmentUseCase:
         self,
         section: _SectionContext,
     ) -> Result[list[StoredQuizItem], Exception]:
-        prompt = self._build_quiz_prompt(section)
+        prompt = prompts.quiz(section)
         started = time.monotonic()
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._llm_client,
-            prompt=prompt,
-            system=_QUIZ_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_GeneratedQuizPayload,
             repair_schema_name="quiz",
             on_usage=usage,
         )
         self._log_usage(
-            use_case="enrichment_quiz",
+            use_case=prompt.name,
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             usage=usage.total,
@@ -544,38 +535,6 @@ class RunEnrichmentUseCase:
                 profile=self._role.profile,
                 error=str(result.error),
             )
-
-    def _build_cards_prompt(self, section: _SectionContext) -> str:
-        heading_path = " > ".join(section.heading_path)
-        language = section.language or "same as source"
-        return (
-            "Create 2-3 micro-learning lesson cards from the section below.\n"
-            "Use the same language as the source content.\n"
-            "Return strict JSON only with this shape:\n"
-            '{"cards":[{"title":"...","bullets":["..."],"key_insight":"..."}]}\n\n'
-            f"Heading path: {heading_path}\n"
-            f"Section title: {section.title}\n"
-            f"Language: {language}\n\n"
-            "Section content:\n"
-            f"{section.content_text}"
-        )
-
-    def _build_quiz_prompt(self, section: _SectionContext) -> str:
-        heading_path = " > ".join(section.heading_path)
-        language = section.language or "same as source"
-        return (
-            "Create 3-5 multiple-choice questions from the section below.\n"
-            "Each question must have exactly 4 choices, one correct answer index, and an explanation.\n"
-            "Use the same language as the source content.\n"
-            "Return strict JSON only with this shape:\n"
-            '{"questions":[{"question":"...","choices":["...","...","...","..."],'
-            '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard"}]}\n\n'
-            f"Heading path: {heading_path}\n"
-            f"Section title: {section.title}\n"
-            f"Language: {language}\n\n"
-            "Section content:\n"
-            f"{section.content_text}"
-        )
 
     def _effective_heading_path(self, chunk: StoredChunkMetadata) -> tuple[str, ...]:
         if chunk.heading_path:

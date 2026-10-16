@@ -6,11 +6,16 @@ from bullmq.custom_errors import UnrecoverableError
 
 from document_chunk.shared.result import Ok
 from worker.runners.content_generation_worker import (
+    _card_request,
     _parse_job,
     _process_job,
     _quiz_request,
 )
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizResponse
+from worker.use_cases.generate_lesson_cards import (
+    DEFAULT_CARD_COUNT,
+    GenerateLessonCardsResponse,
+)
 
 
 def _job_data():
@@ -40,6 +45,15 @@ def test_parse_job_and_scope():
     assert request.target_code == "L.O.3.1"
     assert request.count == 3
     assert request.bloom_level == "analyze"
+    # Request cũ không có question_type: vẫn là trắc nghiệm một đáp án.
+    assert request.question_type == "MCQ_SINGLE"
+
+
+def test_quiz_request_reads_question_type():
+    data = _job_data()
+    data["payload"]["scope"]["question_type"] = "FILL_BLANK"
+
+    assert _quiz_request(_parse_job(data)).question_type == "FILL_BLANK"
 
 
 @pytest.mark.asyncio
@@ -65,12 +79,55 @@ async def test_process_job_updates_request_lifecycle():
     assert lifecycle[-1].kwargs["generated_count"] == 3
 
 
+def _card_job_data(**scope):
+    data = _job_data()
+    data["payload"]["type"] = "card"
+    data["payload"]["scope"] = {"target_kind": "lo", "target_code": "lo-uuid", **scope}
+    return data
+
+
+def test_card_request_reads_target_and_defaults_count():
+    request = _card_request(_parse_job(_card_job_data(source_document_ids=["doc-1"])))
+
+    assert request.target_kind == "lo"
+    assert request.target_code == "lo-uuid"
+    assert request.count == DEFAULT_CARD_COUNT
+    assert request.source_document_ids == ["doc-1"]
+
+
+def test_card_request_rejects_count_out_of_range():
+    with pytest.raises(ValueError, match="card count"):
+        _card_request(_parse_job(_card_job_data(count=50)))
+
+
+@pytest.mark.asyncio
+async def test_card_job_runs_card_use_case_and_records_count():
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.return_value = Ok(None)
+    container.generate_lesson_cards_use_case.execute.return_value = Ok(
+        GenerateLessonCardsResponse(
+            course_id="course-1",
+            lo_id="lo-1",
+            card_count=2,
+            card_ids=["c1", "c2"],
+        )
+    )
+
+    result = await _process_job(container, SimpleNamespace(data=_card_job_data(count=2)), None)
+
+    assert result["card_ids"] == ["c1", "c2"]
+    container.generate_curriculum_quiz_use_case.execute.assert_not_called()
+    lifecycle = container.metadata_store.update_content_generation_request.call_args_list
+    assert lifecycle[-1].kwargs["status"] == "SUCCEEDED"
+    assert lifecycle[-1].kwargs["generated_count"] == 2
+
+
 @pytest.mark.asyncio
 async def test_unsupported_content_type_marks_request_failed():
     container = MagicMock()
     container.metadata_store.update_content_generation_request.return_value = Ok(None)
     data = _job_data()
-    data["payload"]["type"] = "card"
+    data["payload"]["type"] = "summary"
 
     with pytest.raises(UnrecoverableError):
         await _process_job(container, SimpleNamespace(data=data), None)

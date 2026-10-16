@@ -4,11 +4,12 @@ GenerateCurriculumQuizUseCase — generate quiz items aligned to a specific LO/c
 Sibling to RunEnrichmentUseCase (course-scoped, not document-scoped).
 Used by the queued content-generation worker and the legacy synchronous adapter.
 """
+import re
 import time
 import uuid
-from typing import Literal, Protocol
+from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from document_chunk.application.dto.generation_dto import (
     GenerateCurriculumQuizRequest,
@@ -17,6 +18,7 @@ from document_chunk.application.dto.generation_dto import (
 from document_chunk.application.services.answer_layout import (
     balanced_positions,
     shuffle_choices,
+    shuffle_order,
 )
 from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.bloom import bloom_to_level, bloom_to_name
@@ -27,6 +29,9 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.prompts import curriculum_quiz as prompts
+from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
+from worker.use_cases.verification import verify_and_refine
 
 logger = get_logger(__name__)
 
@@ -38,22 +43,6 @@ _QUIZ_ID_NAMESPACE = uuid.UUID("6f9b5f1e-3a4d-5c7b-8e2f-1d0a9c8b7e64")
 _USAGE_OK = "OK"
 _USAGE_ERROR = "ERROR"
 
-_QUIZ_SYSTEM_PROMPT = (
-    "You are an assessment writer for a university course. "
-    "Return strict JSON only."
-)
-
-_VERIFIER_SYSTEM_PROMPT = (
-    "You are a strict fact-checker for a university assessment. "
-    "Return strict JSON only."
-)
-
-_REGEN_SYSTEM_PROMPT = (
-    "You are an assessment writer fixing one rejected question. "
-    "Return strict JSON only."
-)
-
-
 class _UsageAccumulator:
     """Cộng dồn token của mọi lần gọi trong một bước (kể cả lần sửa JSON)."""
 
@@ -64,27 +53,26 @@ class _UsageAccumulator:
         self.total = self.total + usage
 
 
-class QuizContextClient(Protocol):
-    def retrieve_quiz_context(
-        self,
-        course_id: str,
-        lo_code: str,
-        query: str | None = None,
-        bloom_level: str | None = None,
-        assessment_style: str = "quiz",
-        top_k: int = 5,
-    ):
-        ...
-
-
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-class _CurriculumQuestion(BaseModel):
+# Phương án cố định của câu Đúng/Sai, khớp TRUE_FALSE_OPTIONS ở core-api.
+_TRUE_FALSE_OPTIONS = ("Đúng", "Sai")
+_BLANK = re.compile(r"_{3,}")
+
+
+def _texts(values: list[str], *, label: str) -> list[str]:
+    normalized = [v.strip() for v in values if v and v.strip()]
+    if len(normalized) != len(values):
+        raise ValueError(f"{label} must not contain empty items")
+    if len({v.casefold() for v in normalized}) != len(normalized):
+        raise ValueError(f"{label} must be distinct")
+    return normalized
+
+
+class _QuestionBase(BaseModel):
     question: str
-    choices: list[str] = Field(min_length=4, max_length=4)
-    correct_index: int = Field(ge=0, le=3)
     explanation: str
     difficulty: str = "medium"
     lo_alignment_rationale: str = ""
@@ -98,14 +86,6 @@ class _CurriculumQuestion(BaseModel):
             raise ValueError("value must not be empty")
         return v
 
-    @field_validator("choices")
-    @classmethod
-    def _normalize_choices(cls, choices: list[str]) -> list[str]:
-        normalized = [c.strip() for c in choices if c and c.strip()]
-        if len(normalized) != 4:
-            raise ValueError("choices must contain exactly 4 non-empty items")
-        return normalized
-
     @field_validator("difficulty")
     @classmethod
     def _normalize_difficulty(cls, value: str) -> str:
@@ -115,8 +95,103 @@ class _CurriculumQuestion(BaseModel):
         return v
 
 
-class _CurriculumQuizPayload(BaseModel):
-    questions: list[_CurriculumQuestion] = Field(min_length=1)
+class _CurriculumQuestion(_QuestionBase):
+    """MCQ_SINGLE: 4 phương án, một đáp án đúng."""
+
+    choices: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+
+    @field_validator("choices")
+    @classmethod
+    def _normalize_choices(cls, choices: list[str]) -> list[str]:
+        normalized = [c.strip() for c in choices if c and c.strip()]
+        if len(normalized) != 4:
+            raise ValueError("choices must contain exactly 4 non-empty items")
+        return normalized
+
+
+class _MultiAnswerQuestion(_QuestionBase):
+    """MCQ_MULTI: 4–6 phương án, chọn tất cả đáp án đúng."""
+
+    choices: list[str] = Field(min_length=4, max_length=6)
+    correct_indices: list[int] = Field(min_length=1)
+
+    @field_validator("choices")
+    @classmethod
+    def _normalize_choices(cls, choices: list[str]) -> list[str]:
+        return _texts(choices, label="choices")
+
+    @model_validator(mode="after")
+    def _check_indices(self) -> "_MultiAnswerQuestion":
+        indices = set(self.correct_indices)
+        if len(indices) != len(self.correct_indices):
+            raise ValueError("correct_indices must be distinct")
+        if not all(0 <= i < len(self.choices) for i in indices):
+            raise ValueError("correct_indices must point at choices")
+        if len(indices) == len(self.choices):
+            raise ValueError("at least one choice must be wrong")
+        return self
+
+
+class _TrueFalseQuestion(_QuestionBase):
+    """TRUE_FALSE: ``question`` là một mệnh đề."""
+
+    is_true: bool
+
+
+class _FillBlankQuestion(_QuestionBase):
+    """FILL_BLANK: một chỗ trống ``____``, các cách viết đáp án chấp nhận."""
+
+    accepted_answers: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("question")
+    @classmethod
+    def _one_blank(cls, value: str) -> str:
+        if len(_BLANK.findall(value)) != 1:
+            raise ValueError("question must contain exactly one blank written as ____")
+        return value
+
+    @field_validator("accepted_answers")
+    @classmethod
+    def _normalize_answers(cls, answers: list[str]) -> list[str]:
+        return _texts(answers, label="accepted_answers")
+
+
+class _ShortAnswerQuestion(_QuestionBase):
+    """SHORT_ANSWER: bài mẫu và các ý chấm; worker chấm bài làm bằng LLM."""
+
+    model_answer: str
+    rubric: list[str] = Field(min_length=1, max_length=6)
+
+    @field_validator("model_answer")
+    @classmethod
+    def _model_answer(cls, value: str) -> str:
+        v = value.strip()
+        if not v:
+            raise ValueError("model_answer must not be empty")
+        return v
+
+    @field_validator("rubric")
+    @classmethod
+    def _normalize_rubric(cls, rubric: list[str]) -> list[str]:
+        return _texts(rubric, label="rubric")
+
+
+_QuestionT = TypeVar("_QuestionT", bound=_QuestionBase)
+
+
+class _CurriculumQuizPayload(BaseModel, Generic[_QuestionT]):
+    questions: list[_QuestionT] = Field(min_length=1)
+
+
+# Kiểu câu → (schema một câu, tên schema cho bước sửa JSON).
+_QUESTION_MODELS: dict[str, tuple[type[_QuestionBase], str]] = {
+    "MCQ_SINGLE": (_CurriculumQuestion, "CurriculumQuestion"),
+    "MCQ_MULTI": (_MultiAnswerQuestion, "MultiAnswerQuestion"),
+    "TRUE_FALSE": (_TrueFalseQuestion, "TrueFalseQuestion"),
+    "FILL_BLANK": (_FillBlankQuestion, "FillBlankQuestion"),
+    "SHORT_ANSWER": (_ShortAnswerQuestion, "ShortAnswerQuestion"),
+}
 
 
 class _QuestionVerdict(BaseModel):
@@ -127,6 +202,38 @@ class _QuestionVerdict(BaseModel):
 
 class _QuizVerificationPayload(BaseModel):
     verdicts: list[_QuestionVerdict] = Field(min_length=1)
+
+
+def _answer_layout(
+    q: _QuestionBase,
+    question_type: str,
+    *,
+    seed: str,
+    target_index: int,
+) -> tuple[list[str], int, object]:
+    """
+    (phương án lưu, correct_index, correct_answer) theo dạng của từng kiểu câu.
+
+    ``correct_answer`` None với MCQ_SINGLE: repository lấy ``choices[correct_index]``.
+    """
+    if isinstance(q, _CurriculumQuestion):
+        # G3: xáo phương án, vị trí đáp án đúng phân bố đều trong mẻ.
+        choices, correct_index = shuffle_choices(
+            list(q.choices), q.correct_index, seed=seed, target_index=target_index
+        )
+        return choices, correct_index, None
+    if isinstance(q, _MultiAnswerQuestion):
+        correct = {q.choices[i] for i in q.correct_indices}
+        choices = shuffle_order(list(q.choices), seed=seed)
+        return choices, 0, [c for c in choices if c in correct]
+    if isinstance(q, _TrueFalseQuestion):
+        answer = _TRUE_FALSE_OPTIONS[0 if q.is_true else 1]
+        return list(_TRUE_FALSE_OPTIONS), _TRUE_FALSE_OPTIONS.index(answer), answer
+    if isinstance(q, _FillBlankQuestion):
+        return [], 0, list(q.accepted_answers)
+    if isinstance(q, _ShortAnswerQuestion):
+        return [], 0, {"model_answer": q.model_answer, "rubric": list(q.rubric)}
+    raise ProcessingError(f"Unsupported question type: {question_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +254,13 @@ class GenerateCurriculumQuizUseCase:
         max_verification_retries: int = 2,
     ) -> None:
         self._metadata_store = metadata_store
-        self._max_context_chars = max_context_chars
-        self._context_client = context_client
-        self._fallback_to_local_context = fallback_to_local_context
+        self._context = LoContextLoader(
+            metadata_store=metadata_store,
+            context_client=context_client,
+            fallback_to_local_context=fallback_to_local_context,
+            max_context_chars=max_context_chars,
+            log_prefix="generate_curriculum_quiz",
+        )
         self._max_verification_retries = max_verification_retries
         # Viết câu và sinh lại câu bị loại đều là việc của writer; chấm là việc
         # của judge. Không truyền judge thì cả hai là một model, như trước đây.
@@ -160,6 +271,10 @@ class GenerateCurriculumQuizUseCase:
         self, request: GenerateCurriculumQuizRequest
     ) -> Result[GenerateCurriculumQuizResponse, Exception]:
         trace_id = str(uuid.uuid4())
+        question_type = request.question_type
+        if question_type not in _QUESTION_MODELS:
+            return Err(ProcessingError(f"Unsupported question type: {question_type}"))
+        question_model, schema_name = _QUESTION_MODELS[question_type]
 
         # 1. Resolve LO ids from target
         lo_ids = self._resolve_lo_ids(request)
@@ -224,7 +339,7 @@ class GenerateCurriculumQuizUseCase:
             )
 
         # 4. Build prompt
-        prompt = self._build_prompt(
+        prompt = prompts.generation(
             course_title=stored_course.title_vi,
             lo_code=lo_obj.code,
             lo_vi=lo_obj.statement_vi,
@@ -233,6 +348,7 @@ class GenerateCurriculumQuizUseCase:
             style=request.style,
             count=request.count,
             context_parts=context_parts,
+            question_type=question_type,
         )
 
         # 5. Generate via LLM
@@ -240,14 +356,14 @@ class GenerateCurriculumQuizUseCase:
         usage = _UsageAccumulator()
         payload_result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_QUIZ_SYSTEM_PROMPT,
-            schema_model=_CurriculumQuizPayload,
+            prompt=prompt.user,
+            system=prompt.system,
+            schema_model=_CurriculumQuizPayload[question_model],
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="quiz_generation",
+            use_case=prompt.name,
             status=_USAGE_OK if payload_result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -257,7 +373,7 @@ class GenerateCurriculumQuizUseCase:
         if payload_result.is_err():
             return Err(payload_result.error)
 
-        payload: _CurriculumQuizPayload = payload_result.unwrap()
+        payload = payload_result.unwrap()
 
         # 5b. Verify each question against the retrieved source excerpts and give
         # the model a bounded number of chances to fix anything unsupported
@@ -267,6 +383,8 @@ class GenerateCurriculumQuizUseCase:
             context_parts=context_parts,
             trace_id=trace_id,
             course_id=request.course_id,
+            question_type=question_type,
+            schema=(question_model, schema_name),
         )
         if rejected:
             logger.warning(
@@ -292,20 +410,20 @@ class GenerateCurriculumQuizUseCase:
 
         for idx, q in enumerate(questions):
             # O3: id tất định theo (LO, nội dung câu hỏi). Trước đây là uuid4 nên
-            # một lần retry sau bước lưu sẽ nhân đôi cả bộ câu.
-            qid = str(uuid.uuid5(_QUIZ_ID_NAMESPACE, f"{primary_lo_id}|{q.question.strip()}"))
+            # một lần retry sau bước lưu sẽ nhân đôi cả bộ câu. Kiểu khác MCQ_SINGLE
+            # thêm kiểu vào khoá để không đè lên câu cùng lời của kiểu khác.
+            key = q.question.strip()
+            if question_type != "MCQ_SINGLE":
+                key = f"{question_type}|{key}"
+            qid = str(uuid.uuid5(_QUIZ_ID_NAMESPACE, f"{primary_lo_id}|{key}"))
             question_ids.append(qid)
             valid_source_ids = tuple(
                 source_id
                 for source_id in q.source_chunk_ids
                 if source_id in source_chunk_ids
             )
-            # G3: xáo phương án, vị trí đáp án đúng phân bố đều trong mẻ.
-            choices, correct_index = shuffle_choices(
-                list(q.choices),
-                q.correct_index,
-                seed=qid,
-                target_index=targets[idx],
+            choices, correct_index, correct_answer = _answer_layout(
+                q, question_type, seed=qid, target_index=targets[idx]
             )
             item = StoredQuizItem(
                 question_id=qid,
@@ -320,6 +438,8 @@ class GenerateCurriculumQuizUseCase:
                 difficulty=q.difficulty,
                 question_index=idx,
                 model_id=self._writer.client.model_id,
+                question_type=question_type,
+                correct_answer=correct_answer,
             )
             stored_items.append(item)
 
@@ -357,159 +477,21 @@ class GenerateCurriculumQuizUseCase:
         lo_statement: str,
         bloom: str,
     ) -> Result[tuple[list[str], list[str], str | None], Exception]:
-        # Module launches must use only the selected chapter's lecture sources.
-        # Generic MCP retrieval has no document filter, so use local LO mappings
-        # for this explicit scope and never fall back to another chapter.
-        if self._context_client is not None and request.source_document_ids is None:
-            try:
-                context = self._context_client.retrieve_quiz_context(
-                    course_id=request.course_id,
-                    lo_code=lo_code,
-                    query=lo_statement,
-                    bloom_level=bloom,
-                    assessment_style=request.style,
-                    top_k=5,
-                )
-                parts: list[str] = []
-                source_ids: list[str] = []
-                source_document_id: str | None = None
-                total_chars = 0
-                for index, chunk in enumerate(context.chunks, start=1):
-                    content = chunk.content.strip()
-                    if not content:
-                        continue
-                    snippet = (
-                        f"[{index}] (chunk_id={chunk.chunk_id}, "
-                        f"page={chunk.page_number or 'n/a'})\n{content}"
-                    )
-                    if parts and total_chars + len(snippet) > self._max_context_chars:
-                        break
-                    parts.append(snippet)
-                    source_ids.append(chunk.chunk_id)
-                    source_document_id = source_document_id or chunk.document_id
-                    total_chars += len(snippet)
-                if parts:
-                    logger.info(
-                        "generate_curriculum_quiz.context.mcp",
-                        lo_id=primary_lo_id,
-                        chunks=len(parts),
-                    )
-                    return Ok((parts, source_ids, source_document_id))
-            except Exception as exc:
-                if not self._fallback_to_local_context:
-                    return Err(
-                        ProcessingError(
-                            "MCP quiz-context retrieval failed",
-                            cause=exc,
-                        )
-                    )
-                logger.warning(
-                    "generate_curriculum_quiz.context.mcp_failed",
-                    lo_id=primary_lo_id,
-                    error=str(exc),
-                )
-
-        chunks_result = self._metadata_store.list_chunks_for_lo(primary_lo_id)
-        if chunks_result.is_err():
-            return Err(chunks_result.error)
-
-        context_parts: list[str] = []
-        total_chars = 0
-        source_chunk_ids: list[str] = []
-        local_document_id: str | None = None
-        candidates = chunks_result.unwrap()
-        if request.source_document_ids is not None:
-            # psycopg returns UUID objects even though the metadata port types
-            # IDs as strings. Normalize before comparing with JSON job IDs.
-            allowed_documents = {str(value) for value in request.source_document_ids}
-            candidates = [c for c in candidates if str(c.document_id) in allowed_documents]
-        for index, chunk in enumerate(candidates[:5], start=1):
-            text = (chunk.content_text or "").strip()
-            if not text:
-                continue
-            snippet = f"[{index}] (chunk_id={chunk.chunk_id})\n{text[:1200]}"
-            if context_parts and total_chars + len(snippet) > self._max_context_chars:
-                break
-            context_parts.append(snippet)
-            source_chunk_ids.append(str(chunk.chunk_id))
-            local_document_id = local_document_id or str(chunk.document_id)
-            total_chars += len(snippet)
-        return Ok((context_parts, source_chunk_ids, local_document_id))
+        return self._context.load(
+            course_id=request.course_id,
+            lo_id=primary_lo_id,
+            lo_code=lo_code,
+            lo_statement=lo_statement,
+            bloom=bloom,
+            style=request.style,
+            source_document_ids=request.source_document_ids,
+        )
 
     def _resolve_lo_ids(
         self, request: GenerateCurriculumQuizRequest
     ) -> Result[list[str], Exception]:
-        kind = request.target_kind
-        code = request.target_code
-        course_id = request.course_id
-
-        if kind == "lo":
-            full_code = code if code.startswith("L.O.") else f"L.O.{code}"
-            curriculum_result = self._metadata_store.get_curriculum(course_id)
-            if curriculum_result.is_err():
-                return Err(curriculum_result.error)
-            curriculum = curriculum_result.unwrap()
-            if curriculum is None:
-                return Ok([])
-            _, _, learning_outcomes, _ = curriculum
-            matching = [
-                lo.lo_id
-                for lo in learning_outcomes
-                if lo.code == full_code or lo.lo_id == code
-            ]
-            return Ok(matching)
-
-        if kind == "chapter":
-            result = self._metadata_store.list_los_by_chapter(course_id, code)
-            if result.is_err():
-                return Err(result.error)
-            return Ok([lo.lo_id for lo in result.unwrap()])
-
-        if kind == "assessment":
-            result = self._metadata_store.list_los_by_assessment(course_id, code)
-            if result.is_err():
-                return Err(result.error)
-            return Ok([lo.lo_id for lo in result.unwrap()])
-
-        return Err(ProcessingError(f"Unknown target_kind: {kind!r}"))
-
-    def _build_prompt(
-        self,
-        course_title: str,
-        lo_code: str,
-        lo_vi: str,
-        lo_en: str | None,
-        bloom: str,
-        style: str,
-        count: int,
-        context_parts: list[str],
-    ) -> str:
-        style_desc = {
-            "quiz": "quick recall / comprehension",
-            "midterm": "mixed application and analysis",
-            "final": "integrative synthesis across topics",
-        }.get(style, style)
-
-        lo_line = f"{lo_code} — {lo_vi}"
-        if lo_en:
-            lo_line += f" ({lo_en})"
-
-        context_text = "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-
-        return (
-            f"You are creating an assessment item for course: {course_title}\n"
-            f"Target Learning Outcome: {lo_line}\n"
-            f"Bloom level required: {bloom}\n"
-            f"Assessment style: {style} ({style_desc})\n"
-            "Use the language of the source content (Vietnamese unless source is English).\n\n"
-            f"Source excerpts (each with chunk_id):\n{context_text}\n\n"
-            f"Generate {count} multiple-choice questions strictly aligned to the LO.\n"
-            "Each question MUST have exactly 4 choices, one correct_index (0-3), "
-            "an explanation, and a lo_alignment_rationale.\n"
-            "Return strict JSON:\n"
-            '{"questions":[{"question":"...","choices":["...","...","...","..."],'
-            '"correct_index":0,"explanation":"...","difficulty":"easy|medium|hard",'
-            '"lo_alignment_rationale":"...","source_chunk_ids":["..."]}]}'
+        return self._context.resolve_lo_ids(
+            request.course_id, request.target_kind, request.target_code
         )
 
     # ------------------------------------------------------------------
@@ -519,11 +501,13 @@ class GenerateCurriculumQuizUseCase:
     def _verify_and_refine(
         self,
         *,
-        questions: list[_CurriculumQuestion],
+        questions: list[_QuestionBase],
         context_parts: list[str],
         trace_id: str,
         course_id: str,
-    ) -> tuple[list[_CurriculumQuestion], list[tuple[_CurriculumQuestion, str]]]:
+        question_type: str = "MCQ_SINGLE",
+        schema: tuple[type[_QuestionBase], str] = _QUESTION_MODELS["MCQ_SINGLE"],
+    ) -> tuple[list[_QuestionBase], list[tuple[_QuestionBase, str]]]:
         """
         Đối chiếu từng câu với đoạn nguồn, cho model tối đa
         ``max_verification_retries`` lượt sửa, rồi trả về (giữ lại, bị loại).
@@ -536,73 +520,61 @@ class GenerateCurriculumQuizUseCase:
         lý do để giữ lại nội dung: người duyệt trong `review.service.ts` vẫn là
         cổng cuối.
         """
-        current = list(questions)
-        if not current:
-            return current, []
-
-        for attempt in range(self._max_verification_retries + 1):
+        def find_failing(current: list[_QuestionBase]) -> dict[int, str] | None:
             verdicts = self._run_verifier(
                 questions=current,
                 context_parts=context_parts,
                 trace_id=trace_id,
                 course_id=course_id,
+                question_type=question_type,
             )
             if verdicts is None:
-                return current, []
+                return None
+            return {v.question_index: v.reason for v in verdicts if v.verdict != "supported"}
 
-            failing = {
-                v.question_index: v.reason
-                for v in verdicts
-                if v.verdict != "supported" and 0 <= v.question_index < len(current)
-            }
-            if not failing:
-                return current, []
-
-            if attempt == self._max_verification_retries:
-                logger.warning(
-                    "generate_curriculum_quiz.verify.exhausted",
-                    trace_id=trace_id,
-                    still_failing=sorted(failing.keys()),
-                )
-                rejected = [(current[i], reason) for i, reason in sorted(failing.items())]
-                kept = [q for i, q in enumerate(current) if i not in failing]
-                return kept, rejected
-
-            for index, reason in failing.items():
-                fixed = self._run_regeneration(
-                    original=current[index],
-                    reason=reason,
-                    context_parts=context_parts,
-                    trace_id=trace_id,
-                    course_id=course_id,
-                )
-                if fixed is not None:
-                    current[index] = fixed
-
-        return current, []
+        return verify_and_refine(
+            questions,
+            find_failing=find_failing,
+            regenerate=lambda original, reason: self._run_regeneration(
+                original=original,
+                reason=reason,
+                context_parts=context_parts,
+                trace_id=trace_id,
+                course_id=course_id,
+                question_type=question_type,
+                schema=schema,
+            ),
+            max_retries=self._max_verification_retries,
+            on_exhausted=lambda still_failing: logger.warning(
+                "generate_curriculum_quiz.verify.exhausted",
+                trace_id=trace_id,
+                still_failing=still_failing,
+            ),
+        )
 
     def _run_verifier(
         self,
         *,
-        questions: list[_CurriculumQuestion],
+        questions: list[_QuestionBase],
         context_parts: list[str],
         trace_id: str,
         course_id: str,
+        question_type: str = "MCQ_SINGLE",
     ) -> list[_QuestionVerdict] | None:
-        prompt = self._build_verification_prompt(context_parts, questions)
+        prompt = prompts.verification(context_parts, questions, question_type)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._verifier.client,
-            prompt=prompt,
-            system=_VERIFIER_SYSTEM_PROMPT,
+            prompt=prompt.user,
+            system=prompt.system,
             schema_model=_QuizVerificationPayload,
             repair_schema_name="QuizVerification",
             on_usage=usage,
         )
         self._log_usage(
             role=self._verifier,
-            use_case="quiz_verification",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -621,26 +593,29 @@ class GenerateCurriculumQuizUseCase:
     def _run_regeneration(
         self,
         *,
-        original: _CurriculumQuestion,
+        original: _QuestionBase,
         reason: str,
         context_parts: list[str],
         trace_id: str,
         course_id: str,
-    ) -> _CurriculumQuestion | None:
-        prompt = self._build_regeneration_prompt(context_parts, original, reason)
+        question_type: str = "MCQ_SINGLE",
+        schema: tuple[type[_QuestionBase], str] = _QUESTION_MODELS["MCQ_SINGLE"],
+    ) -> _QuestionBase | None:
+        prompt = prompts.regeneration(context_parts, original, reason, question_type)
+        schema_model, schema_name = schema
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._writer.client,
-            prompt=prompt,
-            system=_REGEN_SYSTEM_PROMPT,
-            schema_model=_CurriculumQuestion,
-            repair_schema_name="CurriculumQuestion",
+            prompt=prompt.user,
+            system=prompt.system,
+            schema_model=schema_model,
+            repair_schema_name=schema_name,
             on_usage=usage,
         )
         self._log_usage(
             role=self._writer,
-            use_case="quiz_regeneration",
+            use_case=prompt.name,
             status=_USAGE_OK if result.is_ok() else _USAGE_ERROR,
             latency_ms=int((time.monotonic() - started) * 1000),
             trace_id=trace_id,
@@ -655,65 +630,6 @@ class GenerateCurriculumQuizUseCase:
             )
             return None
         return result.unwrap()
-
-    def _build_verification_prompt(
-        self,
-        context_parts: list[str],
-        questions: list[_CurriculumQuestion],
-    ) -> str:
-        context_text = (
-            "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-        )
-        questions_text = "\n\n".join(
-            f"[{idx}] Question: {q.question}\n"
-            f"Choices: {list(q.choices)}\n"
-            "Marked correct: "
-            f"{q.choices[q.correct_index] if 0 <= q.correct_index < len(q.choices) else '(invalid index)'}\n"
-            f"Explanation: {q.explanation}"
-            for idx, q in enumerate(questions)
-        )
-        return (
-            "You are checking a multiple-choice quiz for factual correctness. "
-            "Using ONLY the source excerpts below (not outside knowledge), check "
-            "each question.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Questions to check:\n{questions_text}\n\n"
-            "For each question index, decide:\n"
-            '- "supported": the marked-correct choice and explanation are accurate '
-            "per the source, AND the other three choices are clearly wrong (not "
-            "arguably correct too).\n"
-            '- "contradicted": the marked-correct choice is wrong, the explanation '
-            "misstates the source, or another choice is also defensible as correct.\n"
-            '- "not_enough_evidence": the source excerpts do not cover this enough '
-            "to check.\n"
-            "Return strict JSON:\n"
-            '{"verdicts":[{"question_index":0,'
-            '"verdict":"supported|contradicted|not_enough_evidence","reason":"..."}]}'
-        )
-
-    def _build_regeneration_prompt(
-        self,
-        context_parts: list[str],
-        original: _CurriculumQuestion,
-        reason: str,
-    ) -> str:
-        context_text = (
-            "\n\n".join(context_parts) if context_parts else "(no source excerpts available)"
-        )
-        return (
-            "A fact-checker rejected the following multiple-choice question because "
-            "it is not properly grounded in the source excerpts below. Rewrite it so "
-            "the problem is fixed. Keep the same topic and difficulty; you may change "
-            "the wording, choices, or correct_index as needed.\n\n"
-            f"Source excerpts:\n{context_text}\n\n"
-            f"Rejected question: {original.question}\n"
-            f"Rejected choices: {list(original.choices)}\n"
-            f"Fact-checker feedback: {reason}\n\n"
-            "Return strict JSON for ONE corrected question:\n"
-            '{"question":"...","choices":["...","...","...","..."],"correct_index":0,'
-            '"explanation":"...","difficulty":"easy|medium|hard",'
-            '"lo_alignment_rationale":"...","source_chunk_ids":["..."]}'
-        )
 
     def _log_usage(
         self,

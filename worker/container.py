@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import TYPE_CHECKING
 
 from document_chunk.adapters.chunkers.structural import build_chunker as create_chunker
@@ -114,6 +115,8 @@ def build_vector_store(settings: WorkerSettings) -> QdrantAdapter:
 # deployment chưa kịp đổi sang LLM_PROFILE__* không âm thầm chạy model khác.
 _LEGACY_ENV_VARS = ("LLM__PROVIDER", "LLM__MODEL", "LLM__BASE_URL")
 _LEGACY_PROFILE_NAME = "env-llm"
+# Đổi model trên web có hiệu lực với job mới sau tối đa chừng này giây.
+_BINDING_TTL_SECONDS = 30.0
 _SUPPORTED_PROVIDERS = ("gemini", "openai-compatible", "deepseek")
 
 
@@ -142,24 +145,40 @@ def build_model_registry(settings: WorkerSettings):
     """
     Registry phân giải "task nào dùng model nào", thay cho một client/process.
 
-    Thứ tự: LLM_PROFILE__<TASK> → LLM_PROFILE → LLM__* (nếu còn đặt) →
+    Thứ tự: bảng llm_model_bindings (admin chọn trên web, đọc lại mỗi 30s) →
+    LLM_PROFILE__<TASK> → LLM_PROFILE → LLM__* (nếu còn đặt kèm key) →
     TASK_DEFAULTS trong catalog của ai-sdk.
     """
-    from ai_runtime import EnvConfigSource, ModelRegistry
+    from ai_runtime import EnvConfigSource, ModelRegistry, OverrideConfigSource
     from ai_runtime.catalog import PROFILES
 
     legacy = _legacy_profile(settings.llm)  # luôn dựng để provider sai lộ ra ngay
-    prefer_legacy = any(os.environ.get(name, "").strip() for name in _LEGACY_ENV_VARS)
+    legacy_set = any(os.environ.get(name, "").strip() for name in _LEGACY_ENV_VARS)
+    # Profile LLM__* chỉ lấy key từ LLM__API_KEY. Đặt provider/model mà không
+    # có key thì nó chắc chắn hỏng — thường là ENV cũ còn nằm trong image —
+    # nên không được thắng các default đang chạy được.
+    prefer_legacy = legacy_set and bool(settings.llm.api_key)
 
     env = dict(os.environ)
     if settings.llm.api_key:
         env[legacy.key_env[0]] = settings.llm.api_key
 
+    source = EnvConfigSource(
+        env=env,
+        fallback_profile=legacy.name if prefer_legacy else None,
+    )
+    if settings.sql.enabled:
+        from worker.services.model_binding_store import ModelBindingStore
+
+        source = OverrideConfigSource(
+            ModelBindingStore(settings.sql).fetch,
+            source,
+            ttl_seconds=_BINDING_TTL_SECONDS,
+            known_profiles=[name for name, p in PROFILES.items() if not p.internal],
+            source_label="db:llm_model_bindings",
+        )
     registry = ModelRegistry(
-        source=EnvConfigSource(
-            env=env,
-            fallback_profile=legacy.name if prefer_legacy else None,
-        ),
+        source=source,
         profiles={**PROFILES, legacy.name: legacy},
         env=env,
     )
@@ -169,6 +188,13 @@ def build_model_registry(settings: WorkerSettings):
             provider=legacy.provider,
             model=legacy.model,
             hint="LLM__* vẫn đang ghi đè; chuyển sang LLM_PROFILE__<TASK> để tách model theo task",
+        )
+    elif legacy_set:
+        logger.warning(
+            "worker_container.llm_legacy_env_ignored",
+            provider=legacy.provider,
+            model=legacy.model,
+            reason="LLM__PROVIDER/LLM__MODEL đặt nhưng thiếu LLM__API_KEY",
         )
     return registry
 
@@ -191,6 +217,46 @@ def build_llm_client_for(registry, task: str):
         chosen_by=resolved.binding.source,
     )
     return AIRuntimeLLMClient(resolved.runtime(), profile=resolved.profile)
+
+
+class TaskRoles:
+    """
+    Phân giải task → ``LlmRole`` mỗi lần được hỏi, để admin đổi model trên web
+    mà không phải restart worker.
+
+    Container hỏi một lần khi runner lấy use case đầu mỗi job, nên một job
+    chạy trọn trên một model và sổ chi phí của nó không bị chia đôi. Client
+    giữ theo profile: hỏi lại cùng profile trả lại đúng client cũ.
+    """
+
+    def __init__(self, registry) -> None:
+        self._registry = registry
+        self._clients: dict[tuple, object] = {}
+        self._chosen: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def role(self, task: str):
+        from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
+        from worker.llm_role import LlmRole
+
+        resolved = self._registry.resolve(task)
+        key = (resolved.profile.name, resolved.binding.temperature)
+        with self._lock:
+            client = self._clients.get(key)
+            if client is None:
+                client = AIRuntimeLLMClient(resolved.runtime(), profile=resolved.profile)
+                self._clients[key] = client
+            if self._chosen.get(task) != resolved.profile.name:
+                self._chosen[task] = resolved.profile.name
+                logger.info(
+                    "worker_container.llm_resolved",
+                    task=task,
+                    profile=resolved.profile.name,
+                    provider=resolved.provider,
+                    model=resolved.model_id,
+                    chosen_by=resolved.binding.source,
+                )
+        return LlmRole(client=client, provider=client.provider, profile=client.profile_name)
 
 
 def build_learning_context_client(settings: WorkerSettings):
@@ -287,56 +353,126 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
         super().__init__(settings)
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.model_registry = build_model_registry(settings)
-        self.llm_client = self._track(
-            "llm_client", build_llm_client_for(self.model_registry, ENRICHMENT)
-        )
-        self.run_enrichment_use_case = RunEnrichmentUseCase(
+        self.roles = TaskRoles(self.model_registry)
+
+    @property
+    def run_enrichment_use_case(self) -> RunEnrichmentUseCase:
+        """Dựng mỗi job với model đang được chọn; runner chỉ lấy một lần mỗi job."""
+        role = self.roles.role(ENRICHMENT)
+        return RunEnrichmentUseCase(
             metadata_store=self.metadata_store,
-            llm_client=self.llm_client,
-            max_section_chars=settings.llm.max_section_chars,
-            llm_provider=self.llm_client.provider,
-            llm_profile=self.llm_client.profile_name,
+            llm_client=role.client,
+            max_section_chars=self.settings.llm.max_section_chars,
+            llm_provider=role.provider,
+            llm_profile=role.profile,
         )
 
 
 class CurriculumQuizContainer(BaseWorkerContainer):
-    """Dependencies for synchronous or queued curriculum-aware quiz generation."""
+    """Dependencies for queued, LO-scoped quiz and lesson-card generation."""
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
-        from worker.llm_role import LlmRole
-        from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
-
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.model_registry = build_model_registry(settings)
-        # Người viết câu và người chấm là hai model khác nhau trong cùng một
-        # process: model vừa viết một câu sai có xu hướng chấm là câu đúng.
-        # Hai task trỏ cùng profile thì registry trả lại đúng một client.
-        self.llm_client = self._track(
-            "llm_client", build_llm_client_for(self.model_registry, QUIZ_GENERATION)
-        )
-        self.verifier_llm_client = self._track(
-            "verifier_llm_client", build_llm_client_for(self.model_registry, QUIZ_VERIFICATION)
-        )
-        if self.llm_client.profile_name == self.verifier_llm_client.profile_name:
+        self.roles = TaskRoles(self.model_registry)
+        self.context_client = build_learning_context_client(settings)
+        self._warned_same_model: str | None = None
+
+    def _writer_and_judge(self):
+        """
+        Người viết câu và người chấm là hai model khác nhau trong cùng một
+        process: model vừa viết một câu sai có xu hướng chấm là câu đúng.
+        Hai task trỏ cùng profile thì registry trả lại đúng một client.
+        """
+        writer = self.roles.role(QUIZ_GENERATION)
+        judge = self.roles.role(QUIZ_VERIFICATION)
+        same = writer.profile if writer.profile == judge.profile else None
+        if same and same != self._warned_same_model:
             logger.warning(
                 "worker_container.quiz_judge_is_writer",
-                profile=self.llm_client.profile_name,
-                hint="đặt LLM_PROFILE__QUIZ_VERIFICATION khác LLM_PROFILE__QUIZ_GENERATION",
+                profile=same,
+                hint="chọn model kiểm chứng khác model viết nội dung",
             )
-        self.context_client = build_learning_context_client(settings)
-        self.generate_curriculum_quiz_use_case = GenerateCurriculumQuizUseCase(
+        self._warned_same_model = same
+        return writer, judge
+
+    @property
+    def generate_curriculum_quiz_use_case(self):
+        from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateCurriculumQuizUseCase(
             metadata_store=self.metadata_store,
-            llm_client=self.llm_client,
+            llm_client=writer.client,
             context_client=self.context_client,
-            fallback_to_local_context=settings.learning_context_mcp.fallback_to_local,
-            llm_provider=self.llm_client.provider,
-            llm_profile=self.llm_client.profile_name,
-            verifier=LlmRole(
-                client=self.verifier_llm_client,
-                provider=self.verifier_llm_client.provider,
-                profile=self.verifier_llm_client.profile_name,
-            ),
+            fallback_to_local_context=self.settings.learning_context_mcp.fallback_to_local,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
+    @property
+    def generate_lesson_cards_use_case(self):
+        """
+        Card dùng chung cặp writer/judge của quiz: catalog của ai-sdk chưa có
+        task riêng cho card, và cả hai đều là "viết nội dung bám nguồn rồi để
+        model khác chấm". Chi phí vẫn tách được qua use_case card_*.
+        """
+        from worker.use_cases.generate_lesson_cards import GenerateLessonCardsUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateLessonCardsUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            context_client=self.context_client,
+            fallback_to_local_context=self.settings.learning_context_mcp.fallback_to_local,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
+
+class AnswerGradingContainer(BaseWorkerContainer):
+    """
+    Chấm bài của người học: tự luận ngắn trong quiz và bài luận nộp file qua
+    Canvas (Asset Processor). Chỉ cần metadata store, MinIO và model judge,
+    không MCP, không writer.
+    """
+
+    def __init__(self, settings: WorkerSettings) -> None:
+        super().__init__(settings)
+        from worker.services.essay_submission_store import EssaySubmissionStore
+
+        self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
+        self.file_storage = self._track("file_storage", build_file_storage(settings))
+        self.essay_store = EssaySubmissionStore(settings.sql)
+        self.model_registry = build_model_registry(settings)
+        self.roles = TaskRoles(self.model_registry)
+
+    @property
+    def grade_essay_submission_use_case(self):
+        """Bài luận cũng là việc phán xét: dùng model judge như chấm tự luận ngắn."""
+        from worker.use_cases.grade_essay_submission import GradeEssaySubmissionUseCase
+
+        return GradeEssaySubmissionUseCase(
+            store=self.essay_store,
+            file_storage=self.file_storage,
+            metadata_store=self.metadata_store,
+            grader=self.roles.role(QUIZ_VERIFICATION),
+        )
+
+    @property
+    def grade_short_answers_use_case(self):
+        """
+        Chấm tự luận là việc phán xét như bước kiểm tra câu hỏi, nên dùng
+        profile của judge. Chi phí tách được qua use_case answer_grading.
+        """
+        from worker.use_cases.grade_short_answers import GradeShortAnswersUseCase
+
+        return GradeShortAnswersUseCase(
+            metadata_store=self.metadata_store,
+            grader=self.roles.role(QUIZ_VERIFICATION),
         )
 
 
@@ -373,3 +509,9 @@ def build_curriculum_quiz_container(
     settings: WorkerSettings | None = None,
 ) -> CurriculumQuizContainer:
     return CurriculumQuizContainer(settings or get_worker_settings())
+
+
+def build_answer_grading_container(
+    settings: WorkerSettings | None = None,
+) -> AnswerGradingContainer:
+    return AnswerGradingContainer(settings or get_worker_settings("answer_grading"))
