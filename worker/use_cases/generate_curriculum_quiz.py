@@ -4,11 +4,12 @@ GenerateCurriculumQuizUseCase — generate quiz items aligned to a specific LO/c
 Sibling to RunEnrichmentUseCase (course-scoped, not document-scoped).
 Used by the queued content-generation worker and the legacy synchronous adapter.
 """
+import re
 import time
 import uuid
-from typing import Literal
+from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from document_chunk.application.dto.generation_dto import (
     GenerateCurriculumQuizRequest,
@@ -17,6 +18,7 @@ from document_chunk.application.dto.generation_dto import (
 from document_chunk.application.services.answer_layout import (
     balanced_positions,
     shuffle_choices,
+    shuffle_order,
 )
 from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.bloom import bloom_to_level, bloom_to_name
@@ -55,10 +57,22 @@ class _UsageAccumulator:
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-class _CurriculumQuestion(BaseModel):
+# Phương án cố định của câu Đúng/Sai, khớp TRUE_FALSE_OPTIONS ở core-api.
+_TRUE_FALSE_OPTIONS = ("Đúng", "Sai")
+_BLANK = re.compile(r"_{3,}")
+
+
+def _texts(values: list[str], *, label: str) -> list[str]:
+    normalized = [v.strip() for v in values if v and v.strip()]
+    if len(normalized) != len(values):
+        raise ValueError(f"{label} must not contain empty items")
+    if len({v.casefold() for v in normalized}) != len(normalized):
+        raise ValueError(f"{label} must be distinct")
+    return normalized
+
+
+class _QuestionBase(BaseModel):
     question: str
-    choices: list[str] = Field(min_length=4, max_length=4)
-    correct_index: int = Field(ge=0, le=3)
     explanation: str
     difficulty: str = "medium"
     lo_alignment_rationale: str = ""
@@ -72,14 +86,6 @@ class _CurriculumQuestion(BaseModel):
             raise ValueError("value must not be empty")
         return v
 
-    @field_validator("choices")
-    @classmethod
-    def _normalize_choices(cls, choices: list[str]) -> list[str]:
-        normalized = [c.strip() for c in choices if c and c.strip()]
-        if len(normalized) != 4:
-            raise ValueError("choices must contain exactly 4 non-empty items")
-        return normalized
-
     @field_validator("difficulty")
     @classmethod
     def _normalize_difficulty(cls, value: str) -> str:
@@ -89,8 +95,103 @@ class _CurriculumQuestion(BaseModel):
         return v
 
 
-class _CurriculumQuizPayload(BaseModel):
-    questions: list[_CurriculumQuestion] = Field(min_length=1)
+class _CurriculumQuestion(_QuestionBase):
+    """MCQ_SINGLE: 4 phương án, một đáp án đúng."""
+
+    choices: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+
+    @field_validator("choices")
+    @classmethod
+    def _normalize_choices(cls, choices: list[str]) -> list[str]:
+        normalized = [c.strip() for c in choices if c and c.strip()]
+        if len(normalized) != 4:
+            raise ValueError("choices must contain exactly 4 non-empty items")
+        return normalized
+
+
+class _MultiAnswerQuestion(_QuestionBase):
+    """MCQ_MULTI: 4–6 phương án, chọn tất cả đáp án đúng."""
+
+    choices: list[str] = Field(min_length=4, max_length=6)
+    correct_indices: list[int] = Field(min_length=1)
+
+    @field_validator("choices")
+    @classmethod
+    def _normalize_choices(cls, choices: list[str]) -> list[str]:
+        return _texts(choices, label="choices")
+
+    @model_validator(mode="after")
+    def _check_indices(self) -> "_MultiAnswerQuestion":
+        indices = set(self.correct_indices)
+        if len(indices) != len(self.correct_indices):
+            raise ValueError("correct_indices must be distinct")
+        if not all(0 <= i < len(self.choices) for i in indices):
+            raise ValueError("correct_indices must point at choices")
+        if len(indices) == len(self.choices):
+            raise ValueError("at least one choice must be wrong")
+        return self
+
+
+class _TrueFalseQuestion(_QuestionBase):
+    """TRUE_FALSE: ``question`` là một mệnh đề."""
+
+    is_true: bool
+
+
+class _FillBlankQuestion(_QuestionBase):
+    """FILL_BLANK: một chỗ trống ``____``, các cách viết đáp án chấp nhận."""
+
+    accepted_answers: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("question")
+    @classmethod
+    def _one_blank(cls, value: str) -> str:
+        if len(_BLANK.findall(value)) != 1:
+            raise ValueError("question must contain exactly one blank written as ____")
+        return value
+
+    @field_validator("accepted_answers")
+    @classmethod
+    def _normalize_answers(cls, answers: list[str]) -> list[str]:
+        return _texts(answers, label="accepted_answers")
+
+
+class _ShortAnswerQuestion(_QuestionBase):
+    """SHORT_ANSWER: bài mẫu và các ý chấm; worker chấm bài làm bằng LLM."""
+
+    model_answer: str
+    rubric: list[str] = Field(min_length=1, max_length=6)
+
+    @field_validator("model_answer")
+    @classmethod
+    def _model_answer(cls, value: str) -> str:
+        v = value.strip()
+        if not v:
+            raise ValueError("model_answer must not be empty")
+        return v
+
+    @field_validator("rubric")
+    @classmethod
+    def _normalize_rubric(cls, rubric: list[str]) -> list[str]:
+        return _texts(rubric, label="rubric")
+
+
+_QuestionT = TypeVar("_QuestionT", bound=_QuestionBase)
+
+
+class _CurriculumQuizPayload(BaseModel, Generic[_QuestionT]):
+    questions: list[_QuestionT] = Field(min_length=1)
+
+
+# Kiểu câu → (schema một câu, tên schema cho bước sửa JSON).
+_QUESTION_MODELS: dict[str, tuple[type[_QuestionBase], str]] = {
+    "MCQ_SINGLE": (_CurriculumQuestion, "CurriculumQuestion"),
+    "MCQ_MULTI": (_MultiAnswerQuestion, "MultiAnswerQuestion"),
+    "TRUE_FALSE": (_TrueFalseQuestion, "TrueFalseQuestion"),
+    "FILL_BLANK": (_FillBlankQuestion, "FillBlankQuestion"),
+    "SHORT_ANSWER": (_ShortAnswerQuestion, "ShortAnswerQuestion"),
+}
 
 
 class _QuestionVerdict(BaseModel):
@@ -101,6 +202,38 @@ class _QuestionVerdict(BaseModel):
 
 class _QuizVerificationPayload(BaseModel):
     verdicts: list[_QuestionVerdict] = Field(min_length=1)
+
+
+def _answer_layout(
+    q: _QuestionBase,
+    question_type: str,
+    *,
+    seed: str,
+    target_index: int,
+) -> tuple[list[str], int, object]:
+    """
+    (phương án lưu, correct_index, correct_answer) theo dạng của từng kiểu câu.
+
+    ``correct_answer`` None với MCQ_SINGLE: repository lấy ``choices[correct_index]``.
+    """
+    if isinstance(q, _CurriculumQuestion):
+        # G3: xáo phương án, vị trí đáp án đúng phân bố đều trong mẻ.
+        choices, correct_index = shuffle_choices(
+            list(q.choices), q.correct_index, seed=seed, target_index=target_index
+        )
+        return choices, correct_index, None
+    if isinstance(q, _MultiAnswerQuestion):
+        correct = {q.choices[i] for i in q.correct_indices}
+        choices = shuffle_order(list(q.choices), seed=seed)
+        return choices, 0, [c for c in choices if c in correct]
+    if isinstance(q, _TrueFalseQuestion):
+        answer = _TRUE_FALSE_OPTIONS[0 if q.is_true else 1]
+        return list(_TRUE_FALSE_OPTIONS), _TRUE_FALSE_OPTIONS.index(answer), answer
+    if isinstance(q, _FillBlankQuestion):
+        return [], 0, list(q.accepted_answers)
+    if isinstance(q, _ShortAnswerQuestion):
+        return [], 0, {"model_answer": q.model_answer, "rubric": list(q.rubric)}
+    raise ProcessingError(f"Unsupported question type: {question_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +271,10 @@ class GenerateCurriculumQuizUseCase:
         self, request: GenerateCurriculumQuizRequest
     ) -> Result[GenerateCurriculumQuizResponse, Exception]:
         trace_id = str(uuid.uuid4())
+        question_type = request.question_type
+        if question_type not in _QUESTION_MODELS:
+            return Err(ProcessingError(f"Unsupported question type: {question_type}"))
+        question_model, schema_name = _QUESTION_MODELS[question_type]
 
         # 1. Resolve LO ids from target
         lo_ids = self._resolve_lo_ids(request)
@@ -211,6 +348,7 @@ class GenerateCurriculumQuizUseCase:
             style=request.style,
             count=request.count,
             context_parts=context_parts,
+            question_type=question_type,
         )
 
         # 5. Generate via LLM
@@ -220,7 +358,7 @@ class GenerateCurriculumQuizUseCase:
             llm_client=self._writer.client,
             prompt=prompt.user,
             system=prompt.system,
-            schema_model=_CurriculumQuizPayload,
+            schema_model=_CurriculumQuizPayload[question_model],
             on_usage=usage,
         )
         self._log_usage(
@@ -235,7 +373,7 @@ class GenerateCurriculumQuizUseCase:
         if payload_result.is_err():
             return Err(payload_result.error)
 
-        payload: _CurriculumQuizPayload = payload_result.unwrap()
+        payload = payload_result.unwrap()
 
         # 5b. Verify each question against the retrieved source excerpts and give
         # the model a bounded number of chances to fix anything unsupported
@@ -245,6 +383,8 @@ class GenerateCurriculumQuizUseCase:
             context_parts=context_parts,
             trace_id=trace_id,
             course_id=request.course_id,
+            question_type=question_type,
+            schema=(question_model, schema_name),
         )
         if rejected:
             logger.warning(
@@ -270,20 +410,20 @@ class GenerateCurriculumQuizUseCase:
 
         for idx, q in enumerate(questions):
             # O3: id tất định theo (LO, nội dung câu hỏi). Trước đây là uuid4 nên
-            # một lần retry sau bước lưu sẽ nhân đôi cả bộ câu.
-            qid = str(uuid.uuid5(_QUIZ_ID_NAMESPACE, f"{primary_lo_id}|{q.question.strip()}"))
+            # một lần retry sau bước lưu sẽ nhân đôi cả bộ câu. Kiểu khác MCQ_SINGLE
+            # thêm kiểu vào khoá để không đè lên câu cùng lời của kiểu khác.
+            key = q.question.strip()
+            if question_type != "MCQ_SINGLE":
+                key = f"{question_type}|{key}"
+            qid = str(uuid.uuid5(_QUIZ_ID_NAMESPACE, f"{primary_lo_id}|{key}"))
             question_ids.append(qid)
             valid_source_ids = tuple(
                 source_id
                 for source_id in q.source_chunk_ids
                 if source_id in source_chunk_ids
             )
-            # G3: xáo phương án, vị trí đáp án đúng phân bố đều trong mẻ.
-            choices, correct_index = shuffle_choices(
-                list(q.choices),
-                q.correct_index,
-                seed=qid,
-                target_index=targets[idx],
+            choices, correct_index, correct_answer = _answer_layout(
+                q, question_type, seed=qid, target_index=targets[idx]
             )
             item = StoredQuizItem(
                 question_id=qid,
@@ -298,6 +438,8 @@ class GenerateCurriculumQuizUseCase:
                 difficulty=q.difficulty,
                 question_index=idx,
                 model_id=self._writer.client.model_id,
+                question_type=question_type,
+                correct_answer=correct_answer,
             )
             stored_items.append(item)
 
@@ -359,11 +501,13 @@ class GenerateCurriculumQuizUseCase:
     def _verify_and_refine(
         self,
         *,
-        questions: list[_CurriculumQuestion],
+        questions: list[_QuestionBase],
         context_parts: list[str],
         trace_id: str,
         course_id: str,
-    ) -> tuple[list[_CurriculumQuestion], list[tuple[_CurriculumQuestion, str]]]:
+        question_type: str = "MCQ_SINGLE",
+        schema: tuple[type[_QuestionBase], str] = _QUESTION_MODELS["MCQ_SINGLE"],
+    ) -> tuple[list[_QuestionBase], list[tuple[_QuestionBase, str]]]:
         """
         Đối chiếu từng câu với đoạn nguồn, cho model tối đa
         ``max_verification_retries`` lượt sửa, rồi trả về (giữ lại, bị loại).
@@ -376,12 +520,13 @@ class GenerateCurriculumQuizUseCase:
         lý do để giữ lại nội dung: người duyệt trong `review.service.ts` vẫn là
         cổng cuối.
         """
-        def find_failing(current: list[_CurriculumQuestion]) -> dict[int, str] | None:
+        def find_failing(current: list[_QuestionBase]) -> dict[int, str] | None:
             verdicts = self._run_verifier(
                 questions=current,
                 context_parts=context_parts,
                 trace_id=trace_id,
                 course_id=course_id,
+                question_type=question_type,
             )
             if verdicts is None:
                 return None
@@ -396,6 +541,8 @@ class GenerateCurriculumQuizUseCase:
                 context_parts=context_parts,
                 trace_id=trace_id,
                 course_id=course_id,
+                question_type=question_type,
+                schema=schema,
             ),
             max_retries=self._max_verification_retries,
             on_exhausted=lambda still_failing: logger.warning(
@@ -408,12 +555,13 @@ class GenerateCurriculumQuizUseCase:
     def _run_verifier(
         self,
         *,
-        questions: list[_CurriculumQuestion],
+        questions: list[_QuestionBase],
         context_parts: list[str],
         trace_id: str,
         course_id: str,
+        question_type: str = "MCQ_SINGLE",
     ) -> list[_QuestionVerdict] | None:
-        prompt = prompts.verification(context_parts, questions)
+        prompt = prompts.verification(context_parts, questions, question_type)
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
@@ -445,21 +593,24 @@ class GenerateCurriculumQuizUseCase:
     def _run_regeneration(
         self,
         *,
-        original: _CurriculumQuestion,
+        original: _QuestionBase,
         reason: str,
         context_parts: list[str],
         trace_id: str,
         course_id: str,
-    ) -> _CurriculumQuestion | None:
-        prompt = prompts.regeneration(context_parts, original, reason)
+        question_type: str = "MCQ_SINGLE",
+        schema: tuple[type[_QuestionBase], str] = _QUESTION_MODELS["MCQ_SINGLE"],
+    ) -> _QuestionBase | None:
+        prompt = prompts.regeneration(context_parts, original, reason, question_type)
+        schema_model, schema_name = schema
         started = time.monotonic()
         usage = _UsageAccumulator()
         result = generate_structured_payload(
             llm_client=self._writer.client,
             prompt=prompt.user,
             system=prompt.system,
-            schema_model=_CurriculumQuestion,
-            repair_schema_name="CurriculumQuestion",
+            schema_model=schema_model,
+            repair_schema_name=schema_name,
             on_usage=usage,
         )
         self._log_usage(

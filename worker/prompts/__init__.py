@@ -5,7 +5,9 @@ Mỗi module là một họ prompt và trả về ``Prompt``. Use case chỉ g�
 ``system``/``user`` đi và lấy ``name`` làm ``use_case`` khi ghi chi phí; sửa câu
 chữ của prompt thì sửa ở đây.
 
-- ``curriculum_quiz``: câu trắc nghiệm theo LO (sinh, kiểm tra, sửa)
+- ``curriculum_quiz``: câu hỏi theo LO, năm kiểu câu (sinh, kiểm tra, sửa)
+- ``answer_grading``: chấm tự luận ngắn của người học theo rubric
+- ``essay_grading``: chấm bài luận nộp file qua Canvas (Asset Processor)
 - ``lesson_cards``: micro-content card theo LO (sinh, kiểm tra, sửa)
 - ``enrichment``: card và quiz theo section tài liệu, đường cũ không kiểm tra
 

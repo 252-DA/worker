@@ -153,6 +153,7 @@ def _quiz_request(job: ContentGenerationJob) -> GenerateCurriculumQuizRequest:
         bloom_level=scope.get("bloom_level") or scope.get("bloomLevel") or scope.get("bloom"),
         source_document_ids=scope.get("source_document_ids"),
         count=int(scope.get("count") or 5),
+        question_type=str(scope.get("question_type") or "MCQ_SINGLE"),
     )
 
 

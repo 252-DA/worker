@@ -45,6 +45,15 @@ def test_parse_job_and_scope():
     assert request.target_code == "L.O.3.1"
     assert request.count == 3
     assert request.bloom_level == "analyze"
+    # Request cũ không có question_type: vẫn là trắc nghiệm một đáp án.
+    assert request.question_type == "MCQ_SINGLE"
+
+
+def test_quiz_request_reads_question_type():
+    data = _job_data()
+    data["payload"]["scope"]["question_type"] = "FILL_BLANK"
+
+    assert _quiz_request(_parse_job(data)).question_type == "FILL_BLANK"
 
 
 @pytest.mark.asyncio

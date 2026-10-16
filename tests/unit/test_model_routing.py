@@ -60,14 +60,27 @@ class TestRegistryWiring:
         # sang model khác chỉ vì code mới lên.
         monkeypatch.setenv("LLM__PROVIDER", "gemini")
         monkeypatch.setenv("LLM__MODEL", "gemini-1.5-legacy")
+        monkeypatch.setenv("LLM__API_KEY", "legacy-key")
         resolved = build_model_registry(WorkerSettings()).resolve("quiz_generation")
 
         assert resolved.model_id == "gemini-1.5-legacy"
         assert resolved.binding.source == "legacy-env"
 
+    def test_legacy_env_without_its_key_does_not_win(self, monkeypatch):
+        # worker/Dockerfile từng gắn LLM__PROVIDER/LLM__MODEL vào image mà
+        # compose không truyền LLM__API_KEY: profile cũ thắng rồi gọi model
+        # không có key, mọi lần chấm tự luận đều hỏng.
+        monkeypatch.setenv("LLM__PROVIDER", "gemini")
+        monkeypatch.setenv("LLM__MODEL", "gemini-3-flash-preview")
+        resolved = build_model_registry(WorkerSettings()).resolve("quiz_verification")
+
+        assert resolved.profile.name == "gemini-flash"
+        assert resolved.binding.source == "task-default"
+
     def test_profile_env_beats_legacy_env(self, monkeypatch):
         monkeypatch.setenv("LLM__PROVIDER", "gemini")
         monkeypatch.setenv("LLM__MODEL", "gemini-1.5-legacy")
+        monkeypatch.setenv("LLM__API_KEY", "legacy-key")
         monkeypatch.setenv("LLM_PROFILE__QUIZ_GENERATION", "deepseek-chat")
         resolved = build_model_registry(WorkerSettings()).resolve("quiz_generation")
 
@@ -101,6 +114,109 @@ class TestRegistryWiring:
         judge = build_llm_client_for(registry, "quiz_verification")
 
         assert (writer.provider, judge.provider) == ("deepseek", "gemini")
+
+
+class _Bindings:
+    """Bảng llm_model_bindings giả, thay cho ModelBindingStore."""
+
+    rows: dict[str, str] = {}
+
+    def __init__(self, sql) -> None:
+        del sql
+
+    def fetch(self) -> dict[str, str]:
+        return dict(_Bindings.rows)
+
+
+@pytest.fixture
+def db_bindings(monkeypatch):
+    """Settings có SQL bật, bảng binding giả, TTL 0 để mỗi lần hỏi đọc lại bảng."""
+    import worker.container as container_module
+    import worker.services.model_binding_store as store_module
+
+    _Bindings.rows = {}
+    monkeypatch.setattr(store_module, "ModelBindingStore", _Bindings)
+    monkeypatch.setattr(container_module, "_BINDING_TTL_SECONDS", 0.0)
+    settings = WorkerSettings()
+    settings.core.sql.enabled = True
+    return settings
+
+
+class TestBindingsFromDatabase:
+    def test_table_binding_beats_env(self, monkeypatch, db_bindings):
+        monkeypatch.setenv("LLM_PROFILE__QUIZ_GENERATION", "deepseek-chat")
+        _Bindings.rows = {"quiz_generation": "gemini-pro"}
+        resolved = build_model_registry(db_bindings).resolve("quiz_generation")
+
+        assert resolved.profile.name == "gemini-pro"
+        assert resolved.binding.source == "db:llm_model_bindings"
+
+    def test_empty_table_keeps_env_and_defaults(self, db_bindings):
+        resolved = build_model_registry(db_bindings).resolve("quiz_generation")
+
+        assert resolved.profile.name == "deepseek-chat"
+
+    def test_internal_legacy_profile_cannot_be_chosen_from_the_table(self, db_bindings):
+        _Bindings.rows = {"enrichment": "env-llm"}
+        resolved = build_model_registry(db_bindings).resolve("enrichment")
+
+        assert resolved.profile.name == "gemini-flash"
+
+    def test_sql_disabled_never_reads_the_table(self, monkeypatch):
+        import worker.services.model_binding_store as store_module
+
+        monkeypatch.setattr(store_module, "ModelBindingStore", MagicMock(side_effect=AssertionError))
+        build_model_registry(WorkerSettings()).resolve("enrichment")
+
+
+class TestModelChangeWithoutRestart:
+    def test_task_roles_follow_the_table_between_jobs(self, db_bindings):
+        from worker.container import TaskRoles
+
+        roles = TaskRoles(build_model_registry(db_bindings))
+        first = roles.role("enrichment")
+        _Bindings.rows = {"enrichment": "gemini-pro"}
+        second = roles.role("enrichment")
+
+        assert (first.profile, second.profile) == ("gemini-flash", "gemini-pro")
+
+    def test_same_profile_reuses_one_client(self, db_bindings):
+        from worker.container import TaskRoles
+
+        roles = TaskRoles(build_model_registry(db_bindings))
+
+        assert roles.role("enrichment").client is roles.role("enrichment").client
+
+    def test_grading_container_picks_up_a_new_judge(self, db_bindings):
+        from worker.container import AnswerGradingContainer
+
+        container = AnswerGradingContainer(db_bindings)
+        before = container.grade_short_answers_use_case._grader.profile
+        _Bindings.rows = {"quiz_verification": "gemini-pro"}
+        after = container.grade_short_answers_use_case._grader.profile
+
+        assert (before, after) == ("gemini-flash", "gemini-pro")
+        container.close()
+
+    def test_quiz_container_builds_each_job_with_current_writer_and_judge(self, db_bindings):
+        from worker.container import CurriculumQuizContainer
+
+        container = CurriculumQuizContainer(db_bindings)
+        _Bindings.rows = {"quiz_generation": "gemini-pro", "quiz_verification": "deepseek-chat"}
+        use_case = container.generate_curriculum_quiz_use_case
+
+        assert use_case._writer.profile == "gemini-pro"
+        assert use_case._verifier.profile == "deepseek-chat"
+        container.close()
+
+    def test_enrichment_container_rebuilds_with_the_new_model(self, db_bindings):
+        from worker.container import EnrichmentWorkerContainer
+
+        container = EnrichmentWorkerContainer(db_bindings)
+        _Bindings.rows = {"enrichment": "deepseek-chat"}
+
+        assert container.run_enrichment_use_case._role.profile == "deepseek-chat"
+        container.close()
 
 
 class TestCostFromCatalog:
