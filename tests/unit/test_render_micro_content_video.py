@@ -83,7 +83,7 @@ async def test_render_micro_content_video_success():
     )
 
     res = await use_case.execute(req)
-    assert res.is_ok
+    assert res.is_ok()
     data = res.unwrap()
     assert data.video_object_key == "micro-content/c-456/mc-123/video.mp4"
     assert data.duration_seconds == 7.7

@@ -87,14 +87,14 @@ class MicroContentVideoStore:
                            SET video_status = 'READY',
                                video_source = 'AI',
                                video_object_key = %s,
-                               video_duration_seconds = %s,
+                               video_duration_ms = %s,
                                video_size_bytes = %s,
                                video_mime_type = 'video/mp4',
                                video_error = NULL,
                                updated_at = NOW()
                          WHERE micro_content_id = %s::uuid;
                         """,
-                        (object_key, int(duration_seconds), size_bytes, micro_content_id),
+                        (object_key, int(duration_seconds * 1000), size_bytes, micro_content_id),
                     )
                 conn.commit()
             return Ok(True)
