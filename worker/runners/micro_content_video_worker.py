@@ -66,12 +66,14 @@ async def process_video_job(container, bull_job, job_token):
 
         logger.info("micro_content_video_worker.start_render", micro_content_id=req.micro_content_id)
         result = await container.render_micro_content_video_use_case.execute(req)
-        if result.is_err:
+        if result.is_err():
+            err = result.error
+            logger.error("micro_content_video_worker.render_failed", error=str(err), exc_info=err)
             if is_final_attempt(bull_job):
                 container.video_store.update_video_failed(
-                    req.micro_content_id, str(result.unwrap_err())
+                    req.micro_content_id, str(err)
                 )
-            raise result.unwrap_err()
+            raise err
 
         resp = result.unwrap()
         return {

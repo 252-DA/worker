@@ -52,8 +52,8 @@ class RenderMicroContentVideoUseCase:
         self, request: RenderMicroContentVideoRequest
     ) -> Result[RenderMicroContentVideoResponse, Exception]:
         mc_res = self.store.get_micro_content(request.micro_content_id)
-        if mc_res.is_err:
-            return Err(mc_res.unwrap_err())
+        if mc_res.is_err():
+            return Err(mc_res.error)
 
         mc = mc_res.unwrap()
         script = request.script or mc.ai_script
@@ -113,8 +113,8 @@ class RenderMicroContentVideoUseCase:
 
                 object_key = f"micro-content/{course_id}/{request.micro_content_id}/video.mp4"
                 upload_res = self.file_storage.upload(Path(final_mp4_path), object_key)
-                if upload_res.is_err:
-                    raise upload_res.unwrap_err()
+                if upload_res.is_err():
+                    raise upload_res.error
 
                 size_bytes = os.path.getsize(final_mp4_path)
 
@@ -124,8 +124,8 @@ class RenderMicroContentVideoUseCase:
                     duration_seconds=total_duration,
                     size_bytes=size_bytes,
                 )
-                if store_res.is_err:
-                    raise store_res.unwrap_err()
+                if store_res.is_err():
+                    raise store_res.error
 
                 logger.info(
                     "render_micro_content_video.succeeded",

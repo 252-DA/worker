@@ -119,6 +119,6 @@ async def test_render_micro_content_video_handles_error():
     )
 
     res = await use_case.execute(RenderMicroContentVideoRequest(micro_content_id="mc-123"))
-    assert res.is_err
-    assert "TTS failure" in str(res.unwrap_err())
+    assert res.is_err()
+    assert "TTS failure" in str(res.error)
     store.update_video_failed.assert_called_once_with("mc-123", "TTS failure")

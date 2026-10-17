@@ -9,7 +9,12 @@ from document_chunk.infrastructure.config import Settings as CoreSettings
 
 class WorkerRuntimeConfig(BaseSettings):
     type: Literal[
-        "document", "enrichment", "outbox", "content_generation", "answer_grading"
+        "document",
+        "enrichment",
+        "outbox",
+        "content_generation",
+        "answer_grading",
+        "micro_content_video",
     ] = "document"
     concurrency: int = 3
     shutdown_grace_seconds: float = 30.0
@@ -111,6 +116,7 @@ def get_worker_settings(
         "outbox",
         "content_generation",
         "answer_grading",
+        "micro_content_video",
     ]
     | None = None,
 ) -> WorkerSettings:
