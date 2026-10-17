@@ -242,3 +242,63 @@ async def test_failing_to_mark_failed_does_not_mask_the_original_error():
 
     with pytest.raises(UnrecoverableError):
         await _process_job(container, SimpleNamespace(data=data), None)
+
+
+@pytest.mark.asyncio
+async def test_content_generation_offloads_sync_work_from_event_loop(monkeypatch):
+    calls = []
+    real_to_thread = __import__("asyncio").to_thread
+
+    async def tracked_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("worker.runners.content_generation_worker.asyncio.to_thread", tracked_to_thread)
+
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.return_value = Ok(None)
+    container.generate_curriculum_quiz_use_case.execute.return_value = Ok(
+        GenerateCurriculumQuizResponse(
+            course_id="course-1",
+            lo_id="lo-1",
+            quiz_count=1,
+            question_ids=["q1"],
+        )
+    )
+
+    await _process_job(container, SimpleNamespace(data=_job_data()), None)
+
+    assert calls == ["_run_job_sync"]
+
+
+@pytest.mark.asyncio
+async def test_enrichment_worker_offloads_sync_work_from_event_loop(monkeypatch):
+    from worker.runners.enrichment_worker import _process_job as process_enrichment_job
+    from worker.use_cases.run_enrichment import RunEnrichmentResponse
+
+    calls = []
+    real_to_thread = __import__("asyncio").to_thread
+
+    async def tracked_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("worker.runners.enrichment_worker.asyncio.to_thread", tracked_to_thread)
+
+    container = MagicMock()
+    container.run_enrichment_use_case.execute.return_value = Ok(
+        RunEnrichmentResponse(
+            document_id="doc-1",
+            concept_count=3,
+            mention_count=5,
+            card_count=2,
+            quiz_count=4,
+        )
+    )
+    job = SimpleNamespace(id="1", data={"document_id": "doc-1"})
+
+    result = await process_enrichment_job(container, job, None)
+
+    assert calls == ["_run_enrichment_sync"]
+    assert result["quiz_count"] == 4
+

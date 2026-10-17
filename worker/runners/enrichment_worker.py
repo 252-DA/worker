@@ -25,6 +25,12 @@ from worker.use_cases.run_enrichment import RunEnrichmentRequest
 logger = get_logger(__name__)
 
 
+def _run_enrichment_sync(container, document_id: str):
+    return container.run_enrichment_use_case.execute(
+        RunEnrichmentRequest(document_id=document_id)
+    )
+
+
 async def _process_job(container, job, job_token):
     del job_token
 
@@ -39,9 +45,8 @@ async def _process_job(container, job, job_token):
         )
         raise UnrecoverableError(f"invalid enrichment job payload: {exc}") from exc
 
-    result = container.run_enrichment_use_case.execute(
-        RunEnrichmentRequest(document_id=payload.document_id)
-    )
+    # Use case gọi LLM và psycopg đồng bộ: chạy ngoài event loop.
+    result = await asyncio.to_thread(_run_enrichment_sync, container, payload.document_id)
     if result.is_err():
         raise result.error
 

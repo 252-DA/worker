@@ -378,6 +378,7 @@ class CurriculumQuizContainer(BaseWorkerContainer):
         self.roles = TaskRoles(self.model_registry)
         self.context_client = build_learning_context_client(settings)
         self._warned_same_model: str | None = None
+        self._warn_lock = threading.Lock()
 
     def _writer_and_judge(self):
         """
@@ -388,13 +389,14 @@ class CurriculumQuizContainer(BaseWorkerContainer):
         writer = self.roles.role(QUIZ_GENERATION)
         judge = self.roles.role(QUIZ_VERIFICATION)
         same = writer.profile if writer.profile == judge.profile else None
-        if same and same != self._warned_same_model:
-            logger.warning(
-                "worker_container.quiz_judge_is_writer",
-                profile=same,
-                hint="chọn model kiểm chứng khác model viết nội dung",
-            )
-        self._warned_same_model = same
+        with self._warn_lock:
+            if same and same != self._warned_same_model:
+                logger.warning(
+                    "worker_container.quiz_judge_is_writer",
+                    profile=same,
+                    hint="chọn model kiểm chứng khác model viết nội dung",
+                )
+            self._warned_same_model = same
         return writer, judge
 
     @property

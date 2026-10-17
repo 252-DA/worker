@@ -218,14 +218,7 @@ def _generated_ids(content_type: str, response) -> tuple[int, dict[str, Any]]:
     }
 
 
-async def _process_job(container, bull_job, job_token):
-    del job_token
-    try:
-        job = _parse_job(bull_job.data)
-    except (KeyError, TypeError, ValueError) as exc:
-        _fail_unparsed_request(container, bull_job.data, exc)
-        raise UnrecoverableError(f"invalid content-generation job: {exc}") from exc
-
+def _run_job_sync(container, job: ContentGenerationJob) -> dict[str, Any]:
     try:
         use_case, request = _plan(container, job)
     except (TypeError, ValueError) as exc:
@@ -278,6 +271,19 @@ async def _process_job(container, bull_job, job_token):
         "lo_id": getattr(response, "lo_id", None),
         **generated,
     }
+
+
+async def _process_job(container, bull_job, job_token):
+    del job_token
+    try:
+        job = _parse_job(bull_job.data)
+    except (KeyError, TypeError, ValueError) as exc:
+        await asyncio.to_thread(_fail_unparsed_request, container, bull_job.data, exc)
+        raise UnrecoverableError(f"invalid content-generation job: {exc}") from exc
+
+    # Use case gọi LLM, MCP và psycopg đồng bộ: chạy ngoài event loop để không
+    # chặn heartbeat gia hạn lock BullMQ và HTTP healthcheck.
+    return await asyncio.to_thread(_run_job_sync, container, job)
 
 
 async def _main() -> None:
