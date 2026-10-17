@@ -81,7 +81,7 @@ class RenderMicroContentVideoUseCase:
                     narration = scene.get("narration") or title
 
                     slide_img_path = os.path.join(temp_dir, f"slide_{idx:02d}.png")
-                    audio_path = os.path.join(temp_dir, f"audio_{idx:02d}.wav")
+                    audio_path = os.path.join(temp_dir, f"audio_{idx:02d}.mp3")
 
                     self.slide_generator.generate_slide(
                         title=title,
