@@ -18,6 +18,7 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
+from worker.use_cases.extract_relations import ExtractRelationsRequest
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizRequest
 from worker.use_cases.generate_lesson_cards import (
     DEFAULT_CARD_COUNT,
@@ -175,18 +176,37 @@ def _card_request(job: ContentGenerationJob) -> GenerateLessonCardsRequest:
     )
 
 
+def _relations_request(job: ContentGenerationJob) -> ExtractRelationsRequest:
+    if job.content_type != "relations":
+        raise ValueError(f"expected type='relations', got {job.content_type!r}")
+    raw = job.scope.get("source_document_ids")
+    if not isinstance(raw, list) or not raw or not all(isinstance(v, str) and v for v in raw):
+        raise ValueError("relations scope must include source_document_ids")
+    return ExtractRelationsRequest(course_id=job.course_id, document_ids=list(raw))
+
+
 def _plan(container, job: ContentGenerationJob):
     """(use case, request) cho loại nội dung của job; ValueError nếu không hỗ trợ."""
     if job.content_type == "quiz":
         return container.generate_curriculum_quiz_use_case, _quiz_request(job)
     if job.content_type == "card":
         return container.generate_lesson_cards_use_case, _card_request(job)
+    if job.content_type == "relations":
+        return container.extract_relations_use_case, _relations_request(job)
     raise ValueError(
-        f"content-generation worker supports type='quiz' or 'card', got {job.content_type!r}"
+        "content-generation worker supports type='quiz', 'card' or 'relations', "
+        f"got {job.content_type!r}"
     )
 
 
 def _generated_ids(content_type: str, response) -> tuple[int, dict[str, Any]]:
+    if content_type == "relations":
+        return response.relations_written, {
+            "relations_written": response.relations_written,
+            "relations_dropped": response.relations_dropped,
+            "chunks_processed": response.chunks_processed,
+            "failed_batches": response.failed_batches,
+        }
     if content_type == "card":
         return response.card_count, {
             "card_count": response.card_count,
@@ -249,13 +269,13 @@ async def _process_job(container, bull_job, job_token):
         request_id=job.request_id,
         course_id=job.course_id,
         content_type=job.content_type,
-        lo_id=response.lo_id,
+        lo_id=getattr(response, "lo_id", None),
         generated_count=generated_count,
     )
     return {
         "request_id": job.request_id,
         "course_id": response.course_id,
-        "lo_id": response.lo_id,
+        "lo_id": getattr(response, "lo_id", None),
         **generated,
     }
 

@@ -74,7 +74,7 @@ class TestRegistryWiring:
         monkeypatch.setenv("LLM__MODEL", "gemini-3-flash-preview")
         resolved = build_model_registry(WorkerSettings()).resolve("quiz_verification")
 
-        assert resolved.profile.name == "gemini-flash"
+        assert resolved.profile.name == "gemini-flash-lite"
         assert resolved.binding.source == "task-default"
 
     def test_profile_env_beats_legacy_env(self, monkeypatch):
@@ -160,7 +160,7 @@ class TestBindingsFromDatabase:
         _Bindings.rows = {"enrichment": "env-llm"}
         resolved = build_model_registry(db_bindings).resolve("enrichment")
 
-        assert resolved.profile.name == "gemini-flash"
+        assert resolved.profile.name == "gemini-flash-lite"
 
     def test_sql_disabled_never_reads_the_table(self, monkeypatch):
         import worker.services.model_binding_store as store_module
@@ -178,7 +178,7 @@ class TestModelChangeWithoutRestart:
         _Bindings.rows = {"enrichment": "gemini-pro"}
         second = roles.role("enrichment")
 
-        assert (first.profile, second.profile) == ("gemini-flash", "gemini-pro")
+        assert (first.profile, second.profile) == ("gemini-flash-lite", "gemini-pro")
 
     def test_same_profile_reuses_one_client(self, db_bindings):
         from worker.container import TaskRoles
@@ -195,7 +195,7 @@ class TestModelChangeWithoutRestart:
         _Bindings.rows = {"quiz_verification": "gemini-pro"}
         after = container.grade_short_answers_use_case._grader.profile
 
-        assert (before, after) == ("gemini-flash", "gemini-pro")
+        assert (before, after) == ("gemini-flash-lite", "gemini-pro")
         container.close()
 
     def test_quiz_container_builds_each_job_with_current_writer_and_judge(self, db_bindings):

@@ -432,6 +432,21 @@ class CurriculumQuizContainer(BaseWorkerContainer):
             verifier=judge,
         )
 
+    @property
+    def extract_relations_use_case(self):
+        """
+        Trích quan hệ giữa các ý cho chatbot. Việc này là "viết nội dung bám
+        nguồn" nên dùng model viết của quiz; chi phí vẫn tách được qua use_case
+        relation_extraction. PostgresMetadataStore cũng là ICourseKnowledgeStore.
+        """
+        from worker.use_cases.extract_relations import ExtractRelationsUseCase
+
+        return ExtractRelationsUseCase(
+            knowledge_store=self.metadata_store,
+            metadata_store=self.metadata_store,
+            writer=self.roles.role(QUIZ_GENERATION),
+        )
+
 
 class AnswerGradingContainer(BaseWorkerContainer):
     """

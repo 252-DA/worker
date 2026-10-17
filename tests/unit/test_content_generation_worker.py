@@ -10,7 +10,9 @@ from worker.runners.content_generation_worker import (
     _parse_job,
     _process_job,
     _quiz_request,
+    _relations_request,
 )
+from worker.use_cases.extract_relations import ExtractRelationsResponse
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizResponse
 from worker.use_cases.generate_lesson_cards import (
     DEFAULT_CARD_COUNT,
@@ -120,6 +122,50 @@ async def test_card_job_runs_card_use_case_and_records_count():
     lifecycle = container.metadata_store.update_content_generation_request.call_args_list
     assert lifecycle[-1].kwargs["status"] == "SUCCEEDED"
     assert lifecycle[-1].kwargs["generated_count"] == 2
+
+
+def _relations_job_data(**scope):
+    data = _job_data()
+    data["payload"]["type"] = "relations"
+    data["payload"]["scope"] = {"source_document_ids": ["doc-1", "doc-2"], **scope}
+    return data
+
+
+def test_relations_request_reads_documents():
+    request = _relations_request(_parse_job(_relations_job_data()))
+
+    assert request.course_id == "course-1"
+    assert request.document_ids == ["doc-1", "doc-2"]
+
+
+@pytest.mark.parametrize("scope", [{"source_document_ids": []}, {"source_document_ids": "doc-1"}, {"source_document_ids": [1]}])
+def test_relations_request_needs_a_document_list(scope):
+    data = _relations_job_data()
+    data["payload"]["scope"] = scope
+    with pytest.raises(ValueError, match="source_document_ids"):
+        _relations_request(_parse_job(data))
+
+
+@pytest.mark.asyncio
+async def test_relations_job_runs_extraction_and_records_written_count():
+    container = MagicMock()
+    container.metadata_store.update_content_generation_request.return_value = Ok(None)
+    container.extract_relations_use_case.execute.return_value = Ok(
+        ExtractRelationsResponse(
+            course_id="course-1", documents=2, chunks_seen=30, chunks_processed=28,
+            relations_written=41, relations_dropped=9, failed_batches=1,
+        )
+    )
+
+    result = await _process_job(container, SimpleNamespace(data=_relations_job_data()), None)
+
+    assert result["relations_written"] == 41
+    assert result["lo_id"] is None
+    container.generate_curriculum_quiz_use_case.execute.assert_not_called()
+    lifecycle = container.metadata_store.update_content_generation_request.call_args_list
+    assert lifecycle[0].kwargs["status"] == "RUNNING"
+    assert lifecycle[-1].kwargs["status"] == "SUCCEEDED"
+    assert lifecycle[-1].kwargs["generated_count"] == 41
 
 
 @pytest.mark.asyncio
