@@ -12,6 +12,8 @@ RUN apt-get update && \
         build-essential \
         libmagic1 \
         zlib1g-dev \
+        ffmpeg \
+        fonts-dejavu-core \
         # opencv-python (docling OCR) needs these at import time; without
         # them OCR fails with "libGL.so.1: cannot open shared object file".
         libgl1 \

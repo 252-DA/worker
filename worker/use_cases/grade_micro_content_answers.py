@@ -161,3 +161,4 @@ class GradeMicroContentAnswersUseCase:
         score = score_from_points(len(rubric), payload.points)
         feedback = payload.feedback.strip()
         return score, feedback
+

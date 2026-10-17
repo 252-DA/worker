@@ -32,6 +32,7 @@ enrichment-worker = "worker.runners.enrichment_worker:main"
 outbox-worker = "worker.runners.outbox_worker:main"
 content-generation-worker = "worker.runners.content_generation_worker:main"
 answer-grading-worker = "worker.runners.answer_grading_worker:main"
+micro-content-video-worker = "worker.runners.micro_content_video_worker:main"
 
 [dependency-groups]
 dev = [

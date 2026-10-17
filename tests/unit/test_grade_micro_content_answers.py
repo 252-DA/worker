@@ -97,3 +97,4 @@ def test_marks_needs_review_on_final_attempt_failure():
         feedback=REVIEW_FEEDBACK,
     )
     store.finalize_attempt.assert_called_once_with("attempt-1")
+

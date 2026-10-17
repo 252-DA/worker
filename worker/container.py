@@ -526,3 +526,38 @@ def build_answer_grading_container(
     settings: WorkerSettings | None = None,
 ) -> AnswerGradingContainer:
     return AnswerGradingContainer(settings or get_worker_settings("answer_grading"))
+
+
+class MicroContentVideoContainer(BaseWorkerContainer):
+    """Phục vụ sinh video AI cho Micro Content (slide + giọng đọc + render)."""
+
+    def __init__(self, settings: WorkerSettings) -> None:
+        super().__init__(settings)
+        from worker.services.micro_content_video_store import MicroContentVideoStore
+        from worker.services.slide_generator import SlideGenerator
+        from worker.services.tts_client import get_default_tts_client
+        from worker.services.video_composer import VideoComposer
+
+        self.file_storage = self._track("file_storage", build_file_storage(settings))
+        self.video_store = MicroContentVideoStore(settings.sql)
+        self.tts_client = get_default_tts_client()
+        self.slide_generator = SlideGenerator()
+        self.video_composer = VideoComposer()
+
+    @property
+    def render_micro_content_video_use_case(self):
+        from worker.use_cases.render_micro_content_video import RenderMicroContentVideoUseCase
+
+        return RenderMicroContentVideoUseCase(
+            store=self.video_store,
+            file_storage=self.file_storage,
+            tts_client=self.tts_client,
+            slide_generator=self.slide_generator,
+            video_composer=self.video_composer,
+        )
+
+
+def build_micro_content_video_container(
+    settings: WorkerSettings | None = None,
+) -> MicroContentVideoContainer:
+    return MicroContentVideoContainer(settings or get_worker_settings("micro_content_video"))
