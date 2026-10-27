@@ -44,12 +44,14 @@ def parse_render_job(data: Any) -> RenderMicroContentVideoRequest:
     payload = data["payload"]
     micro_content_id = payload.get("micro_content_id") or data.get("aggregate_id")
     course_id = payload.get("course_id")
+    asset_id = payload.get("asset_id")
     script = payload.get("script")
     if not isinstance(micro_content_id, str):
         raise ValueError("render job needs micro_content_id")
     return RenderMicroContentVideoRequest(
         micro_content_id=micro_content_id,
         course_id=course_id,
+        asset_id=asset_id,
         script=script,
     )
 
@@ -71,7 +73,7 @@ async def process_video_job(container, bull_job, job_token):
             logger.error("micro_content_video_worker.render_failed", error=str(err), exc_info=err)
             if is_final_attempt(bull_job):
                 container.video_store.update_video_failed(
-                    req.micro_content_id, str(err)
+                    req.micro_content_id, str(err), asset_id=req.asset_id
                 )
             raise err
 
@@ -81,6 +83,7 @@ async def process_video_job(container, bull_job, job_token):
             "video_object_key": resp.video_object_key,
             "duration": resp.duration_seconds,
             "size": resp.size_bytes,
+            "asset_id": resp.asset_id,
         }
 
     logger.warning("micro_content_video_worker.unhandled_event", event_type=event_type)
