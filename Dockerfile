@@ -52,6 +52,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libmagic1 \
+        # Render video micro-content: ffmpeg ghép cảnh, DejaVu cho chữ trên slide.
+        ffmpeg \
+        fonts-dejavu-core \
         # opencv-python (docling OCR) needs these at import time; without
         # them OCR fails with "libGL.so.1: cannot open shared object file".
         libgl1 \
