@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import base64
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -40,6 +45,16 @@ class HealthServer:
         readiness_check = self._readiness_check
 
         class _Handler(BaseHTTPRequestHandler):
+            def _send_cors_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+            def do_OPTIONS(self):  # noqa: N802
+                self.send_response(204)
+                self._send_cors_headers()
+                self.end_headers()
+
             def do_GET(self):  # noqa: N802
                 if self.path not in ("/health", "/ready"):
                     self.send_error(404)
@@ -58,6 +73,108 @@ class HealthServer:
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_POST(self):  # noqa: N802
+                if self.path == "/script-from-pdf":
+                    try:
+                        content_length = int(self.headers.get("Content-Length", 0))
+                        if content_length <= 0:
+                            self._send_json({"error": "Dữ liệu yêu cầu trống."}, status_code=400)
+                            return
+
+                        body = self.rfile.read(content_length)
+                        data = json.loads(body.decode("utf-8", errors="replace"))
+
+                        pdf_base64 = data.get("pdf_base64")
+                        if not pdf_base64:
+                            self._send_json({"error": "Thiếu dữ liệu file PDF (pdf_base64)."}, status_code=400)
+                            return
+
+                        try:
+                            pdf_bytes = base64.b64decode(pdf_base64)
+                        except Exception as exc:
+                            self._send_json({"error": f"Dữ liệu base64 không hợp lệ: {exc}"}, status_code=400)
+                            return
+
+                        start_page = int(data.get("start_page") or 1)
+                        end_page = int(data.get("end_page") or 20)
+                        target_scenes = int(data.get("target_scenes") or 5)
+                        topic = data.get("topic")
+
+                        from worker.services.pdf_script_extractor import extract_script_from_pdf
+
+                        result = extract_script_from_pdf(
+                            pdf_bytes=pdf_bytes,
+                            start_page=start_page,
+                            end_page=end_page,
+                            target_scenes=target_scenes,
+                            topic=topic,
+                        )
+                        self._send_json(result, status_code=200)
+
+                    except ValueError as val_err:
+                        self._send_json({"error": str(val_err)}, status_code=400)
+                    except Exception as exc:
+                        logger.error("health_server.script_from_pdf_failed", error=str(exc), exc_info=exc)
+                        self._send_json({"error": f"Lỗi xử lý file PDF: {exc}"}, status_code=500)
+                    return
+
+                if self.path == "/tts-preview":
+                    try:
+                        content_length = int(self.headers.get("Content-Length", 0))
+                        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                        data = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+
+                        voice = data.get("voice") or "vi-VN-HoaiMyNeural"
+                        default_sample = (
+                            "Xin chào các bạn, đây là giọng đọc thử nghiệm cho bài giảng của bạn."
+                            if voice.startswith("vi")
+                            else "Hello, this is a sample audio preview for your lecture."
+                        )
+                        text = data.get("text") or default_sample
+
+                        import asyncio
+                        from worker.services.tts_client import get_default_tts_client
+
+                        tts = get_default_tts_client()
+                        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                            tmp_path = tmp.name
+
+                        try:
+                            duration = asyncio.run(tts.synthesize(text=text, output_path=tmp_path, voice=voice))
+                            with open(tmp_path, "rb") as f:
+                                mp3_bytes = f.read()
+
+                            encoded = base64.b64encode(mp3_bytes).decode("ascii")
+                            self._send_json({
+                                "status": "ok",
+                                "voice": voice,
+                                "duration": duration,
+                                "audio_base64": encoded,
+                            }, status_code=200)
+                        finally:
+                            if os.path.exists(tmp_path):
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+
+                    except Exception as exc:
+                        logger.error("health_server.tts_preview_failed", error=str(exc), exc_info=exc)
+                        self._send_json({"error": f"Lỗi tạo audio nghe thử: {exc}"}, status_code=500)
+                    return
+
+                self.send_error(404)
+
+            def _send_json(self, data: dict, status_code: int = 200) -> None:
+                encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(encoded)
 

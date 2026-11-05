@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
-import struct
 import wave
 from abc import ABC, abstractmethod
 
@@ -92,22 +90,43 @@ class EdgeTtsClient(TtsClient):
         return fallback_duration
 
     async def synthesize(self, text: str, output_path: str, voice: str = "vi-VN-HoaiMyNeural") -> float:
+        clean_text = text.strip()
+        if not clean_text:
+            clean_text = "Nội dung bài giảng."
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
         try:
             import edge_tts  # type: ignore
 
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(output_path)
+            # Danh sách giọng ưu tiên: giọng chính -> giọng phụ
+            candidate_voices = [voice]
+            if voice == "vi-VN-HoaiMyNeural":
+                candidate_voices.append("vi-VN-NamMinhNeural")
+            elif voice == "vi-VN-NamMinhNeural":
+                candidate_voices.append("vi-VN-HoaiMyNeural")
 
-            words = text.strip().split()
-            fallback_duration = max(2.0, len(words) * 0.38)
-            duration = await self._measure_duration(output_path, fallback_duration)
+            last_error = None
+            for v in candidate_voices:
+                try:
+                    communicate = edge_tts.Communicate(clean_text, v)
+                    await communicate.save(output_path)
 
-            logger.info("edge_tts.synthesized", path=output_path, voice=voice, duration=duration)
-            return duration
+                    words = clean_text.split()
+                    fallback_duration = max(2.0, len(words) * 0.38)
+                    duration = await self._measure_duration(output_path, fallback_duration)
+
+                    logger.info("edge_tts.synthesized", path=output_path, voice=v, duration=duration)
+                    return duration
+                except Exception as voice_err:
+                    last_error = voice_err
+                    logger.warning("edge_tts.voice_failed", voice=v, error=str(voice_err))
+
+            logger.error("edge_tts.all_voices_failed", error=str(last_error))
         except Exception as exc:
             logger.warning("edge_tts.failed_fallback_to_mock", error=str(exc))
-            return await self._fallback.synthesize(text, output_path, voice)
+
+        return await self._fallback.synthesize(clean_text, output_path, voice)
 
 
 def get_default_tts_client() -> TtsClient:

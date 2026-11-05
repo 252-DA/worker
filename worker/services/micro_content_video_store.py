@@ -16,6 +16,7 @@ class MicroContentRecord:
     title: str
     ai_script: Any
     video_status: str
+    video_asset_id: str | None = None
 
 
 class MicroContentVideoStore:
@@ -31,7 +32,7 @@ class MicroContentVideoStore:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT micro_content_id::text, course_id::text, title, ai_script, video_status
+                        SELECT micro_content_id::text, course_id::text, title, ai_script, video_status, video_asset_id::text
                           FROM micro_contents
                          WHERE micro_content_id = %s::uuid
                            AND deleted_at IS NULL;
@@ -48,6 +49,7 @@ class MicroContentVideoStore:
                     title=str(row[2]),
                     ai_script=row[3],
                     video_status=str(row[4]),
+                    video_asset_id=str(row[5]) if row[5] else None,
                 )
             )
         except Exception as exc:
@@ -77,6 +79,7 @@ class MicroContentVideoStore:
         object_key: str,
         duration_seconds: float,
         size_bytes: int,
+        asset_id: str | None = None,
     ) -> Result[bool, Exception]:
         try:
             with self._connect() as conn:
@@ -96,12 +99,42 @@ class MicroContentVideoStore:
                         """,
                         (object_key, int(duration_seconds * 1000), size_bytes, micro_content_id),
                     )
+                    target_asset_id = asset_id
+                    if not target_asset_id:
+                        cur.execute(
+                            "SELECT video_asset_id::text FROM micro_contents WHERE micro_content_id = %s::uuid",
+                            (micro_content_id,),
+                        )
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            target_asset_id = str(r[0])
+
+                    if target_asset_id:
+                        cur.execute(
+                            """
+                            UPDATE video_assets
+                               SET status = 'READY',
+                                   object_key = %s,
+                                   duration_ms = %s,
+                                   size_bytes = %s,
+                                   mime_type = 'video/mp4',
+                                   error_message = NULL,
+                                   updated_at = NOW()
+                             WHERE asset_id = %s::uuid;
+                            """,
+                            (object_key, int(duration_seconds * 1000), size_bytes, target_asset_id),
+                    )
                 conn.commit()
             return Ok(True)
         except Exception as exc:
             return Err(exc)
 
-    def update_video_failed(self, micro_content_id: str, error: str) -> Result[bool, Exception]:
+    def update_video_failed(
+        self,
+        micro_content_id: str,
+        error: str,
+        asset_id: str | None = None,
+    ) -> Result[bool, Exception]:
         try:
             with self._connect() as conn:
                 with conn.cursor() as cur:
@@ -114,6 +147,27 @@ class MicroContentVideoStore:
                          WHERE micro_content_id = %s::uuid;
                         """,
                         (error[:1000], micro_content_id),
+                    )
+                    target_asset_id = asset_id
+                    if not target_asset_id:
+                        cur.execute(
+                            "SELECT video_asset_id::text FROM micro_contents WHERE micro_content_id = %s::uuid",
+                            (micro_content_id,),
+                        )
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            target_asset_id = str(r[0])
+
+                    if target_asset_id:
+                        cur.execute(
+                            """
+                            UPDATE video_assets
+                               SET status = 'FAILED',
+                                   error_message = %s,
+                                   updated_at = NOW()
+                             WHERE asset_id = %s::uuid;
+                            """,
+                            (error[:1000], target_asset_id),
                     )
                 conn.commit()
             return Ok(True)

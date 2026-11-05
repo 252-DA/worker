@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 class RenderMicroContentVideoRequest:
     micro_content_id: str
     course_id: str | None = None
+    asset_id: str | None = None
     script: dict | None = None
 
 
@@ -31,6 +32,7 @@ class RenderMicroContentVideoResponse:
     video_object_key: str
     duration_seconds: float
     size_bytes: int
+    asset_id: str | None = None
 
 
 class RenderMicroContentVideoUseCase:
@@ -59,16 +61,17 @@ class RenderMicroContentVideoUseCase:
         script = request.script or mc.ai_script
         if not script or not isinstance(script, dict):
             err = ValueError(f"No valid script found for micro content {request.micro_content_id}")
-            self.store.update_video_failed(request.micro_content_id, str(err))
+            self.store.update_video_failed(request.micro_content_id, str(err), asset_id=request.asset_id)
             return Err(err)
 
         scenes = script.get("scenes") or []
         if not isinstance(scenes, list) or len(scenes) == 0:
             err = ValueError("Script contains no scenes to render")
-            self.store.update_video_failed(request.micro_content_id, str(err))
+            self.store.update_video_failed(request.micro_content_id, str(err), asset_id=request.asset_id)
             return Err(err)
 
         course_id = request.course_id or mc.course_id
+        script_voice = script.get("voice") or "vi-VN-HoaiMyNeural"
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -79,6 +82,7 @@ class RenderMicroContentVideoUseCase:
                     title = scene.get("title", f"Cảnh {idx + 1}")
                     bullets = scene.get("bullets", [])
                     narration = scene.get("narration") or title
+                    voice = scene.get("voice") or script_voice
 
                     slide_img_path = os.path.join(temp_dir, f"slide_{idx:02d}.png")
                     audio_path = os.path.join(temp_dir, f"audio_{idx:02d}.mp3")
@@ -94,6 +98,7 @@ class RenderMicroContentVideoUseCase:
                     duration = await self.tts_client.synthesize(
                         text=narration,
                         output_path=audio_path,
+                        voice=voice,
                     )
 
                     scene_media_list.append(
@@ -123,6 +128,7 @@ class RenderMicroContentVideoUseCase:
                     object_key=object_key,
                     duration_seconds=total_duration,
                     size_bytes=size_bytes,
+                    asset_id=request.asset_id,
                 )
                 if store_res.is_err():
                     raise store_res.error
@@ -133,6 +139,8 @@ class RenderMicroContentVideoUseCase:
                     object_key=object_key,
                     duration=total_duration,
                     size_bytes=size_bytes,
+                    asset_id=request.asset_id,
+                    voice=script_voice,
                 )
 
                 return Ok(
@@ -141,6 +149,7 @@ class RenderMicroContentVideoUseCase:
                         video_object_key=object_key,
                         duration_seconds=total_duration,
                         size_bytes=size_bytes,
+                        asset_id=request.asset_id,
                     )
                 )
 
@@ -150,5 +159,5 @@ class RenderMicroContentVideoUseCase:
                 micro_content_id=request.micro_content_id,
                 error=str(exc),
             )
-            self.store.update_video_failed(request.micro_content_id, str(exc))
+            self.store.update_video_failed(request.micro_content_id, str(exc), asset_id=request.asset_id)
             return Err(exc)
