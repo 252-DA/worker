@@ -8,8 +8,8 @@ from worker.use_cases.grade_micro_content_answers import (
     GradeMicroContentAnswersUseCase,
     REVIEW_FEEDBACK,
     _GradePayload,
-    _PointVerdict,
 )
+from worker.use_cases.grade_short_answers import _PointVerdict
 
 
 def _answer(status="PENDING") -> StoredAnswerForGrading:

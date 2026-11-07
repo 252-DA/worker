@@ -1,5 +1,7 @@
-import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from document_chunk.shared.result import Err, Ok
 from worker.runners.micro_content_video_worker import parse_render_job
@@ -66,7 +68,13 @@ async def test_render_micro_content_video_success():
 
     tts_client.synthesize = AsyncMock(side_effect=[3.5, 4.2])
     slide_gen.generate_slide.return_value = "slide.png"
-    video_composer.compose_video = AsyncMock(return_value=7.7)
+
+    async def fake_compose(scenes, work_dir, output_mp4_path):
+        # Use case đọc kích thước file đầu ra sau khi ghép.
+        Path(output_mp4_path).write_bytes(b"mp4")
+        return 7.7
+
+    video_composer.compose_video = AsyncMock(side_effect=fake_compose)
     file_storage.upload.return_value = Ok("micro-content/c-456/mc-123/video.mp4")
 
     use_case = RenderMicroContentVideoUseCase(
@@ -87,6 +95,7 @@ async def test_render_micro_content_video_success():
     data = res.unwrap()
     assert data.video_object_key == "micro-content/c-456/mc-123/video.mp4"
     assert data.duration_seconds == 7.7
+    assert data.size_bytes == 3
     assert tts_client.synthesize.await_count == 2
     assert slide_gen.generate_slide.call_count == 2
     store.update_video_ready.assert_called_once()
@@ -121,4 +130,4 @@ async def test_render_micro_content_video_handles_error():
     res = await use_case.execute(RenderMicroContentVideoRequest(micro_content_id="mc-123"))
     assert res.is_err()
     assert "TTS failure" in str(res.error)
-    store.update_video_failed.assert_called_once_with("mc-123", "TTS failure")
+    store.update_video_failed.assert_called_once_with("mc-123", "TTS failure", asset_id=None)
