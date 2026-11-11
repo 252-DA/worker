@@ -1,4 +1,5 @@
 from document_chunk.domain.entities.document import DocumentType
+from document_chunk.domain.exceptions import DocumentStaleError
 from document_chunk.domain.outbox_events import (
     OutboxEventType,
     OutboxRelayEvent,
@@ -16,6 +17,11 @@ from document_chunk.domain.ports.vector_store import IVectorStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
+from worker.services.document_reporter import (
+    STAGE_ENRICHMENT,
+    PublishingDocumentStatusReporter,
+)
+
 logger = get_logger(__name__)
 
 
@@ -25,6 +31,12 @@ class OutboxProjector:
     PostgreSQL outbox ownership belongs to the Core API relay. This service only
     consumes durable BullMQ jobs, so it must never fetch or mutate outbox rows.
     BullMQ owns retries for projection failures.
+
+    DOCUMENT_DELETED dọn cả ba kho dẫn xuất của tài liệu: ``chunks`` (soft-delete,
+    bảng AI của worker), Qdrant và Neo4j. ``documents`` do core-api xoá.
+
+    Document status (GENERATED_DRAFT after the concept graph) goes to core-api
+    as DOCUMENT_PROCESSING_RESULT; this service never writes ``documents``.
     """
 
     def __init__(
@@ -32,10 +44,12 @@ class OutboxProjector:
         metadata_store: IMetadataStore,
         graph_store: IGraphStore,
         vector_store: IVectorStore,
+        result_publisher,
     ) -> None:
         self._metadata_store = metadata_store
         self._graph_store = graph_store
         self._vector_store = vector_store
+        self._result_publisher = result_publisher
 
     def process(self, event: OutboxRelayEvent) -> Result[None, Exception]:
         try:
@@ -108,6 +122,19 @@ class OutboxProjector:
         except (TypeError, ValueError) as exc:
             return Err(exc)
 
+        # Postgres trước: chunks là bảng AI do worker sở hữu, core-api chỉ
+        # soft-delete documents. Làm trước để việc ẩn chunks không phụ thuộc
+        # Qdrant/Neo4j đang sống; mọi bước idempotent nên BullMQ chạy lại cả job
+        # khi một bước sau lỗi cũng không sao.
+        chunks_result = self._metadata_store.soft_delete_document_chunks(document_id)
+        if chunks_result.is_err():
+            return chunks_result
+        logger.info(
+            "outbox_projector.document_chunks_soft_deleted",
+            document_id=document_id,
+            chunks=chunks_result.unwrap(),
+        )
+
         vector_result = self._vector_store.delete_by_document(document_id)
         if vector_result.is_err():
             return vector_result
@@ -129,6 +156,13 @@ class OutboxProjector:
 
         concepts_payload = payload.get("concepts", [])
         mentions_payload = payload.get("mentions", [])
+        # Sự kiện ghi trước khi có hai trường này: lượt 0, lần chạy 1.
+        generation = payload.get("processing_generation", 0)
+        attempt = payload.get("enrichment_attempt", 1)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            return Err(ValueError("concept projection payload.processing_generation must be an integer >= 0"))
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            return Err(ValueError("concept projection payload.enrichment_attempt must be an integer >= 1"))
         if not isinstance(concepts_payload, list):
             return Err(ValueError("concept projection payload.concepts must be a list"))
         if not isinstance(mentions_payload, list):
@@ -167,10 +201,19 @@ class OutboxProjector:
         if upsert_result.is_err():
             return upsert_result
 
-        return self._metadata_store.update_document_status(
-            document_id,
-            IngestionStatus.ENRICHED,
+        reporter = PublishingDocumentStatusReporter(
+            self._result_publisher,
+            self._metadata_store,
+            stage=STAGE_ENRICHMENT,
+            processing_generation=generation,
+            attempt=attempt,
         )
+        status_result = reporter.report_status(document_id, IngestionStatus.ENRICHED)
+        if status_result.is_err() and isinstance(status_result.error, DocumentStaleError):
+            # Tài liệu bị xoá sau khi chiếu graph: DOCUMENT_DELETED sẽ dọn graph.
+            logger.info("outbox_projector.stale_document_skipped", document_id=document_id)
+            return Ok(None)
+        return status_result
 
     def _ensure_document_still_exists(
         self,

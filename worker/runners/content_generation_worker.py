@@ -1,6 +1,16 @@
-"""BullMQ worker for grounded, LO-scoped quiz and lesson-card generation requests."""
+"""
+BullMQ worker for grounded, LO-scoped quiz and lesson-card generation requests.
+
+Worker tính, core-api ghi: mỗi bước của vòng đời request (bắt đầu chạy, xong
+kèm câu/card đã kiểm chứng, thất bại) được gửi về core-api thành một kết quả
+CONTENT_GENERATION_RESULT trên hàng đợi ``worker_results``
+(contracts/integration-events/v1/content-generation-result.json). core-api là
+nơi duy nhất ghi ``content_generation_requests``, ``lessons``, ``quiz_items``,
+``lesson_cards`` (src/content-generation/content-generation-result.handler.ts).
+"""
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +28,7 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
+from worker.services.result_publisher import CONTENT_GENERATION_RESULT, make_result_id
 from worker.use_cases.extract_relations import ExtractRelationsRequest
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizRequest
 from worker.use_cases.generate_lesson_cards import (
@@ -29,12 +40,127 @@ from worker.use_cases.generate_lesson_cards import (
 logger = get_logger(__name__)
 
 
+# Trạng thái đích của content_generation_requests mà mỗi kết quả mang theo; cũng
+# là phần cuối của result_id, nên mỗi bước có đúng một id cho một lệnh: job gốc
+# retry gửi lại cùng id và BullMQ bỏ bản trùng.
+STATUS_RUNNING = "RUNNING"
+STATUS_SUCCEEDED = "SUCCEEDED"
+STATUS_FAILED = "FAILED"
+
+_CONTENT_TYPES = frozenset({"quiz", "card", "relations"})
+# last_error là TEXT; chặn để một thông báo lỗi dài không đi nguyên vào payload.
+_MAX_ERROR_CHARS = 4000
+# Khớp _ID_PART của result_publisher: một phần của result_id.
+_RESULT_ID_PART = re.compile(r"[A-Za-z0-9_-]+")
+_MAX_SOURCE_EVENT_ID = 200
+
+
 @dataclass(frozen=True)
 class ContentGenerationJob:
     request_id: str
     course_id: str
     content_type: str
     scope: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResultSource:
+    """Lệnh đã sinh ra việc này: gốc của result_id và source_event_id."""
+
+    source_id: str
+    source_event_id: str | None
+
+
+def _result_source(bull_job: Any, request_id: str | None) -> ResultSource | None:
+    """
+    ``event_id`` outbox của lệnh là gốc tốt nhất (mỗi lần yêu cầu là một sự
+    kiện mới); job id (outbox đặt = event_id) rồi request_id là dự phòng.
+    """
+    data = getattr(bull_job, "data", None)
+    event_id = data.get("event_id") if isinstance(data, dict) else None
+    if not isinstance(event_id, str) or not event_id.strip():
+        event_id = None
+    candidates = (event_id, getattr(bull_job, "id", None), request_id)
+    source_id = next(
+        (c for c in candidates if isinstance(c, str) and _RESULT_ID_PART.fullmatch(c)),
+        None,
+    )
+    if source_id is None:
+        return None
+    if event_id is not None and len(event_id) > _MAX_SOURCE_EVENT_ID:
+        event_id = None
+    return ResultSource(source_id=source_id, source_event_id=event_id)
+
+
+def _is_final_attempt(bull_job: Any) -> bool:
+    """``attemptsMade`` đếm số lần đã thất bại, nên lần đang chạy là lần thứ +1."""
+    opts = getattr(bull_job, "opts", None) or {}
+    attempts = int(opts.get("attempts") or 1)
+    return int(getattr(bull_job, "attemptsMade", 0) or 0) + 1 >= attempts
+
+
+def _error_text(error: object) -> str:
+    text = str(error).strip() or type(error).__name__
+    return text if len(text) <= _MAX_ERROR_CHARS else text[: _MAX_ERROR_CHARS - 1] + "…"
+
+
+def _base_payload(
+    request_id: str, course_id: str | None, content_type: str | None, status: str
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "course_id": course_id,
+        # Loại lạ (job hỏng) gửi null: core-api chỉ đối chiếu khi có giá trị.
+        "content_type": content_type if content_type in _CONTENT_TYPES else None,
+        "status": status,
+    }
+
+
+def _started_payload(job: ContentGenerationJob) -> dict[str, Any]:
+    return _base_payload(job.request_id, job.course_id, job.content_type, STATUS_RUNNING)
+
+
+def _failed_payload(
+    request_id: str, course_id: str | None, content_type: str | None, error: object
+) -> dict[str, Any]:
+    return {
+        **_base_payload(request_id, course_id, content_type, STATUS_FAILED),
+        "error": _error_text(error),
+    }
+
+
+def _succeeded_payload(job: ContentGenerationJob, response) -> dict[str, Any]:
+    payload = _base_payload(job.request_id, job.course_id, job.content_type, STATUS_SUCCEEDED)
+    if job.content_type == "relations":
+        # knowledge_relations vẫn do worker ghi (chưa thuộc đợt này); core-api
+        # chỉ cập nhật trạng thái request.
+        return {**payload, "generated_count": response.relations_written}
+    rejected = [r.to_payload() for r in response.rejected]
+    if job.content_type == "card":
+        return {
+            **payload,
+            "lo_id": response.lo_id,
+            "generated_count": response.card_count,
+            "lesson_cards": [card.to_payload() for card in response.cards],
+            "rejected": rejected,
+        }
+    return {
+        **payload,
+        "lo_id": response.lo_id,
+        "generated_count": response.quiz_count,
+        "quiz_items": [item.to_payload() for item in response.items],
+        "rejected": rejected,
+    }
+
+
+async def _publish(container, source: ResultSource, payload: dict[str, Any]) -> str:
+    """Chỉ trả về khi Redis đã nhận; lỗi nổi lên để job gốc fail và BullMQ retry."""
+    return await container.result_publisher.publish(
+        CONTENT_GENERATION_RESULT,
+        payload,
+        result_id=make_result_id(CONTENT_GENERATION_RESULT, source.source_id, payload["status"]),
+        source_event_id=source.source_event_id,
+    )
 
 
 def _request_id_from_job_data(data: Any) -> str | None:
@@ -63,39 +189,38 @@ def _request_id_from_job_data(data: Any) -> str | None:
     return None
 
 
-def _fail_unparsed_request(container, data: Any, exc: Exception) -> None:
-    """
-    Đánh dấu FAILED cho một job hỏng, best-effort.
+def _payload_text(data: Any, key: str) -> str | None:
+    payload = data.get("payload") if isinstance(data, dict) else None
+    value = payload.get(key) if isinstance(payload, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
-    Không bao giờ được che lỗi gốc: chỗ gọi vẫn raise ``UnrecoverableError``
-    ngay sau đó, nên mọi trục trặc ở đây chỉ được ghi log.
+
+async def _fail_unparsed_request(container, bull_job: Any, exc: Exception) -> None:
     """
+    Gửi kết quả FAILED cho một job hỏng để dòng request không treo ở QUEUED.
+
+    Lỗi gửi được ném ra cho chỗ gọi: job phải retry để còn gửi lại được.
+    """
+    data = getattr(bull_job, "data", None)
     request_id = _request_id_from_job_data(data)
-    if request_id is None:
+    source = _result_source(bull_job, request_id) if request_id else None
+    if request_id is None or source is None:
         logger.error(
             "content_generation_worker.job.unidentifiable",
             error=str(exc),
             reason="không lấy được request_id; dòng QUEUED phải dọn tay",
         )
         return
-    try:
-        result = container.metadata_store.update_content_generation_request(
-            request_id=request_id,
-            status="FAILED",
-            last_error=f"invalid content-generation job: {exc}",
-        )
-        if result.is_err():
-            logger.error(
-                "content_generation_worker.job.fail_mark_failed",
-                request_id=request_id,
-                error=str(result.error),
-            )
-    except Exception as update_exc:  # pragma: no cover - chỉ khi store hỏng hẳn
-        logger.error(
-            "content_generation_worker.job.fail_mark_raised",
-            request_id=request_id,
-            error=str(update_exc),
-        )
+    await _publish(
+        container,
+        source,
+        _failed_payload(
+            request_id,
+            _payload_text(data, "course_id"),
+            _payload_text(data, "type"),
+            f"invalid content-generation job: {exc}",
+        ),
+    )
 
 
 def _parse_job(data: Any) -> ContentGenerationJob:
@@ -199,72 +324,27 @@ def _plan(container, job: ContentGenerationJob):
     )
 
 
-def _generated_ids(content_type: str, response) -> tuple[int, dict[str, Any]]:
-    if content_type == "relations":
-        return response.relations_written, {
+def _summary(job: ContentGenerationJob, response) -> dict[str, Any]:
+    """Giá trị trả về của job gốc (BullMQ giữ làm returnvalue): nhỏ, để tra cứu."""
+    if job.content_type == "relations":
+        generated: dict[str, Any] = {
             "relations_written": response.relations_written,
             "relations_dropped": response.relations_dropped,
             "chunks_processed": response.chunks_processed,
             "failed_batches": response.failed_batches,
         }
-    if content_type == "card":
-        return response.card_count, {
+    elif job.content_type == "card":
+        generated = {
             "card_count": response.card_count,
             "card_ids": response.card_ids,
+            "rejected_count": len(response.rejected),
         }
-    return response.quiz_count, {
-        "quiz_count": response.quiz_count,
-        "question_ids": response.question_ids,
-    }
-
-
-def _run_job_sync(container, job: ContentGenerationJob) -> dict[str, Any]:
-    try:
-        use_case, request = _plan(container, job)
-    except (TypeError, ValueError) as exc:
-        container.metadata_store.update_content_generation_request(
-            request_id=job.request_id,
-            status="FAILED",
-            last_error=str(exc),
-        )
-        raise UnrecoverableError(f"invalid content-generation request: {exc}") from exc
-
-    running_result = container.metadata_store.update_content_generation_request(
-        request_id=job.request_id,
-        status="RUNNING",
-        last_error=None,
-    )
-    if running_result.is_err():
-        raise running_result.error
-
-    result = use_case.execute(request)
-    if result.is_err():
-        container.metadata_store.update_content_generation_request(
-            request_id=job.request_id,
-            status="FAILED",
-            last_error=str(result.error),
-        )
-        raise result.error
-
-    response = result.unwrap()
-    generated_count, generated = _generated_ids(job.content_type, response)
-    completed_result = container.metadata_store.update_content_generation_request(
-        request_id=job.request_id,
-        status="SUCCEEDED",
-        generated_count=generated_count,
-        last_error=None,
-    )
-    if completed_result.is_err():
-        raise completed_result.error
-
-    logger.info(
-        "content_generation_worker.job.completed",
-        request_id=job.request_id,
-        course_id=job.course_id,
-        content_type=job.content_type,
-        lo_id=getattr(response, "lo_id", None),
-        generated_count=generated_count,
-    )
+    else:
+        generated = {
+            "quiz_count": response.quiz_count,
+            "question_ids": response.question_ids,
+            "rejected_count": len(response.rejected),
+        }
     return {
         "request_id": job.request_id,
         "course_id": response.course_id,
@@ -273,17 +353,91 @@ def _run_job_sync(container, job: ContentGenerationJob) -> dict[str, Any]:
     }
 
 
+def _run_job_sync(use_case, request):
+    """Chạy use case (đồng bộ, trong thread); Err thành exception cho chỗ gọi."""
+    result = use_case.execute(request)
+    if result.is_err():
+        error = result.error
+        raise error if isinstance(error, BaseException) else RuntimeError(str(error))
+    return result.unwrap()
+
+
 async def _process_job(container, bull_job, job_token):
     del job_token
     try:
         job = _parse_job(bull_job.data)
     except (KeyError, TypeError, ValueError) as exc:
-        await asyncio.to_thread(_fail_unparsed_request, container, bull_job.data, exc)
+        try:
+            await _fail_unparsed_request(container, bull_job, exc)
+        except Exception as publish_exc:
+            # FAILED chưa tới core-api: lỗi thường (không Unrecoverable) để
+            # BullMQ retry job và lần sau gửi lại, thay vì để dòng treo QUEUED.
+            logger.error(
+                "content_generation_worker.job.fail_publish_failed",
+                error=str(exc),
+                publish_error=str(publish_exc),
+            )
+            raise RuntimeError(
+                f"invalid content-generation job ({exc}); "
+                f"publishing the FAILED result failed: {publish_exc}"
+            ) from publish_exc
         raise UnrecoverableError(f"invalid content-generation job: {exc}") from exc
 
-    # Use case gọi LLM, MCP và psycopg đồng bộ: chạy ngoài event loop để không
-    # chặn heartbeat gia hạn lock BullMQ và HTTP healthcheck.
-    return await asyncio.to_thread(_run_job_sync, container, job)
+    source = _result_source(bull_job, job.request_id)
+    if source is None:
+        logger.error(
+            "content_generation_worker.job.no_result_id",
+            request_id=job.request_id,
+            reason="event_id, job id và request_id đều không dùng làm result_id được",
+        )
+        raise UnrecoverableError(f"cannot derive a result_id for request {job.request_id!r}")
+
+    try:
+        # Dựng use case có thể đọc llm_model_bindings (đồng bộ): cũng chạy
+        # ngoài event loop như trước.
+        use_case, request = await asyncio.to_thread(_plan, container, job)
+    except (TypeError, ValueError) as exc:
+        await _publish(
+            container, source,
+            _failed_payload(job.request_id, job.course_id, job.content_type, exc),
+        )
+        raise UnrecoverableError(f"invalid content-generation request: {exc}") from exc
+
+    await _publish(container, source, _started_payload(job))
+
+    try:
+        # Use case gọi LLM, MCP và psycopg đồng bộ: chạy ngoài event loop để
+        # không chặn heartbeat gia hạn lock BullMQ và HTTP healthcheck.
+        response = await asyncio.to_thread(_run_job_sync, use_case, request)
+    except Exception as exc:
+        # Chỉ báo FAILED ở lần thử cuối: FAILED là trạng thái kết thúc, core-api
+        # không cho lần retry sau kéo request về RUNNING/SUCCEEDED. Giữa các lần
+        # thử, request vẫn RUNNING.
+        if _is_final_attempt(bull_job) or isinstance(exc, UnrecoverableError):
+            await _publish(
+                container, source,
+                _failed_payload(job.request_id, job.course_id, job.content_type, exc),
+            )
+        else:
+            logger.warning(
+                "content_generation_worker.job.will_retry",
+                request_id=job.request_id,
+                attempts_made=getattr(bull_job, "attemptsMade", None),
+                error=str(exc),
+            )
+        raise
+
+    await _publish(container, source, _succeeded_payload(job, response))
+    summary = _summary(job, response)
+    logger.info(
+        "content_generation_worker.job.completed",
+        request_id=job.request_id,
+        course_id=job.course_id,
+        content_type=job.content_type,
+        lo_id=summary["lo_id"],
+        rejected=summary.get("rejected_count"),
+    )
+    return summary
 
 
 async def _main() -> None:

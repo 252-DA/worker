@@ -11,7 +11,7 @@ from document_chunk.domain.ports.metadata_store import (
     StoredCourse,
     StoredLearningOutcome,
 )
-from document_chunk.shared.result import Err, Ok
+from document_chunk.shared.result import Ok
 from worker.use_cases.generate_lesson_cards import (
     GenerateLessonCardsRequest,
     GenerateLessonCardsUseCase,
@@ -92,8 +92,9 @@ def _use_case(store, llm) -> GenerateLessonCardsUseCase:
     return GenerateLessonCardsUseCase(metadata_store=store, llm_client=llm)
 
 
-def _persisted(store):
-    return store.persist_curriculum_lesson_cards.call_args.kwargs["lesson_cards"]
+def _cards(result):
+    """Card use case trả về; core-api ghi chúng (use case không gọi hàm ghi nào)."""
+    return list(result.unwrap().cards)
 
 
 class TestGenerateLessonCards:
@@ -110,8 +111,8 @@ class TestGenerateLessonCards:
 
         assert result.is_ok()
         assert result.unwrap().card_count == 2
-        assert store.persist_curriculum_lesson_cards.call_args.kwargs["lo_id"] == LO_ID
-        first, second = _persisted(store)
+        assert result.unwrap().lo_id == LO_ID
+        first, second = _cards(result)
         assert [first.card_index, second.card_index] == [0, 1]
         assert first.title == "AI"
         assert first.check_question == "AI là gì?"
@@ -122,6 +123,7 @@ class TestGenerateLessonCards:
         # chunk_id model bịa ra bị bỏ, chỉ giữ chunk thật sự đã đưa vào prompt.
         assert second.source_chunk_ids == ("chunk-002",)
         assert second.primary_chunk_id == "chunk-002"
+        assert {first.verification.status, second.verification.status} == {"VERIFIED"}
 
     def test_card_id_is_stable_for_the_same_lo_and_title(self, store, mock_llm_client):
         mock_llm_client.generate.side_effect = [
@@ -146,7 +148,7 @@ class TestGenerateLessonCards:
         result = _use_case(store, mock_llm_client).execute(_request(count=3))
 
         assert result.unwrap().card_count == 2
-        assert [card.title for card in _persisted(store)] == ["AI", "Học máy"]
+        assert [card.title for card in _cards(result)] == ["AI", "Học máy"]
 
     def test_only_count_cards_are_kept(self, store, mock_llm_client):
         mock_llm_client.generate.side_effect = [
@@ -170,7 +172,11 @@ class TestGenerateLessonCards:
 
         assert result.is_ok()
         assert mock_llm_client.generate.call_count == 4
-        assert [card.title for card in _persisted(store)] == ["AI", "Học máy"]
+        first, rewritten = _cards(result)
+        assert [first.title, rewritten.title] == ["AI", "Học máy"]
+        assert first.verification.regeneration_attempts == 0
+        assert rewritten.verification.status == "VERIFIED"
+        assert rewritten.verification.regeneration_attempts == 1
 
     def test_card_still_failing_after_retries_is_not_saved(self, store, mock_llm_client):
         mock_llm_client.generate.side_effect = [
@@ -185,7 +191,10 @@ class TestGenerateLessonCards:
         result = _use_case(store, mock_llm_client).execute(_request(count=2))
 
         assert result.is_ok()
-        assert [card.title for card in _persisted(store)] == ["AI"]
+        assert [card.title for card in _cards(result)] == ["AI"]
+        # Card bị loại không được lưu nhưng được đếm trong kết quả.
+        [rejected] = result.unwrap().rejected
+        assert rejected.regeneration_attempts == 2
 
     def test_nothing_saved_when_every_card_fails(self, store, mock_llm_client):
         use_case = GenerateLessonCardsUseCase(
@@ -199,7 +208,6 @@ class TestGenerateLessonCards:
         result = use_case.execute(_request(count=1))
 
         assert result.is_err()
-        store.persist_curriculum_lesson_cards.assert_not_called()
 
     def test_broken_verifier_does_not_block_saving(self, store, mock_llm_client):
         """Chấm hỏng là không kết luận được; người duyệt vẫn là cổng cuối."""
@@ -212,7 +220,10 @@ class TestGenerateLessonCards:
         result = _use_case(store, mock_llm_client).execute(_request(count=1))
 
         assert result.is_ok()
-        assert [card.title for card in _persisted(store)] == ["AI"]
+        [card] = _cards(result)
+        assert card.title == "AI"
+        assert card.verification.status == "INCONCLUSIVE"
+        assert card.verification.inconclusive_reason == "judge_failed"
 
     def test_no_source_chunks_fails_without_calling_the_model(self, store, mock_llm_client):
         store.list_chunks_for_lo.return_value = Ok([])
@@ -243,8 +254,8 @@ class TestGenerateLessonCards:
         assert result.is_err()
         mock_llm_client.generate.assert_not_called()
 
-    def test_persist_error_is_returned(self, store, mock_llm_client):
-        store.persist_curriculum_lesson_cards.return_value = Err(RuntimeError("db down"))
+    def test_card_payload_matches_the_lesson_cards_row(self, store, mock_llm_client):
+        """Đúng các cột lesson_cards mà câu SQL cũ ghi, cộng hồ sơ kiểm chứng."""
         mock_llm_client.generate.side_effect = [
             Ok(_cards_json(_card("AI"))),
             Ok(_verdicts("supported")),
@@ -252,8 +263,26 @@ class TestGenerateLessonCards:
 
         result = _use_case(store, mock_llm_client).execute(_request(count=1))
 
-        assert result.is_err()
-        assert "db down" in str(result.error)
+        assert result.is_ok()
+        payload = _cards(result)[0].to_payload()
+        assert payload["title"] == "AI"
+        assert payload["content"] == {
+            "key_insight": "AI là ý chính.",
+            "bullets": ["Ý một", "Ý hai"],
+            "example": "Ví dụ trong slide.",
+            "misconception": None,
+            "check_question": "AI là gì?",
+            "check_answer": "AI là ý chính.",
+            "model_id": "gemini-test",
+        }
+        assert len(payload["source_chunk_ids"]) == 1
+        assert payload["verification_status"] == "VERIFIED"
+        evidence = payload["verification_evidence"]
+        assert evidence["criterion"] == "source_grounding"
+        assert evidence["judge_verdict"] == "supported"
+        # Một model vừa viết vừa chấm: ghi rõ trong hồ sơ.
+        assert evidence["judge_is_writer"] is True
+        assert "requested_bloom_level" not in evidence
 
     def test_usage_is_logged_per_step(self, store, mock_llm_client):
         mock_llm_client.generate.side_effect = [

@@ -1,50 +1,102 @@
+"""
+Render video AI cho Micro Content: slide + giọng đọc + ghép FFmpeg → object
+storage, rồi gửi MICRO_CONTENT_VIDEO_RESULT về core-api.
+
+Worker không ghi ``micro_contents`` hay ``video_assets``: core-api áp dụng kết
+quả (core-api/src/micro-content/micro-content-video-result.handler.ts). Lệnh
+MICRO_CONTENT_RENDER_REQUESTED mang đủ dữ liệu (kịch bản, asset, render_id) nên
+cũng không đọc DB. Xem docs/ke-hoach-ranh-gioi-du-lieu.md.
+"""
 from __future__ import annotations
 
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from document_chunk.domain.ports.file_storage import IFileStorage
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.services.micro_content_video_store import MicroContentVideoStore
+from worker.services.result_publisher import MICRO_CONTENT_VIDEO_RESULT, make_result_id
 from worker.services.slide_generator import SlideGenerator
 from worker.services.tts_client import TtsClient, get_default_tts_client
 from worker.services.video_composer import SceneMedia, VideoComposer
 
 logger = get_logger(__name__)
 
+DEFAULT_VOICE = "vi-VN-HoaiMyNeural"
+VIDEO_MIME_TYPE = "video/mp4"
+# Khớp maxLength của `error` trong micro-content-video-result.json (trước đây
+# store cắt cùng độ dài khi ghi micro_contents.video_error).
+MAX_ERROR_CHARS = 1000
+
+
+class ResultPublisher(Protocol):
+    async def publish(
+        self, kind: str, payload: dict[str, Any], *, result_id: str, source_event_id: str | None = None
+    ) -> str: ...
+
+
+class InvalidRenderRequest(ValueError):
+    """Lệnh render không render được (không có kịch bản/cảnh): thử lại cũng vậy."""
+
 
 @dataclass(frozen=True)
 class RenderMicroContentVideoRequest:
     micro_content_id: str
-    course_id: str | None = None
-    asset_id: str | None = None
-    script: dict | None = None
+    course_id: str
+    asset_id: str
+    # core-api sinh mới mỗi lần bấm render; kết quả mang lại để core-api bỏ
+    # kết quả của lần render cũ.
+    render_id: str
+    script: Any = None
+    # event_id outbox của lệnh render.
+    source_event_id: str | None = None
 
 
 @dataclass(frozen=True)
 class RenderMicroContentVideoResponse:
     micro_content_id: str
+    asset_id: str
+    render_id: str
     video_object_key: str
     duration_seconds: float
     size_bytes: int
-    asset_id: str | None = None
+
+
+def video_object_key(course_id: str, micro_content_id: str, render_id: str) -> str:
+    """
+    Mỗi lần render một object riêng. Trước đây mọi lần render (và cả video tải
+    lên) cùng ghi ``.../video.mp4``: job cũ retry xong muộn sẽ ghi đè file của
+    lần render mới, dù DB đã chặn kết quả cũ. Bài khác hay bản fork đang trỏ file
+    cũ cũng vẫn phát được file của nó.
+    """
+    return f"micro-content/{course_id}/{micro_content_id}/ai-{render_id}.mp4"
+
+
+def _scenes_of(script: Any) -> tuple[list[dict], str]:
+    if not script or not isinstance(script, dict):
+        raise InvalidRenderRequest("No valid script found for this render request")
+    scenes = script.get("scenes") or []
+    if not isinstance(scenes, list) or len(scenes) == 0:
+        raise InvalidRenderRequest("Script contains no scenes to render")
+    if not all(isinstance(scene, dict) for scene in scenes):
+        raise InvalidRenderRequest("Every scene of the script must be an object")
+    return scenes, script.get("voice") or DEFAULT_VOICE
 
 
 class RenderMicroContentVideoUseCase:
     def __init__(
         self,
-        store: MicroContentVideoStore,
+        result_publisher: ResultPublisher,
         file_storage: IFileStorage,
         tts_client: TtsClient | None = None,
         slide_generator: SlideGenerator | None = None,
         video_composer: VideoComposer | None = None,
     ) -> None:
-        self.store = store
+        self.result_publisher = result_publisher
         self.file_storage = file_storage
         self.tts_client = tts_client or get_default_tts_client()
         self.slide_generator = slide_generator or SlideGenerator()
@@ -53,25 +105,15 @@ class RenderMicroContentVideoUseCase:
     async def execute(
         self, request: RenderMicroContentVideoRequest
     ) -> Result[RenderMicroContentVideoResponse, Exception]:
-        mc_res = self.store.get_micro_content(request.micro_content_id)
-        if mc_res.is_err():
-            return Err(mc_res.error)
-
-        mc = mc_res.unwrap()
-        script = request.script or mc.ai_script
-        if not script or not isinstance(script, dict):
-            err = ValueError(f"No valid script found for micro content {request.micro_content_id}")
-            self.store.update_video_failed(request.micro_content_id, str(err), asset_id=request.asset_id)
-            return Err(err)
-
-        scenes = script.get("scenes") or []
-        if not isinstance(scenes, list) or len(scenes) == 0:
-            err = ValueError("Script contains no scenes to render")
-            self.store.update_video_failed(request.micro_content_id, str(err), asset_id=request.asset_id)
-            return Err(err)
-
-        course_id = request.course_id or mc.course_id
-        script_voice = script.get("voice") or "vi-VN-HoaiMyNeural"
+        """
+        Render, upload rồi gửi kết quả READY. Lỗi trả về Err và KHÔNG gửi FAILED:
+        job gốc còn lượt thử thì người gọi để BullMQ thử lại, chỉ lần cuối (hoặc
+        ``InvalidRenderRequest``) mới gọi ``report_failure``.
+        """
+        try:
+            scenes, script_voice = _scenes_of(request.script)
+        except InvalidRenderRequest as exc:
+            return Err(exc)
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -116,48 +158,85 @@ class RenderMicroContentVideoUseCase:
                     output_mp4_path=final_mp4_path,
                 )
 
-                object_key = f"micro-content/{course_id}/{request.micro_content_id}/video.mp4"
+                object_key = video_object_key(
+                    request.course_id, request.micro_content_id, request.render_id
+                )
                 upload_res = self.file_storage.upload(Path(final_mp4_path), object_key)
                 if upload_res.is_err():
                     raise upload_res.error
 
                 size_bytes = os.path.getsize(final_mp4_path)
 
-                store_res = self.store.update_video_ready(
-                    micro_content_id=request.micro_content_id,
-                    object_key=object_key,
-                    duration_seconds=total_duration,
-                    size_bytes=size_bytes,
-                    asset_id=request.asset_id,
-                )
-                if store_res.is_err():
-                    raise store_res.error
+            response = RenderMicroContentVideoResponse(
+                micro_content_id=request.micro_content_id,
+                asset_id=request.asset_id,
+                render_id=request.render_id,
+                video_object_key=object_key,
+                duration_seconds=total_duration,
+                size_bytes=size_bytes,
+            )
+            # Chỉ báo READY khi file đã nằm trên storage. Gửi lỗi thì nổi lên
+            # thành Err: job gốc lỗi và BullMQ render lại, không hoàn tất khi
+            # core-api chưa nhận được kết quả.
+            await self._publish_ready(request, response)
 
-                logger.info(
-                    "render_micro_content_video.succeeded",
-                    micro_content_id=request.micro_content_id,
-                    object_key=object_key,
-                    duration=total_duration,
-                    size_bytes=size_bytes,
-                    asset_id=request.asset_id,
-                    voice=script_voice,
-                )
-
-                return Ok(
-                    RenderMicroContentVideoResponse(
-                        micro_content_id=request.micro_content_id,
-                        video_object_key=object_key,
-                        duration_seconds=total_duration,
-                        size_bytes=size_bytes,
-                        asset_id=request.asset_id,
-                    )
-                )
+            logger.info(
+                "render_micro_content_video.succeeded",
+                micro_content_id=request.micro_content_id,
+                render_id=request.render_id,
+                object_key=object_key,
+                duration=total_duration,
+                size_bytes=size_bytes,
+                asset_id=request.asset_id,
+                voice=script_voice,
+            )
+            return Ok(response)
 
         except Exception as exc:
             logger.error(
                 "render_micro_content_video.failed",
                 micro_content_id=request.micro_content_id,
+                render_id=request.render_id,
                 error=str(exc),
             )
-            self.store.update_video_failed(request.micro_content_id, str(exc), asset_id=request.asset_id)
             return Err(exc)
+
+    async def report_failure(self, request: RenderMicroContentVideoRequest, error: BaseException | str) -> str:
+        """
+        Gửi FAILED cho lần render này (micro_contents.video_error hiện cho giảng
+        viên). Lỗi gửi nổi lên cho người gọi: job gốc phải lỗi theo.
+        """
+        message = (str(error) or type(error).__name__)[:MAX_ERROR_CHARS]
+        return await self.result_publisher.publish(
+            MICRO_CONTENT_VIDEO_RESULT,
+            {
+                "micro_content_id": request.micro_content_id,
+                "asset_id": request.asset_id,
+                "render_id": request.render_id,
+                "status": "FAILED",
+                "error": message,
+            },
+            result_id=make_result_id(MICRO_CONTENT_VIDEO_RESULT, request.render_id, "failed"),
+            source_event_id=request.source_event_id,
+        )
+
+    async def _publish_ready(
+        self, request: RenderMicroContentVideoRequest, response: RenderMicroContentVideoResponse
+    ) -> str:
+        return await self.result_publisher.publish(
+            MICRO_CONTENT_VIDEO_RESULT,
+            {
+                "micro_content_id": response.micro_content_id,
+                "asset_id": response.asset_id,
+                "render_id": response.render_id,
+                "status": "READY",
+                "object_key": response.video_object_key,
+                "duration_ms": max(0, int(response.duration_seconds * 1000)),
+                "size_bytes": response.size_bytes,
+                "mime_type": VIDEO_MIME_TYPE,
+            },
+            # Tất định theo lần render: job gốc retry sau khi đã gửi sinh lại
+            # đúng id, BullMQ bỏ bản trùng.
+            result_id=make_result_id(MICRO_CONTENT_VIDEO_RESULT, request.render_id, "ready"),
+            source_event_id=request.source_event_id,
+        )

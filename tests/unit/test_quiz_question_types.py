@@ -62,7 +62,6 @@ def _store(mock_metadata_store):
         StoredChunkMetadata(chunk_id="chunk-001", document_id="doc-001", chunk_index=0,
                             content_text="Cây là đồ thị liên thông không chu trình, n đỉnh có n-1 cạnh.")
     ])
-    mock_metadata_store.persist_curriculum_quiz_items.return_value = Ok(None)
     return mock_metadata_store
 
 
@@ -85,7 +84,7 @@ def test_each_type_is_generated_verified_and_stored(question_type, mock_metadata
     result = _run(store, mock_llm_client, question_type, item)
 
     assert result.is_ok(), result
-    [stored] = store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"]
+    [stored] = result.unwrap().items
     assert stored.question_type == question_type
     assert expected(stored), stored
     generation_prompt, verification_prompt = (c.args[0] for c in mock_llm_client.generate.call_args_list)
@@ -98,8 +97,8 @@ def test_quiz_id_includes_type_so_types_do_not_overwrite_each_other(mock_metadat
     ids = []
     for question_type, item in (("TRUE_FALSE", {"question": "Q", "is_true": True}),
                                 ("SHORT_ANSWER", {"question": "Q", "model_answer": "M", "rubric": ["R"]})):
-        assert _run(store, mock_llm_client, question_type, item).is_ok()
-        ids.append(store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"][0].question_id)
+        result = _run(store, mock_llm_client, question_type, item)
+        ids.append(result.unwrap().items[0].question_id)
     assert ids[0] != ids[1]
 
 
@@ -115,7 +114,6 @@ def test_fill_blank_without_a_blank_is_rejected_by_the_schema(mock_metadata_stor
     )
 
     assert result.is_err()
-    store.persist_curriculum_quiz_items.assert_not_called()
 
 
 def test_unknown_type_fails_before_calling_the_model(mock_metadata_store, mock_llm_client):

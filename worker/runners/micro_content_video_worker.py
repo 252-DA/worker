@@ -2,8 +2,11 @@
 BullMQ worker — xử lý sinh video AI cho Micro Content.
 Hàng đợi: ``micro_content_video``
 Sự kiện:
-- ``MICRO_CONTENT_RENDER_REQUESTED``: Render slide + TTS audio + ghép FFmpeg -> MinIO -> cập nhật video READY/FAILED.
-- ``MICRO_CONTENT_SCRIPT_REQUESTED``: Sinh kịch bản nếu cần thêm.
+- ``MICRO_CONTENT_RENDER_REQUESTED``: Render slide + TTS audio + ghép FFmpeg -> object
+  storage -> gửi MICRO_CONTENT_VIDEO_RESULT (READY/FAILED) về core-api qua
+  ``worker_results``; core-api ghi micro_contents/video_assets, worker không ghi.
+- ``MICRO_CONTENT_SCRIPT_REQUESTED``: chưa có việc gì (core-api tự ghi kịch bản mặc
+  định khi phát lệnh); nhận job và bỏ qua.
 
 Run:
     python -m worker.runners.micro_content_video_worker
@@ -11,6 +14,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 from bullmq.custom_errors import UnrecoverableError
@@ -25,7 +29,10 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
-from worker.use_cases.render_micro_content_video import RenderMicroContentVideoRequest
+from worker.use_cases.render_micro_content_video import (
+    InvalidRenderRequest,
+    RenderMicroContentVideoRequest,
+)
 
 logger = get_logger(__name__)
 
@@ -38,21 +45,38 @@ def is_final_attempt(bull_job: Any) -> bool:
     return int(getattr(bull_job, "attemptsMade", 0) or 0) + 1 >= attempts
 
 
+def _uuid_field(payload: dict, key: str) -> str:
+    # Dạng chuẩn có gạch nối như core-api kiểm kết quả: id lạ thì kết quả bị
+    # core-api từ chối và bài kẹt ở PROCESSING, nên chặn ngay từ lệnh.
+    value = payload.get(key)
+    try:
+        canonical = isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        canonical = False
+    if not canonical:
+        raise ValueError(f"render job needs {key} as a UUID, got {value!r}")
+    return value
+
+
 def parse_render_job(data: Any) -> RenderMicroContentVideoRequest:
+    """
+    Lệnh theo contracts/integration-events/v1/micro-content-render-requested.json.
+    Thiếu id (kể cả ``render_id`` — lệnh phát trước khi có cột ai_render_id) thì
+    không gửi được kết quả core-api áp dụng được: lỗi lệnh, không thử lại.
+    Kịch bản để use case kiểm, vì kịch bản hỏng vẫn phải báo FAILED cho bài.
+    """
     if not isinstance(data, dict) or not isinstance(data.get("payload"), dict):
         raise ValueError("render job must carry an outbox payload")
-    payload = data["payload"]
-    micro_content_id = payload.get("micro_content_id") or data.get("aggregate_id")
-    course_id = payload.get("course_id")
-    asset_id = payload.get("asset_id")
-    script = payload.get("script")
-    if not isinstance(micro_content_id, str):
-        raise ValueError("render job needs micro_content_id")
+    payload = dict(data["payload"])
+    payload.setdefault("micro_content_id", data.get("aggregate_id"))
+    event_id = data.get("event_id")
     return RenderMicroContentVideoRequest(
-        micro_content_id=micro_content_id,
-        course_id=course_id,
-        asset_id=asset_id,
-        script=script,
+        micro_content_id=_uuid_field(payload, "micro_content_id"),
+        course_id=_uuid_field(payload, "course_id"),
+        asset_id=_uuid_field(payload, "asset_id"),
+        render_id=_uuid_field(payload, "render_id"),
+        script=payload.get("script"),
+        source_event_id=event_id if isinstance(event_id, str) and event_id else None,
     )
 
 
@@ -66,15 +90,24 @@ async def process_video_job(container, bull_job, job_token):
         except (KeyError, TypeError, ValueError) as exc:
             raise UnrecoverableError(f"invalid render job: {exc}") from exc
 
-        logger.info("micro_content_video_worker.start_render", micro_content_id=req.micro_content_id)
-        result = await container.render_micro_content_video_use_case.execute(req)
+        logger.info(
+            "micro_content_video_worker.start_render",
+            micro_content_id=req.micro_content_id,
+            render_id=req.render_id,
+        )
+        use_case = container.render_micro_content_video_use_case
+        result = await use_case.execute(req)
         if result.is_err():
             err = result.error
+            permanent = isinstance(err, InvalidRenderRequest)
             logger.error("micro_content_video_worker.render_failed", error=str(err), exc_info=err)
-            if is_final_attempt(bull_job):
-                container.video_store.update_video_failed(
-                    req.micro_content_id, str(err), asset_id=req.asset_id
-                )
+            # Chỉ báo FAILED khi không còn thử lại: lần thử sau có thể thành công,
+            # và core-api không cho READY đè FAILED của cùng lần render. Gửi FAILED
+            # lỗi thì lỗi đó nổi lên (lỗi thường): job gốc lỗi, còn lượt thì thử lại.
+            if permanent or is_final_attempt(bull_job):
+                await use_case.report_failure(req, err)
+            if permanent:
+                raise UnrecoverableError(f"invalid render job: {err}") from err
             raise err
 
         resp = result.unwrap()
@@ -84,7 +117,15 @@ async def process_video_job(container, bull_job, job_token):
             "duration": resp.duration_seconds,
             "size": resp.size_bytes,
             "asset_id": resp.asset_id,
+            "render_id": resp.render_id,
         }
+
+    if event_type == "MICRO_CONTENT_SCRIPT_REQUESTED":
+        logger.info(
+            "micro_content_video_worker.script_requested_ignored",
+            micro_content_id=bull_job.data.get("aggregate_id"),
+        )
+        return {"status": "ignored"}
 
     logger.warning("micro_content_video_worker.unhandled_event", event_type=event_type)
     return {"status": "ignored"}

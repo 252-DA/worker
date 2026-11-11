@@ -20,14 +20,20 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
+from worker.services.document_reporter import job_attempt
+from worker.services.processing_generation import newer_generation
 from worker.use_cases.run_enrichment import RunEnrichmentRequest
 
 logger = get_logger(__name__)
 
 
-def _run_enrichment_sync(container, document_id: str):
+def _run_enrichment_sync(container, payload: EnrichmentJobPayload, attempt: int):
     return container.run_enrichment_use_case.execute(
-        RunEnrichmentRequest(document_id=document_id)
+        RunEnrichmentRequest(
+            document_id=payload.document_id,
+            processing_generation=payload.processing_generation,
+            attempt=attempt,
+        )
     )
 
 
@@ -45,8 +51,31 @@ async def _process_job(container, job, job_token):
         )
         raise UnrecoverableError(f"invalid enrichment job payload: {exc}") from exc
 
-    # Use case gọi LLM và psycopg đồng bộ: chạy ngoài event loop.
-    result = await asyncio.to_thread(_run_enrichment_sync, container, payload.document_id)
+    # Enrichment của lượt cũ: tài liệu đã được xử lý lại, enrichment của lượt mới sẽ
+    # chạy sau lượt đó. Bỏ để không tốn LLM và không ghi concepts chồng lên.
+    # Job cũ chưa mang lượt (0) không kiểm: giữ hành vi cũ, khỏi tốn một lần đọc DB.
+    current_generation = None
+    if payload.processing_generation > 0:
+        current_generation = await asyncio.to_thread(
+            newer_generation, container.metadata_store, payload.document_id, payload.processing_generation
+        )
+    if current_generation is not None:
+        logger.warning(
+            "enrichment_worker.job.stale_generation_skipped",
+            document_id=payload.document_id,
+            job_generation=payload.processing_generation,
+            current_generation=current_generation,
+        )
+        return {
+            "document_id": payload.document_id,
+            "skipped": "stale_generation",
+            "job_generation": payload.processing_generation,
+            "current_generation": current_generation,
+        }
+
+    # Use case gọi LLM, psycopg và publish_sync đồng bộ: chạy ngoài event loop.
+    # Lỗi (kể cả không gửi được kết quả về core-api) → job lỗi, BullMQ retry.
+    result = await asyncio.to_thread(_run_enrichment_sync, container, payload, job_attempt(job))
     if result.is_err():
         raise result.error
 

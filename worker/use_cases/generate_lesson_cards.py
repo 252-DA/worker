@@ -8,6 +8,9 @@ card im lặng khi chunk chưa được map LO.
 
 Một card là một ý, đọc trong 1–3 phút, và mọi câu trong đó phải có trong đoạn
 nguồn. ``check_question``/``check_answer`` là mặt lật của flashcard.
+
+Use case chỉ TÍNH: trả về card đã kiểm chứng kèm hồ sơ; runner gửi về core-api
+(CONTENT_GENERATION_RESULT) và core-api ghi lessons/lesson_cards.
 """
 import re
 import time
@@ -21,14 +24,20 @@ from document_chunk.application.services.structured_output import generate_struc
 from document_chunk.domain.bloom import bloom_to_name
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.ports.llm_client import ILLMClient, LLMUsage
-from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredLessonCard
+from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
 from worker.prompts import lesson_cards as prompts
+from worker.use_cases.generated_content import GeneratedLessonCard, RejectedDraft
 from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
-from worker.use_cases.verification import verify_and_refine
+from worker.use_cases.verification import (
+    JudgeVerdict,
+    Kept,
+    collect_verdicts,
+    verify_and_refine,
+)
 
 logger = get_logger(__name__)
 
@@ -164,10 +173,23 @@ class GenerateLessonCardsRequest:
 
 @dataclass(frozen=True)
 class GenerateLessonCardsResponse:
+    """
+    Card đã qua vòng kiểm chứng, chưa ghi đâu cả. ``rejected``: card judge loại
+    sau lượt sửa cuối — không gửi đi để lưu, nhưng được đếm trong kết quả.
+    """
+
     course_id: str
     lo_id: str
-    card_count: int
-    card_ids: list[str]
+    cards: tuple[GeneratedLessonCard, ...] = ()
+    rejected: tuple[RejectedDraft, ...] = ()
+
+    @property
+    def card_count(self) -> int:
+        return len(self.cards)
+
+    @property
+    def card_ids(self) -> list[str]:
+        return [card.card_id for card in self.cards]
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +289,9 @@ class GenerateLessonCardsUseCase:
 
         cards = self._drop_repeated_titles(payload_result.unwrap().cards[: request.count])
 
-        cards, rejected = verify_and_refine(
+        refined = verify_and_refine(
             cards,
-            find_failing=lambda current: self._find_failing(
+            judge=lambda current: self._judge(
                 current, context_parts, trace_id, request.course_id
             ),
             regenerate=lambda original, reason: self._run_regeneration(
@@ -286,57 +308,49 @@ class GenerateLessonCardsUseCase:
                 still_failing=still_failing,
             ),
         )
+        rejected = tuple(
+            RejectedDraft(reason=r.reason, regeneration_attempts=r.regeneration_attempts)
+            for r in refined.rejected
+        )
         if rejected:
             logger.warning(
                 "generate_lesson_cards.rejected_not_persisted",
                 trace_id=trace_id,
                 lo_id=lo.lo_id,
                 rejected=len(rejected),
-                reasons=[reason for _, reason in rejected][:3],
+                reasons=[r.reason for r in rejected][:3],
             )
         # Một card sửa lại có thể trùng tiêu đề với card khác trong mẻ.
-        cards = self._drop_repeated_titles(cards)
-        if not cards:
+        kept = self._drop_repeated_kept_titles(refined.kept)
+        if not kept:
             return Err(ProcessingError(
                 f"Tất cả {len(rejected)} card đều không bám được nguồn sau "
                 f"{self._max_verification_retries} lượt sửa; không lưu card nào "
                 f"cho {lo.lo_id}."
             ))
 
-        stored = [
-            self._to_stored(
-                card,
+        generated = tuple(
+            self._to_generated(
+                entry,
                 index=index,
                 lo_id=lo.lo_id,
                 source_chunk_ids=source_chunk_ids,
-                source_document_id=source_document_id,
             )
-            for index, card in enumerate(cards)
-        ]
-        persist_result = self._metadata_store.persist_curriculum_lesson_cards(
-            lo_id=lo.lo_id,
-            lesson_cards=stored,
+            for index, entry in enumerate(kept)
         )
-        if persist_result.is_err():
-            logger.error(
-                "generate_lesson_cards.persist_failed",
-                lo_id=lo.lo_id,
-                error=str(persist_result.error),
-            )
-            return Err(persist_result.error)
-
-        card_ids = [card.card_id for card in stored]
         logger.info(
             "generate_lesson_cards.done",
             course_id=request.course_id,
             lo_id=lo.lo_id,
-            count=len(card_ids),
+            count=len(generated),
+            rejected=len(rejected),
+            verified=sum(1 for c in generated if c.verification.status == "VERIFIED"),
         )
         return Ok(GenerateLessonCardsResponse(
             course_id=request.course_id,
             lo_id=lo.lo_id,
-            card_count=len(card_ids),
-            card_ids=card_ids,
+            cards=generated,
+            rejected=rejected,
         ))
 
     # ------------------------------------------------------------------
@@ -353,23 +367,36 @@ class GenerateLessonCardsUseCase:
             unique.append(card)
         return unique
 
-    def _to_stored(
+    def _drop_repeated_kept_titles(
+        self, kept: list[Kept[_LessonCard]]
+    ) -> list[Kept[_LessonCard]]:
+        seen: set[str] = set()
+        unique: list[Kept[_LessonCard]] = []
+        for entry in kept:
+            key = _title_key(entry.item.title)
+            if key in seen:
+                logger.info(
+                    "generate_lesson_cards.duplicate_title_dropped", title=entry.item.title
+                )
+                continue
+            seen.add(key)
+            unique.append(entry)
+        return unique
+
+    def _to_generated(
         self,
-        card: _LessonCard,
+        entry: Kept[_LessonCard],
         *,
         index: int,
         lo_id: str,
         source_chunk_ids: list[str],
-        source_document_id: str,
-    ) -> StoredLessonCard:
+    ) -> GeneratedLessonCard:
+        card = entry.item
         valid_source_ids = tuple(
             chunk_id for chunk_id in card.source_chunk_ids if chunk_id in source_chunk_ids
         ) or tuple(source_chunk_ids[:3])
-        return StoredLessonCard(
+        return GeneratedLessonCard(
             card_id=str(uuid.uuid5(_CARD_ID_NAMESPACE, f"{lo_id}|{_title_key(card.title)}")),
-            document_id=source_document_id,
-            primary_chunk_id=valid_source_ids[0],
-            source_chunk_ids=valid_source_ids,
             title=card.title,
             bullets=tuple(card.bullets),
             key_insight=card.key_insight,
@@ -378,20 +405,24 @@ class GenerateLessonCardsUseCase:
             check_question=card.check_question,
             check_answer=card.check_answer,
             card_index=index,
+            primary_chunk_id=valid_source_ids[0],
+            source_chunk_ids=valid_source_ids,
             model_id=self._writer.client.model_id,
+            judge_model=self._verifier.client.model_id,
+            verification=entry.verification,
         )
 
     # ------------------------------------------------------------------
     # Verification + Reflexion
     # ------------------------------------------------------------------
 
-    def _find_failing(
+    def _judge(
         self,
         cards: list[_LessonCard],
         context_parts: list[str],
         trace_id: str,
         course_id: str,
-    ) -> dict[int, str] | None:
+    ) -> dict[int, JudgeVerdict] | None:
         prompt = prompts.verification(context_parts, cards)
         started = time.monotonic()
         usage = _UsageAccumulator()
@@ -419,11 +450,9 @@ class GenerateLessonCardsUseCase:
                 error=str(result.error),
             )
             return None
-        return {
-            v.card_index: v.reason
-            for v in result.unwrap().verdicts
-            if v.verdict != "supported"
-        }
+        return collect_verdicts(
+            (v.card_index, v.verdict, v.reason) for v in result.unwrap().verdicts
+        )
 
     def _run_regeneration(
         self,

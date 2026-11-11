@@ -14,7 +14,7 @@ from ai_runtime.errors import ModelConfigurationError
 from document_chunk.application.dto.generation_dto import GenerateCurriculumQuizRequest
 from document_chunk.domain.ports.llm_client import LLMUsage
 from document_chunk.shared.result import Err, Ok
-from tests.support import as_llm_client
+from tests.support import RecordingResultPublisher, as_llm_client
 from tests.unit.test_quizgen_phase0 import _all_supported, _curriculum, _questions_json
 from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
 from worker.config import WorkerSettings
@@ -309,10 +309,11 @@ class TestQuizRolesUseTheirOwnModel:
 
     def test_items_are_stamped_with_the_writer_model(self, writer, judge):
         store = MagicMock()
-        assert self._run(store, writer, judge).is_ok()
+        items = self._run(store, writer, judge).unwrap().items
 
-        items = store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"]
         assert {item.model_id for item in items} == {"deepseek-chat"}
+        # Hồ sơ kiểm chứng ghi đúng model nào viết, model nào chấm.
+        assert {item.judge_model for item in items} == {"gemini-3-flash-preview"}
 
     def test_without_a_verifier_role_one_model_does_both(self, writer):
         store = MagicMock()
@@ -362,6 +363,7 @@ class TestEnrichmentRecordsItsCost:
         use_case = RunEnrichmentUseCase(
             metadata_store=store,
             llm_client=llm,
+            result_publisher=RecordingResultPublisher(),
             max_section_chars=500,
             llm_provider=provider,
             llm_profile="gemini-flash",
@@ -402,7 +404,7 @@ class TestEnrichmentRecordsItsCost:
 
         RunEnrichmentUseCase(
             metadata_store=mock_metadata_store, llm_client=mock_llm_client,
-            llm_provider="gemini",
+            result_publisher=RecordingResultPublisher(), llm_provider="gemini",
         ).execute(RunEnrichmentRequest(document_id=sample_document.id))
 
         statuses = [
