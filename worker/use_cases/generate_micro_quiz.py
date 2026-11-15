@@ -8,6 +8,7 @@ Tái sử dụng hoàn toàn prompt sinh/chấm/sửa câu hỏi, bảng schema 
 """
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,7 +22,12 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
-from worker.prompts import curriculum_quiz as quiz_prompts
+from worker.prompts import micro_content as micro_prompts
+from worker.use_cases._chunk_text import (
+    filter_chunks_in_page_range,
+    format_chunk_with_heading,
+    resolve_course_title,
+)
 from worker.use_cases.generate_curriculum_quiz import (
     _QUESTION_MODELS,
     _CurriculumQuizPayload,
@@ -48,6 +54,42 @@ _USAGE_ERROR = "ERROR"
 DEFAULT_MICRO_QUIZ_COUNT = 3
 DEFAULT_MICRO_QUIZ_TYPES = ("MCQ_SINGLE", "TRUE_FALSE")
 
+_LEADING_CHUNK_SOURCE_RE = re.compile(
+    r"^\s*(?:Theo\s+)?Nguồn\s*\([^)]*chunk[^)]*\)\s*(?:nêu\s*(?:rằng)?|cho\s*biết\s*(?:rằng)?|chỉ\s*ra\s*(?:rằng)?|:)?[,:\s]*",
+    re.IGNORECASE,
+)
+_INLINE_CHUNK_PAREN_RE = re.compile(r"\s*\([^)]*\bchunk(?:_id)?\b[^)]*\)", re.IGNORECASE)
+_INLINE_CHUNK_TOKEN_RE = re.compile(r"\bchunk(?:_id)?\s*[:=#]?\s*[0-9a-zA-Z_-]{4,}\b", re.IGNORECASE)
+_BRACKET_REF_RE = re.compile(r"\s*\[\d+\]")
+_BLOOM_META_RE = re.compile(
+    r"(?:Đây\s+là\s+)?mức\s+độ\s+(?:nhớ|hiểu|vận\s+dụng|phân\s+tích|đánh\s+giá|sáng\s+tạo)"
+    r"(?:\s*\(\s*(?:remember|understand|apply|analyze|evaluate|create)\s*\))?"
+    r"(?:\s*(?:vì|do|bởi\s+vì|nhằm|:))?\s*",
+    re.IGNORECASE,
+)
+_BLOOM_PAREN_RE = re.compile(
+    r"\s*\(\s*(?:remember|understand|apply|analyze|evaluate|create)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_explanation(text: str) -> str:
+    """Loại bỏ mã chunk nội bộ, ký hiệu [1] và nhãn Bloom khỏi giải thích cho người học."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = _LEADING_CHUNK_SOURCE_RE.sub("Theo nội dung bài giảng, ", cleaned)
+    cleaned = _INLINE_CHUNK_PAREN_RE.sub("", cleaned)
+    cleaned = _INLINE_CHUNK_TOKEN_RE.sub("", cleaned)
+    cleaned = _BRACKET_REF_RE.sub("", cleaned)
+    cleaned = _BLOOM_META_RE.sub("", cleaned)
+    cleaned = _BLOOM_PAREN_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;")
+    cleaned = re.sub(r"\s+([.,;:])", r"\1", cleaned)
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
 
 class _UsageAccumulator:
     def __init__(self) -> None:
@@ -62,6 +104,7 @@ class GenerateMicroQuizRequest:
     course_id: str
     micro_content_id: str
     topic_title: str = ""
+    topic_summary: str | None = None
     lo_id: str | None = None
     lo_code: str | None = None
     lo_statement_vi: str | None = None
@@ -148,13 +191,15 @@ class GenerateMicroQuizUseCase:
             question_model, schema_name = _QUESTION_MODELS[question_type]
             payload_model = _CurriculumQuizPayload[question_model]  # type: ignore[valid-type]
 
-            gen_prompt = quiz_prompts.generation(
+            gen_prompt = micro_prompts.micro_quiz_generation(
                 course_title=course_title,
+                topic_title=request.topic_title or f"Trang {page_from}–{page_to}",
+                topic_summary=request.topic_summary,
+                page_from=page_from,
+                page_to=page_to,
                 lo_code=lo_code,
                 lo_vi=lo_vi,
                 lo_en=lo_en,
-                bloom="understand",
-                style="quiz",
                 count=sub_count,
                 context_parts=context_parts,
                 question_type=question_type,
@@ -185,6 +230,8 @@ class GenerateMicroQuizUseCase:
             refined = self._verify_and_refine(
                 questions=raw_questions,
                 context_parts=context_parts,
+                page_from=page_from,
+                page_to=page_to,
                 trace_id=trace_id,
                 course_id=request.course_id,
                 question_type=question_type,
@@ -233,7 +280,7 @@ class GenerateMicroQuizUseCase:
                         choices=tuple(choices),
                         correct_index=correct_index,
                         correct_answer=correct_answer,
-                        explanation=q.explanation,
+                        explanation=_sanitize_explanation(q.explanation),
                         bloom_level=2,
                         source_chunk_ids=valid_cids or tuple(source_chunk_ids[:3]),
                         model_id=writer_model,
@@ -270,7 +317,7 @@ class GenerateMicroQuizUseCase:
     def _resolve_curriculum_labels(
         self, request: GenerateMicroQuizRequest
     ) -> tuple[str, str, str, str | None]:
-        course_title = request.course_id
+        course_title = resolve_course_title(self._metadata_store, request.course_id)
         lo_code = request.lo_code or "MICRO"
         lo_vi = request.lo_statement_vi or request.topic_title or "Nội dung bài giảng"
         lo_en = request.lo_statement_en
@@ -278,8 +325,7 @@ class GenerateMicroQuizUseCase:
         if request.lo_id and not request.lo_statement_vi:
             cur = self._metadata_store.get_curriculum(request.course_id)
             if cur.is_ok() and cur.unwrap() is not None:
-                course, _, los, _ = cur.unwrap()
-                course_title = course.title_vi or course.code
+                _, _, los, _ = cur.unwrap()
                 match = next((lo for lo in los if lo.lo_id == request.lo_id), None)
                 if match is not None:
                     lo_code = match.code
@@ -307,14 +353,11 @@ class GenerateMicroQuizUseCase:
             res = self._metadata_store.list_chunks(request.document_id)
             if res.is_ok():
                 all_chunks: list[StoredChunkMetadata] = res.unwrap()
-                ranged = [
-                    c for c in all_chunks
-                    if c.page_number is not None and page_from <= c.page_number <= page_to
-                ]
-                chosen = ranged or [c for c in all_chunks if c.page_number is None] or all_chunks[:6]
+                chosen = filter_chunks_in_page_range(all_chunks, page_from, page_to)
                 for c in chosen:
-                    if c.content_text and c.content_text.strip():
-                        raw_chunks.append((str(c.chunk_id), c.page_number, c.content_text.strip()))
+                    formatted = format_chunk_with_heading(c)
+                    if formatted:
+                        raw_chunks.append((str(c.chunk_id), c.page_number, formatted))
 
         for idx, (cid, pno, content) in enumerate(raw_chunks, start=1):
             parts.append(f"[{idx}] (chunk_id={cid}, page={pno or 'n/a'})\n{content}")
@@ -359,13 +402,21 @@ class GenerateMicroQuizUseCase:
         *,
         questions: list[_QuestionBase],
         context_parts: list[str],
+        page_from: int = 1,
+        page_to: int = 1,
         trace_id: str,
         course_id: str,
         question_type: str,
         schema: tuple[type[_QuestionBase], str],
     ) -> RefineResult[_QuestionBase]:
         def judge(current: list[_QuestionBase]) -> dict[int, JudgeVerdict] | None:
-            prompt = quiz_prompts.verification(context_parts, current, question_type)
+            prompt = micro_prompts.micro_quiz_verification(
+                page_from=page_from,
+                page_to=page_to,
+                context_parts=context_parts,
+                questions=current,
+                question_type=question_type,
+            )
             started = time.monotonic()
             usage = _UsageAccumulator()
             res = generate_structured_payload(
@@ -392,7 +443,14 @@ class GenerateMicroQuizUseCase:
             )
 
         def regenerate(original: _QuestionBase, reason: str) -> _QuestionBase | None:
-            prompt = quiz_prompts.regeneration(context_parts, original, reason, question_type)
+            prompt = micro_prompts.micro_quiz_regeneration(
+                page_from=page_from,
+                page_to=page_to,
+                context_parts=context_parts,
+                original=original,
+                reason=reason,
+                question_type=question_type,
+            )
             schema_model, schema_name = schema
             started = time.monotonic()
             usage = _UsageAccumulator()

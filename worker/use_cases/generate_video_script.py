@@ -30,6 +30,11 @@ from document_chunk.shared.result import Err, Ok, Result
 from worker.llm_role import LlmRole
 from worker.prompts import micro_content as prompts
 from worker.prompts._common import lo_line
+from worker.use_cases._chunk_text import (
+    filter_chunks_in_page_range,
+    format_page_chunks_text,
+    resolve_course_title,
+)
 from worker.use_cases.generated_content import RejectedDraft
 from worker.use_cases.verification import (
     FLAGGED,
@@ -46,8 +51,43 @@ MIN_SCENES = 4
 MAX_SCENES = 8
 MIN_NARRATION_WORDS = 40
 MAX_NARRATION_WORDS = 110
+_HARD_MAX_NARRATION_WORDS = 135
+_CODE_VIOLATION_VERDICT = "style_violation"
 MAX_BULLETS_PER_SCENE = 4
 DEFAULT_VOICE = "vi-VN-HoaiMyNeural"
+
+
+@dataclass(frozen=True)
+class _ScriptBounds:
+    min_scenes: int
+    max_scenes: int
+    min_words: int
+    max_words: int
+
+
+def _compute_script_bounds(pages: list[dict[str, Any]], *, low_text: bool) -> _ScriptBounds:
+    """Co giãn số cảnh và độ dài lời đọc theo mật độ chữ thực tế trên slide."""
+    source_words = sum(len((p.get("content") or "").split()) for p in pages)
+    if source_words < 90 or (low_text and source_words < 140):
+        return _ScriptBounds(
+            min_scenes=2 if (len(pages) >= 2 or source_words >= 45) else 1,
+            max_scenes=4,
+            min_words=25,
+            max_words=MAX_NARRATION_WORDS,
+        )
+    if source_words < 200:
+        return _ScriptBounds(
+            min_scenes=2,
+            max_scenes=6,
+            min_words=30,
+            max_words=MAX_NARRATION_WORDS,
+        )
+    return _ScriptBounds(
+        min_scenes=3,
+        max_scenes=MAX_SCENES,
+        min_words=35,
+        max_words=MAX_NARRATION_WORDS,
+    )
 
 _CROSS_REF_PATTERN = re.compile(
     r"\b(bài trước|video trước|phần trước|chương trước|bài sau|video sau|chương sau|video tiếp theo)\b",
@@ -99,7 +139,7 @@ class _GeneratedScene(BaseModel):
 
 
 class _ScriptPayload(BaseModel):
-    scenes: list[_GeneratedScene] = Field(min_length=MIN_SCENES, max_length=MAX_SCENES)
+    scenes: list[_GeneratedScene] = Field(min_length=1, max_length=MAX_SCENES)
 
 
 class _SceneVerdict(BaseModel):
@@ -134,6 +174,7 @@ class GenerateVideoScriptRequest:
     voice: str = DEFAULT_VOICE
     neighbor_topics: tuple[str, ...] = ()
     low_text: bool = False
+    instructor_prompt: str | None = None
     pages: tuple[dict[str, Any], ...] | None = None
 
 
@@ -154,16 +195,18 @@ def _scene_code_problem(
     *,
     page_from: int,
     page_to: int,
+    min_words: int = MIN_NARRATION_WORDS,
+    hard_max_words: int = _HARD_MAX_NARRATION_WORDS,
 ) -> str | None:
     words = len(scene.narration.split())
-    if words < MIN_NARRATION_WORDS:
+    if words < min_words:
         return (
-            f"Lời đọc cảnh quá ngắn ({words} từ < {MIN_NARRATION_WORDS} từ); "
+            f"Lời đọc cảnh quá ngắn ({words} từ < {min_words} từ); "
             "cần mở rộng diễn giải sư phạm ngắn gọn bám slide."
         )
-    if words > MAX_NARRATION_WORDS:
+    if words > hard_max_words:
         return (
-            f"Lời đọc cảnh quá dài ({words} từ > {MAX_NARRATION_WORDS} từ); "
+            f"Lời đọc cảnh quá dài ({words} từ > {hard_max_words} từ); "
             "cần rút gọn cho súc tích."
         )
     match = _CROSS_REF_PATTERN.search(scene.narration)
@@ -185,13 +228,7 @@ def _pages_from_chunks(
     page_from: int,
     page_to: int,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    in_range = [
-        c for c in chunks
-        if c.page_number is not None and page_from <= c.page_number <= page_to
-    ]
-    if not in_range:
-        # Slide có thể chưa đánh số trang hoặc là slide ảnh; dùng chunk toàn tài liệu làm ngữ cảnh phụ nếu có.
-        in_range = [c for c in chunks if c.page_number is None] or chunks[:8]
+    in_range = filter_chunks_in_page_range(chunks, page_from, page_to)
 
     by_page: dict[int, list[StoredChunkMetadata]] = {}
     all_chunk_ids: list[str] = []
@@ -203,7 +240,7 @@ def _pages_from_chunks(
     pages: list[dict[str, Any]] = []
     for pno in range(page_from, max(page_from, page_to) + 1):
         p_chunks = by_page.get(pno, [])
-        content = "\n".join((c.content_text or "").strip() for c in p_chunks if c.content_text)
+        content = format_page_chunks_text(p_chunks)
         pages.append(
             {
                 "page_number": pno,
@@ -255,6 +292,12 @@ class GenerateVideoScriptUseCase:
                 page_from=page_from,
                 page_to=page_to,
             )
+            if not source_chunk_ids and not (request.instructor_prompt and request.instructor_prompt.strip()):
+                return Err(
+                    ProcessingError(
+                        f"Dải trang {page_from}–{page_to} không có văn bản trích xuất được từ tài liệu nguồn."
+                    )
+                )
         else:
             return Err(ProcessingError("video_script request requires pages or document_id"))
 
@@ -264,9 +307,11 @@ class GenerateVideoScriptUseCase:
             else None
         )
         topic_title = request.topic_title.strip() or f"Nội dung trang {page_from}–{page_to}"
+        course_title = resolve_course_title(self._metadata_store, request.course_id)
+        bounds = _compute_script_bounds(pages, low_text=request.low_text)
 
         gen_prompt = prompts.video_script_generation(
-            course_title=request.course_id,
+            course_title=course_title,
             topic_title=topic_title,
             topic_summary=request.topic_summary,
             lo_line_text=lo_text,
@@ -275,6 +320,11 @@ class GenerateVideoScriptUseCase:
             pages=pages,
             neighbor_topics=request.neighbor_topics,
             low_text=request.low_text,
+            instructor_prompt=request.instructor_prompt,
+            min_scenes=bounds.min_scenes,
+            max_scenes=bounds.max_scenes,
+            min_words=bounds.min_words,
+            max_words=bounds.max_words,
         )
         started = time.monotonic()
         usage = _UsageAccumulator()
@@ -306,7 +356,12 @@ class GenerateVideoScriptUseCase:
         def judge(current: list[_IndexedScene]) -> dict[int, JudgeVerdict] | None:
             raw_scenes = [entry.scene for entry in current]
             code_problems = {
-                idx: _scene_code_problem(sc, page_from=page_from, page_to=page_to)
+                idx: _scene_code_problem(
+                    sc,
+                    page_from=page_from,
+                    page_to=page_to,
+                    min_words=bounds.min_words,
+                )
                 for idx, sc in enumerate(raw_scenes)
             }
             llm_verdicts = self._run_verifier(
@@ -320,7 +375,7 @@ class GenerateVideoScriptUseCase:
             if llm_verdicts is None:
                 # Judge LLM lỗi nhưng lỗi code (quá ngắn/quá dài/sai trang) vẫn cần sửa.
                 failing_code = {
-                    idx: JudgeVerdict(verdict="contradicted", reason=prob)
+                    idx: JudgeVerdict(verdict=_CODE_VIOLATION_VERDICT, reason=prob)
                     for idx, prob in code_problems.items()
                     if prob is not None
                 }
@@ -331,7 +386,7 @@ class GenerateVideoScriptUseCase:
             )
             for idx, prob in code_problems.items():
                 if prob is not None:
-                    merged[idx] = JudgeVerdict(verdict="contradicted", reason=prob)
+                    merged[idx] = JudgeVerdict(verdict=_CODE_VIOLATION_VERDICT, reason=prob)
             return merged
 
         def regenerate(entry: _IndexedScene, reason: str) -> _IndexedScene | None:
@@ -344,6 +399,8 @@ class GenerateVideoScriptUseCase:
                 reason=reason,
                 trace_id=trace_id,
                 course_id=request.course_id,
+                min_words=bounds.min_words,
+                max_words=bounds.max_words,
             )
             if fixed is None:
                 return None
@@ -385,11 +442,16 @@ class GenerateVideoScriptUseCase:
         for rej in refined.rejected:
             sc = rej.item.scene
             clamped_page = max(page_from, min(page_to, sc.slide_page))
+            last_verdict = (
+                rej.history[-1].verdict
+                if rej.history
+                else "not_enough_evidence"
+            )
             ordered_entries[rej.item.index] = _scene_to_dict(
                 scene=sc,
                 slide_page=clamped_page,
                 status=FLAGGED,
-                verdict="not_enough_evidence",
+                verdict=last_verdict,
                 reason=rej.reason,
                 writer_model=writer_model,
                 judge_model=judge_model,
@@ -474,6 +536,8 @@ class GenerateVideoScriptUseCase:
         reason: str,
         trace_id: str,
         course_id: str,
+        min_words: int = MIN_NARRATION_WORDS,
+        max_words: int = MAX_NARRATION_WORDS,
     ) -> _GeneratedScene | None:
         prompt = prompts.video_script_regeneration(
             topic_title=topic_title,
@@ -482,6 +546,8 @@ class GenerateVideoScriptUseCase:
             pages=pages,
             scene=scene,
             reason=reason,
+            min_words=min_words,
+            max_words=max_words,
         )
         started = time.monotonic()
         usage = _UsageAccumulator()

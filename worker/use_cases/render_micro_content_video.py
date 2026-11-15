@@ -26,7 +26,7 @@ from worker.services.micro_content_subtitles import (
     normalize_for_tts,
 )
 from worker.services.result_publisher import MICRO_CONTENT_VIDEO_RESULT, make_result_id
-from worker.services.slide_generator import SlideGenerator
+from worker.services.slide_generator import SlideGenerator, render_pdf_slide_page
 from worker.services.tts_client import TtsClient, get_default_tts_client
 from worker.services.video_composer import SceneMedia, VideoComposer
 
@@ -58,6 +58,8 @@ class RenderMicroContentVideoRequest:
     # kết quả của lần render cũ.
     render_id: str
     script: Any = None
+    source_document_key: str | None = None
+    source_document_mime_type: str | None = None
     # event_id outbox của lệnh render.
     source_event_id: str | None = None
 
@@ -87,6 +89,26 @@ def video_object_key(course_id: str, micro_content_id: str, render_id: str) -> s
 
 def vtt_object_key(course_id: str, micro_content_id: str, render_id: str) -> str:
     return f"micro-content/{course_id}/{micro_content_id}/ai-{render_id}.vtt"
+
+
+def _scene_slide_page(scene: dict[str, Any]) -> int | None:
+    raw_page = scene.get("slide_page")
+    if isinstance(raw_page, int) and not isinstance(raw_page, bool) and raw_page >= 1:
+        return raw_page
+    source_pages = scene.get("source_pages")
+    if isinstance(source_pages, list) and source_pages:
+        first = source_pages[0]
+        if isinstance(first, int) and not isinstance(first, bool) and first >= 1:
+            return first
+    return None
+
+
+def _is_pdf_document(key: str | None, mime: str | None) -> bool:
+    if not key:
+        return False
+    if mime and mime.lower() == "application/pdf":
+        return True
+    return key.lower().endswith(".pdf")
 
 
 def _scenes_of(script: Any) -> tuple[list[dict], str]:
@@ -137,23 +159,68 @@ class RenderMicroContentVideoUseCase:
                 use_cue_tts = inspect.iscoroutinefunction(
                     getattr(type(self.tts_client), "synthesize_with_cues", None)
                 )
+                local_pdf_path: Path | None = None
+                if (
+                    _is_pdf_document(request.source_document_key, request.source_document_mime_type)
+                    and any(_scene_slide_page(sc) is not None for sc in scenes)
+                ):
+                    candidate_pdf = Path(temp_dir) / "source.pdf"
+                    try:
+                        dl_res = self.file_storage.download(request.source_document_key, candidate_pdf)  # type: ignore[arg-type]
+                        if dl_res.is_ok() and candidate_pdf.exists():
+                            local_pdf_path = candidate_pdf
+                        else:
+                            logger.warning(
+                                "render_micro_content_video.pdf_download_fallback",
+                                key=request.source_document_key,
+                                error=str(dl_res.error) if dl_res.is_err() else "missing file",
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "render_micro_content_video.pdf_download_error",
+                            key=request.source_document_key,
+                            error=str(exc),
+                        )
+
+                slide_width = getattr(self.slide_generator, "width", 1280)
+                slide_height = getattr(self.slide_generator, "height", 720)
 
                 for idx, scene in enumerate(scenes):
                     title = scene.get("title", f"Cảnh {idx + 1}")
                     bullets = scene.get("bullets", [])
                     narration = scene.get("narration") or title
                     voice = scene.get("voice") or script_voice
+                    slide_page = _scene_slide_page(scene)
 
                     slide_img_path = os.path.join(temp_dir, f"slide_{idx:02d}.png")
                     audio_path = os.path.join(temp_dir, f"audio_{idx:02d}.mp3")
 
-                    self.slide_generator.generate_slide(
-                        title=title,
-                        bullets=bullets,
-                        output_path=slide_img_path,
-                        scene_index=idx + 1,
-                        total_scenes=total_scenes,
-                    )
+                    rendered_from_pdf = False
+                    if local_pdf_path is not None and slide_page is not None:
+                        try:
+                            render_pdf_slide_page(
+                                str(local_pdf_path),
+                                slide_page,
+                                slide_img_path,
+                                width=slide_width,
+                                height=slide_height,
+                            )
+                            rendered_from_pdf = True
+                        except Exception as exc:
+                            logger.warning(
+                                "render_micro_content_video.pdf_page_fallback",
+                                slide_page=slide_page,
+                                error=str(exc),
+                            )
+
+                    if not rendered_from_pdf:
+                        self.slide_generator.generate_slide(
+                            title=title,
+                            bullets=bullets,
+                            output_path=slide_img_path,
+                            scene_index=idx + 1,
+                            total_scenes=total_scenes,
+                        )
 
                     tts_text = normalize_for_tts(narration) or narration
                     if use_cue_tts:

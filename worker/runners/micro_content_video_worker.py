@@ -70,12 +70,16 @@ def parse_render_job(data: Any) -> RenderMicroContentVideoRequest:
     payload = dict(data["payload"])
     payload.setdefault("micro_content_id", data.get("aggregate_id"))
     event_id = data.get("event_id")
+    raw_key = payload.get("source_document_key")
+    raw_mime = payload.get("source_document_mime_type")
     return RenderMicroContentVideoRequest(
         micro_content_id=_uuid_field(payload, "micro_content_id"),
         course_id=_uuid_field(payload, "course_id"),
         asset_id=_uuid_field(payload, "asset_id"),
         render_id=_uuid_field(payload, "render_id"),
         script=payload.get("script"),
+        source_document_key=raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None,
+        source_document_mime_type=raw_mime.strip() if isinstance(raw_mime, str) and raw_mime.strip() else None,
         source_event_id=event_id if isinstance(event_id, str) and event_id else None,
     )
 

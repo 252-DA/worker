@@ -46,6 +46,93 @@ def _split_sentences(text: str) -> list[str]:
     return parts or [cleaned]
 
 
+_MAX_CUE_CHARS = 84
+_MAX_CUE_WORDS = 14
+
+
+def _split_long_text(
+    text: str,
+    *,
+    max_chars: int = _MAX_CUE_CHARS,
+    max_words: int = _MAX_CUE_WORDS,
+) -> list[str]:
+    """Tách câu phụ đề quá dài thành các đoạn cân đối (<= 14 từ, <= 84 ký tự)."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return []
+    words = cleaned.split()
+    if len(cleaned) <= max_chars and len(words) <= max_words:
+        return [cleaned]
+
+    mid_char = len(cleaned) // 2
+    best_comma_idx: int | None = None
+    best_comma_dist = len(cleaned)
+    for m in re.finditer(r"[,;:—–-]\s+", cleaned):
+        split_at = m.end()
+        left = cleaned[:split_at].strip()
+        right = cleaned[split_at:].strip()
+        if len(left.split()) >= 2 and len(right.split()) >= 2:
+            dist = abs(split_at - mid_char)
+            if dist < best_comma_dist:
+                best_comma_dist = dist
+                best_comma_idx = split_at
+
+    if best_comma_idx is not None and best_comma_dist <= len(cleaned) * 0.3:
+        left = cleaned[:best_comma_idx].strip()
+        right = cleaned[best_comma_idx:].strip()
+        return _split_long_text(left, max_chars=max_chars, max_words=max_words) + _split_long_text(
+            right, max_chars=max_chars, max_words=max_words
+        )
+
+    # Không có dấu câu thuận lợi gần giữa câu: chia cân đối theo ranh giới từ.
+    parts = max(2, (len(words) + max_words - 1) // max_words, (len(cleaned) + max_chars - 1) // max_chars)
+    target_words = max(1, (len(words) + parts - 1) // parts)
+    cut = min(len(words) - 1, target_words)
+    # Bảo đảm không vượt quá max_chars cho nửa trái nếu từ dài
+    while cut > 1 and len(" ".join(words[:cut])) > max_chars:
+        cut -= 1
+    left = " ".join(words[:cut])
+    right = " ".join(words[cut:])
+    if len(words[cut:]) == 1 and cut > 2:
+        left = " ".join(words[: cut - 1])
+        right = " ".join(words[cut - 1 :])
+    return _split_long_text(left, max_chars=max_chars, max_words=max_words) + _split_long_text(
+        right, max_chars=max_chars, max_words=max_words
+    )
+
+
+def split_cue_segments(
+    cue: SubtitleCue,
+    *,
+    max_chars: int = _MAX_CUE_CHARS,
+    max_words: int = _MAX_CUE_WORDS,
+) -> list[SubtitleCue]:
+    """Chia một cue dài thành nhiều cue ngắn hơn giữ nguyên tổng khoảng thời gian."""
+    segments = _split_long_text(cue.text, max_chars=max_chars, max_words=max_words)
+    if not segments:
+        return []
+    if len(segments) == 1:
+        return [SubtitleCue(start_ms=cue.start_ms, end_ms=cue.end_ms, text=segments[0])]
+
+    start_ms = max(0, int(cue.start_ms))
+    end_ms = max(start_ms + len(segments) * 50, int(cue.end_ms))
+    total_ms = end_ms - start_ms
+    weights = [max(1, len(s)) for s in segments]
+    total_weight = sum(weights)
+    out: list[SubtitleCue] = []
+    cursor = start_ms
+    for idx, (seg, w) in enumerate(zip(segments, weights)):
+        if idx == len(segments) - 1:
+            seg_end = end_ms
+        else:
+            remaining_min = (len(segments) - 1 - idx) * 50
+            share = max(50, round(total_ms * w / total_weight))
+            seg_end = min(end_ms - remaining_min, cursor + share)
+        out.append(SubtitleCue(start_ms=cursor, end_ms=seg_end, text=seg))
+        cursor = seg_end
+    return out
+
+
 def build_proportional_cues(
     narration: str,
     speech_duration_ms: int,
@@ -126,17 +213,18 @@ def build_webvtt_and_timeline(
             )
             local_cues = build_proportional_cues(narration, min(clip_ms, max(400, speech_ms)))
 
-        for cue in local_cues:
-            cue_text = cue.text.strip()
-            if not cue_text:
-                continue
-            raw_start = start_ms + max(0, min(cue.start_ms, clip_ms - 50))
-            abs_start = min(max(last_cue_end_ms, raw_start), max(start_ms, end_ms - 50))
-            abs_end = min(end_ms, max(abs_start + 50, start_ms + min(cue.end_ms, clip_ms)))
-            last_cue_end_ms = abs_end
-            vtt_blocks.append(
-                f"{format_vtt_timestamp(abs_start)} --> {format_vtt_timestamp(abs_end)}\n{cue_text}\n"
-            )
+        for raw_cue in local_cues:
+            for cue in split_cue_segments(raw_cue):
+                cue_text = cue.text.strip()
+                if not cue_text:
+                    continue
+                raw_start = start_ms + max(0, min(cue.start_ms, clip_ms - 50))
+                abs_start = min(max(last_cue_end_ms, raw_start), max(start_ms, end_ms - 50))
+                abs_end = min(end_ms, max(abs_start + 50, start_ms + min(cue.end_ms, clip_ms)))
+                last_cue_end_ms = abs_end
+                vtt_blocks.append(
+                    f"{format_vtt_timestamp(abs_start)} --> {format_vtt_timestamp(abs_end)}\n{cue_text}\n"
+                )
 
     vtt_text = "\n".join(vtt_blocks).rstrip() + "\n"
     transcript_text = "\n\n".join(transcript_lines)

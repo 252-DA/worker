@@ -426,6 +426,7 @@ def _video_script_request(job: ContentGenerationJob) -> GenerateVideoScriptReque
         voice=_scope_text(scope, "voice") or DEFAULT_VOICE,
         neighbor_topics=neighbor_topics,
         low_text=bool(scope.get("low_text") or scope.get("lowText")),
+        instructor_prompt=_scope_text(scope, "instructor_prompt", "instructorPrompt", "prompt"),
         pages=pages,
     )
 
