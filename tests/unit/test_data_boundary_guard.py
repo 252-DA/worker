@@ -57,23 +57,9 @@ SCAN_ROOTS = {
     "mcp-service/src": REPO_ROOT / "mcp-service" / "src",
 }
 
-_DOCUMENTS_REPO = "packages-ai/src/document_chunk/adapters/metadata/postgres_document_repository.py"
-_PLACEMENT_REPO = "packages-ai/src/document_chunk/adapters/metadata/postgres_document_placement_repository.py"
-
-# Ngoại lệ tường minh, theo cặp (file, bảng): các hàm legacy còn được delivery
-# gRPC/HTTP cũ của packages-ai (compose profile "legacy", không chạy mặc định) dùng.
-# Khi xoá delivery legacy thì xoá hàm và GỠ ngoại lệ ở đây;
-# test_legacy_exceptions_are_still_needed fail nếu ngoại lệ không còn câu SQL nào khớp.
-LEGACY_EXCEPTIONS: dict[tuple[str, str], str] = {
-    (_DOCUMENTS_REPO, "documents"): (
-        "PostgresDocumentRepository.upsert_document / update_document_status / delete: "
-        "EnqueueDocument, ProcessDocument, DeleteDocument của delivery gRPC/HTTP legacy"
-    ),
-    (_PLACEMENT_REPO, "documents"): (
-        "PostgresDocumentPlacementRepository.set_document_chapter: "
-        "MetadataStoreDocumentReporter (delivery legacy, script backfill)"
-    ),
-}
+# Ngoại lệ tường minh, theo cặp (file, bảng), phòng trường hợp tạm thời cần
+# miễn trừ trong quá trình chuyển tiếp. Khi hết dùng phải gỡ về rỗng.
+LEGACY_EXCEPTIONS: dict[tuple[str, str], str] = {}
 
 # --- Nhận diện câu ghi -------------------------------------------------------
 
@@ -478,17 +464,20 @@ class TestScanner:
         [write] = find_sql_writes(source)
         assert write.line == 4
 
-    def test_allowlist_covers_ai_tables_outbox_and_explicit_legacy_pairs_only(self):
+    def test_allowlist_covers_ai_tables_outbox_and_explicit_legacy_pairs_only(self, monkeypatch):
         def w(table):
             return SqlWrite("INSERT", table, 1, "")
+
+        legacy_file = "legacy/repo.py"
+        monkeypatch.setitem(LEGACY_EXCEPTIONS, (legacy_file, "documents"), "temporary exception")
 
         # Tập bảng nghiệp vụ thật luôn đã trừ bảng AI và outbox_events.
         business = _BUSINESS - WRITABLE_TABLES
         for table in sorted(AI_TABLES) + ["outbox_events"]:
             assert is_allowed("any.py", w(table), business)
         assert not is_allowed("any.py", w("documents"), business)
-        assert is_allowed(_DOCUMENTS_REPO, w("documents"), business)
-        assert not is_allowed(_DOCUMENTS_REPO, w("quiz_attempts"), business)
+        assert is_allowed(legacy_file, w("documents"), business)
+        assert not is_allowed(legacy_file, w("quiz_attempts"), business)
         assert not is_allowed("other/file.py", w("documents"), business)
 
     def test_prisma_parser_uses_map_when_present(self):

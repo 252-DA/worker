@@ -178,8 +178,6 @@ def mock_metadata_store(
     sample_document_context: StoredDocumentContext,
 ) -> MagicMock:
     store = MagicMock()
-    store.upsert_document.return_value = Ok(None)
-    store.update_document_status.return_value = Ok(None)
     store.upsert_chunks.return_value = Ok(None)
     store.upsert_chunks_with_outbox.return_value = Ok(None)
     store.get_document_context.return_value = Ok(sample_document_context)
@@ -193,7 +191,6 @@ def mock_metadata_store(
     store.list_quiz_items.return_value = Ok([])
     store.get.return_value = Ok(sample_document)
     store.list.return_value = Ok([sample_document])
-    store.delete.return_value = Ok(None)
     store.get_document_status.return_value = Ok(None)
     store.get_document_processing_generation.return_value = Ok(None)
     return store
