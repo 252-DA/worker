@@ -9,6 +9,7 @@ cũng không đọc DB. Xem docs/ke-hoach-ranh-gioi-du-lieu.md.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import tempfile
 from dataclasses import dataclass
@@ -19,6 +20,11 @@ from document_chunk.domain.ports.file_storage import IFileStorage
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
+from worker.services.micro_content_subtitles import (
+    SubtitleCue,
+    build_webvtt_and_timeline,
+    normalize_for_tts,
+)
 from worker.services.result_publisher import MICRO_CONTENT_VIDEO_RESULT, make_result_id
 from worker.services.slide_generator import SlideGenerator
 from worker.services.tts_client import TtsClient, get_default_tts_client
@@ -64,6 +70,9 @@ class RenderMicroContentVideoResponse:
     video_object_key: str
     duration_seconds: float
     size_bytes: int
+    vtt_object_key: str | None = None
+    transcript_text: str | None = None
+    scene_timeline: list[dict[str, Any]] | None = None
 
 
 def video_object_key(course_id: str, micro_content_id: str, render_id: str) -> str:
@@ -74,6 +83,10 @@ def video_object_key(course_id: str, micro_content_id: str, render_id: str) -> s
     cũ cũng vẫn phát được file của nó.
     """
     return f"micro-content/{course_id}/{micro_content_id}/ai-{render_id}.mp4"
+
+
+def vtt_object_key(course_id: str, micro_content_id: str, render_id: str) -> str:
+    return f"micro-content/{course_id}/{micro_content_id}/ai-{render_id}.vtt"
 
 
 def _scenes_of(script: Any) -> tuple[list[dict], str]:
@@ -118,7 +131,12 @@ class RenderMicroContentVideoUseCase:
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 scene_media_list: list[SceneMedia] = []
+                scene_cues: list[list[SubtitleCue]] = []
+                speech_durations_ms: list[int] = []
                 total_scenes = len(scenes)
+                use_cue_tts = inspect.iscoroutinefunction(
+                    getattr(type(self.tts_client), "synthesize_with_cues", None)
+                )
 
                 for idx, scene in enumerate(scenes):
                     title = scene.get("title", f"Cảnh {idx + 1}")
@@ -137,12 +155,24 @@ class RenderMicroContentVideoUseCase:
                         total_scenes=total_scenes,
                     )
 
-                    duration = await self.tts_client.synthesize(
-                        text=narration,
-                        output_path=audio_path,
-                        voice=voice,
-                    )
+                    tts_text = normalize_for_tts(narration) or narration
+                    if use_cue_tts:
+                        tts_result = await self.tts_client.synthesize_with_cues(  # type: ignore[attr-defined]
+                            text=tts_text,
+                            output_path=audio_path,
+                            voice=voice,
+                        )
+                        duration = float(tts_result.duration_seconds)
+                        scene_cues.append(list(tts_result.cues))
+                    else:
+                        duration = await self.tts_client.synthesize(
+                            text=tts_text,
+                            output_path=audio_path,
+                            voice=voice,
+                        )
+                        scene_cues.append([])
 
+                    speech_durations_ms.append(max(400, round(duration * 1000)))
                     scene_media_list.append(
                         SceneMedia(
                             slide_image_path=slide_img_path,
@@ -152,11 +182,44 @@ class RenderMicroContentVideoUseCase:
                     )
 
                 final_mp4_path = os.path.join(temp_dir, "output.mp4")
-                total_duration = await self.video_composer.compose_video(
-                    scenes=scene_media_list,
-                    work_dir=os.path.join(temp_dir, "clips"),
-                    output_mp4_path=final_mp4_path,
+                use_timeline_composer = inspect.iscoroutinefunction(
+                    getattr(type(self.video_composer), "compose_video_with_timeline", None)
                 )
+                if use_timeline_composer:
+                    composed = await self.video_composer.compose_video_with_timeline(  # type: ignore[attr-defined]
+                        scenes=scene_media_list,
+                        work_dir=os.path.join(temp_dir, "clips"),
+                        output_mp4_path=final_mp4_path,
+                    )
+                    total_duration = float(composed.duration_seconds)
+                    scene_durations_ms = [
+                        max(400, round(d * 1000)) for d in composed.scene_durations_seconds
+                    ]
+                else:
+                    total_duration = await self.video_composer.compose_video(
+                        scenes=scene_media_list,
+                        work_dir=os.path.join(temp_dir, "clips"),
+                        output_mp4_path=final_mp4_path,
+                    )
+                    scene_durations_ms = list(speech_durations_ms)
+
+                vtt_text, transcript_text, timeline = build_webvtt_and_timeline(
+                    scenes=scenes,
+                    scene_durations_ms=scene_durations_ms,
+                    scene_cues=scene_cues,
+                    speech_durations_ms=speech_durations_ms,
+                )
+                vtt_key: str | None = None
+                if vtt_text.strip():
+                    vtt_path = os.path.join(temp_dir, "subtitles.vtt")
+                    Path(vtt_path).write_text(vtt_text, encoding="utf-8")
+                    candidate_vtt_key = vtt_object_key(
+                        request.course_id, request.micro_content_id, request.render_id
+                    )
+                    vtt_res = self.file_storage.upload(Path(vtt_path), candidate_vtt_key)
+                    if vtt_res.is_err():
+                        raise vtt_res.error
+                    vtt_key = candidate_vtt_key
 
                 object_key = video_object_key(
                     request.course_id, request.micro_content_id, request.render_id
@@ -174,6 +237,9 @@ class RenderMicroContentVideoUseCase:
                 video_object_key=object_key,
                 duration_seconds=total_duration,
                 size_bytes=size_bytes,
+                vtt_object_key=vtt_key,
+                transcript_text=transcript_text,
+                scene_timeline=timeline,
             )
             # Chỉ báo READY khi file đã nằm trên storage. Gửi lỗi thì nổi lên
             # thành Err: job gốc lỗi và BullMQ render lại, không hoàn tất khi
@@ -223,18 +289,25 @@ class RenderMicroContentVideoUseCase:
     async def _publish_ready(
         self, request: RenderMicroContentVideoRequest, response: RenderMicroContentVideoResponse
     ) -> str:
+        payload: dict[str, Any] = {
+            "micro_content_id": response.micro_content_id,
+            "asset_id": response.asset_id,
+            "render_id": response.render_id,
+            "status": "READY",
+            "object_key": response.video_object_key,
+            "duration_ms": max(0, int(response.duration_seconds * 1000)),
+            "size_bytes": response.size_bytes,
+            "mime_type": VIDEO_MIME_TYPE,
+        }
+        if response.vtt_object_key:
+            payload["vtt_object_key"] = response.vtt_object_key
+        if response.transcript_text:
+            payload["transcript_text"] = response.transcript_text
+        if response.scene_timeline:
+            payload["scene_timeline"] = response.scene_timeline
         return await self.result_publisher.publish(
             MICRO_CONTENT_VIDEO_RESULT,
-            {
-                "micro_content_id": response.micro_content_id,
-                "asset_id": response.asset_id,
-                "render_id": response.render_id,
-                "status": "READY",
-                "object_key": response.video_object_key,
-                "duration_ms": max(0, int(response.duration_seconds * 1000)),
-                "size_bytes": response.size_bytes,
-                "mime_type": VIDEO_MIME_TYPE,
-            },
+            payload,
             # Tất định theo lần render: job gốc retry sau khi đã gửi sinh lại
             # đúng id, BullMQ bỏ bản trùng.
             result_id=make_result_id(MICRO_CONTENT_VIDEO_RESULT, request.render_id, "ready"),

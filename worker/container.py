@@ -468,6 +468,44 @@ class CurriculumQuizContainer(BaseWorkerContainer):
             writer=self.roles.role(QUIZ_GENERATION),
         )
 
+    @property
+    def generate_micro_outline_use_case(self):
+        from worker.use_cases.generate_micro_outline import GenerateMicroOutlineUseCase
+
+        writer = self.roles.role(QUIZ_GENERATION)
+        return GenerateMicroOutlineUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+        )
+
+    @property
+    def generate_video_script_use_case(self):
+        from worker.use_cases.generate_video_script import GenerateVideoScriptUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateVideoScriptUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
+    @property
+    def generate_micro_quiz_use_case(self):
+        from worker.use_cases.generate_micro_quiz import GenerateMicroQuizUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateMicroQuizUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
 
 class AnswerGradingContainer(BaseWorkerContainer):
     """

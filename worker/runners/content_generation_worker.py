@@ -36,6 +36,16 @@ from worker.use_cases.generate_lesson_cards import (
     MAX_CARD_COUNT,
     GenerateLessonCardsRequest,
 )
+from worker.use_cases.generate_micro_outline import GenerateMicroOutlineRequest
+from worker.use_cases.generate_micro_quiz import (
+    DEFAULT_MICRO_QUIZ_COUNT,
+    DEFAULT_MICRO_QUIZ_TYPES,
+    GenerateMicroQuizRequest,
+)
+from worker.use_cases.generate_video_script import (
+    DEFAULT_VOICE,
+    GenerateVideoScriptRequest,
+)
 
 logger = get_logger(__name__)
 
@@ -47,7 +57,9 @@ STATUS_RUNNING = "RUNNING"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
 
-_CONTENT_TYPES = frozenset({"quiz", "card", "relations"})
+_CONTENT_TYPES = frozenset(
+    {"quiz", "card", "relations", "micro_outline", "video_script", "micro_quiz"}
+)
 # last_error là TEXT; chặn để một thông báo lỗi dài không đi nguyên vào payload.
 _MAX_ERROR_CHARS = 4000
 # Khớp _ID_PART của result_publisher: một phần của result_id.
@@ -135,7 +147,31 @@ def _succeeded_payload(job: ContentGenerationJob, response) -> dict[str, Any]:
         # knowledge_relations vẫn do worker ghi (chưa thuộc đợt này); core-api
         # chỉ cập nhật trạng thái request.
         return {**payload, "generated_count": response.relations_written}
+    if job.content_type == "micro_outline":
+        return {
+            **payload,
+            "document_id": response.document_id,
+            "generated_count": response.section_count,
+            "sections": [sec.to_payload() for sec in response.sections],
+        }
     rejected = [r.to_payload() for r in response.rejected]
+    if job.content_type == "video_script":
+        return {
+            **payload,
+            "micro_content_id": response.micro_content_id,
+            "generated_count": response.scene_count,
+            "script": response.script,
+            "rejected": rejected,
+        }
+    if job.content_type == "micro_quiz":
+        return {
+            **payload,
+            "micro_content_id": response.micro_content_id,
+            "lo_id": response.lo_id,
+            "generated_count": response.quiz_count,
+            "quiz_items": [item.to_payload() for item in response.items],
+            "rejected": rejected,
+        }
     if job.content_type == "card":
         return {
             **payload,
@@ -310,6 +346,135 @@ def _relations_request(job: ContentGenerationJob) -> ExtractRelationsRequest:
     return ExtractRelationsRequest(course_id=job.course_id, document_ids=list(raw))
 
 
+def _scope_text(scope: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = scope.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _scope_int(scope: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = scope.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            return int(value.strip())
+    return None
+
+
+def _micro_outline_request(job: ContentGenerationJob) -> GenerateMicroOutlineRequest:
+    if job.content_type != "micro_outline":
+        raise ValueError(f"expected type='micro_outline', got {job.content_type!r}")
+    scope = job.scope
+    document_id = _scope_text(scope, "document_id", "documentId", "source_document_id", "sourceDocumentId")
+    if not document_id:
+        raise ValueError("micro_outline scope must include document_id")
+    pages = scope.get("pages") if isinstance(scope.get("pages"), list) else None
+    raw_los = scope.get("candidate_los") or scope.get("candidateLos")
+    candidate_los = raw_los if isinstance(raw_los, list) else None
+    return GenerateMicroOutlineRequest(
+        course_id=job.course_id,
+        document_id=document_id,
+        document_title=_scope_text(scope, "document_title", "documentTitle") or "",
+        chapter_code=_scope_text(scope, "chapter_code", "chapterCode"),
+        total_pages=_scope_int(scope, "total_pages", "totalPages"),
+        pages=pages,
+        candidate_los=candidate_los,
+    )
+
+
+def _video_script_request(job: ContentGenerationJob) -> GenerateVideoScriptRequest:
+    if job.content_type != "video_script":
+        raise ValueError(f"expected type='video_script', got {job.content_type!r}")
+    scope = job.scope
+    micro_content_id = _scope_text(scope, "micro_content_id", "microContentId")
+    if not micro_content_id:
+        raise ValueError("video_script scope must include micro_content_id")
+    document_id = _scope_text(
+        scope, "document_id", "documentId", "source_document_id", "sourceDocumentId"
+    )
+    page_from = _scope_int(scope, "page_from", "pageFrom", "source_page_from", "sourcePageFrom") or 1
+    page_to = _scope_int(scope, "page_to", "pageTo", "source_page_to", "sourcePageTo") or page_from
+    page_from = max(1, page_from)
+    page_to = max(page_from, page_to)
+    raw_pages = scope.get("pages")
+    pages = tuple(raw_pages) if isinstance(raw_pages, list) else None
+    if not document_id and not pages:
+        raise ValueError("video_script scope must include document_id or pages")
+    raw_neighbors = scope.get("neighbor_topics") or scope.get("neighborTopics")
+    neighbor_topics = (
+        tuple(str(item).strip() for item in raw_neighbors if isinstance(item, str) and item.strip())
+        if isinstance(raw_neighbors, list)
+        else ()
+    )
+    return GenerateVideoScriptRequest(
+        course_id=job.course_id,
+        micro_content_id=micro_content_id,
+        document_id=document_id,
+        page_from=page_from,
+        page_to=page_to,
+        topic_title=_scope_text(scope, "topic_title", "topicTitle", "title") or "",
+        topic_summary=_scope_text(scope, "topic_summary", "topicSummary", "summary"),
+        lo_id=_scope_text(scope, "lo_id", "loId"),
+        lo_code=_scope_text(scope, "lo_code", "loCode"),
+        lo_statement_vi=_scope_text(scope, "lo_statement_vi", "loStatementVi"),
+        lo_statement_en=_scope_text(scope, "lo_statement_en", "loStatementEn"),
+        voice=_scope_text(scope, "voice") or DEFAULT_VOICE,
+        neighbor_topics=neighbor_topics,
+        low_text=bool(scope.get("low_text") or scope.get("lowText")),
+        pages=pages,
+    )
+
+
+def _micro_quiz_request(job: ContentGenerationJob) -> GenerateMicroQuizRequest:
+    if job.content_type != "micro_quiz":
+        raise ValueError(f"expected type='micro_quiz', got {job.content_type!r}")
+    scope = job.scope
+    micro_content_id = _scope_text(scope, "micro_content_id", "microContentId")
+    if not micro_content_id:
+        raise ValueError("micro_quiz scope must include micro_content_id")
+    document_id = _scope_text(
+        scope, "document_id", "documentId", "source_document_id", "sourceDocumentId"
+    )
+    page_from = _scope_int(scope, "page_from", "pageFrom", "source_page_from", "sourcePageFrom") or 1
+    page_to = _scope_int(scope, "page_to", "pageTo", "source_page_to", "sourcePageTo") or page_from
+    page_from = max(1, page_from)
+    page_to = max(page_from, page_to)
+    raw_types = scope.get("question_types") or scope.get("questionTypes")
+    question_types = (
+        tuple(str(t).strip() for t in raw_types if isinstance(t, str) and t.strip())
+        if isinstance(raw_types, list)
+        else DEFAULT_MICRO_QUIZ_TYPES
+    ) or DEFAULT_MICRO_QUIZ_TYPES
+    raw_chunks = scope.get("source_chunks") or scope.get("sourceChunks")
+    source_chunks = tuple(raw_chunks) if isinstance(raw_chunks, list) else None
+    script = scope.get("script") if isinstance(scope.get("script"), dict) else None
+    if not document_id and not source_chunks and not script:
+        raise ValueError("micro_quiz scope must include document_id, source_chunks, or script")
+    count = _scope_int(scope, "count") or DEFAULT_MICRO_QUIZ_COUNT
+    count = max(1, min(10, count))
+    return GenerateMicroQuizRequest(
+        course_id=job.course_id,
+        micro_content_id=micro_content_id,
+        topic_title=_scope_text(scope, "topic_title", "topicTitle", "title") or "",
+        lo_id=_scope_text(scope, "lo_id", "loId"),
+        lo_code=_scope_text(scope, "lo_code", "loCode"),
+        lo_statement_vi=_scope_text(scope, "lo_statement_vi", "loStatementVi"),
+        lo_statement_en=_scope_text(scope, "lo_statement_en", "loStatementEn"),
+        document_id=document_id,
+        page_from=page_from,
+        page_to=page_to,
+        script=script,
+        count=count,
+        question_types=question_types,
+        source_chunks=source_chunks,
+    )
+
+
 def _plan(container, job: ContentGenerationJob):
     """(use case, request) cho loại nội dung của job; ValueError nếu không hỗ trợ."""
     if job.content_type == "quiz":
@@ -318,9 +483,15 @@ def _plan(container, job: ContentGenerationJob):
         return container.generate_lesson_cards_use_case, _card_request(job)
     if job.content_type == "relations":
         return container.extract_relations_use_case, _relations_request(job)
+    if job.content_type == "micro_outline":
+        return container.generate_micro_outline_use_case, _micro_outline_request(job)
+    if job.content_type == "video_script":
+        return container.generate_video_script_use_case, _video_script_request(job)
+    if job.content_type == "micro_quiz":
+        return container.generate_micro_quiz_use_case, _micro_quiz_request(job)
     raise ValueError(
-        "content-generation worker supports type='quiz', 'card' or 'relations', "
-        f"got {job.content_type!r}"
+        "content-generation worker supports type='quiz', 'card', 'relations', "
+        f"'micro_outline', 'video_script' or 'micro_quiz', got {job.content_type!r}"
     )
 
 
@@ -333,10 +504,28 @@ def _summary(job: ContentGenerationJob, response) -> dict[str, Any]:
             "chunks_processed": response.chunks_processed,
             "failed_batches": response.failed_batches,
         }
+    elif job.content_type == "micro_outline":
+        generated = {
+            "document_id": response.document_id,
+            "section_count": response.section_count,
+        }
+    elif job.content_type == "video_script":
+        generated = {
+            "micro_content_id": response.micro_content_id,
+            "scene_count": response.scene_count,
+            "rejected_count": len(response.rejected),
+        }
     elif job.content_type == "card":
         generated = {
             "card_count": response.card_count,
             "card_ids": response.card_ids,
+            "rejected_count": len(response.rejected),
+        }
+    elif job.content_type == "micro_quiz":
+        generated = {
+            "micro_content_id": response.micro_content_id,
+            "quiz_count": response.quiz_count,
+            "question_ids": response.question_ids,
             "rejected_count": len(response.rejected),
         }
     else:

@@ -153,7 +153,11 @@ async def test_render_micro_content_video_success():
     assert data.size_bytes == 3
     assert t.tts_client.synthesize.await_count == 2
     assert t.slide_gen.generate_slide.call_count == 2
-    # Mỗi lần render một object riêng, không ghi đè file của lần khác.
+    # VTT tải lên trước, MP4 tải lên sau để không ghi đè file của lần render khác.
+    assert t.file_storage.upload.call_count == 2
+    assert t.file_storage.upload.call_args_list[0].args[1] == (
+        f"micro-content/{COURSE}/{MC}/ai-{RENDER}.vtt"
+    )
     assert t.file_storage.upload.call_args.args[1] == KEY
     # Kết quả đi về core-api đúng một lần, thay cho ghi micro_contents/video_assets.
     assert len(t.publisher.envelopes) == 1
@@ -161,16 +165,34 @@ async def test_render_micro_content_video_success():
     assert envelope["kind"] == "MICRO_CONTENT_VIDEO_RESULT"
     assert envelope["result_id"] == f"MICRO_CONTENT_VIDEO_RESULT.{RENDER}.ready"
     assert envelope["source_event_id"] == EVENT
-    assert envelope["payload"] == {
-        "micro_content_id": MC,
-        "asset_id": ASSET,
-        "render_id": RENDER,
-        "status": "READY",
-        "object_key": KEY,
-        "duration_ms": 7700,
-        "size_bytes": 3,
-        "mime_type": "video/mp4",
-    }
+    payload = envelope["payload"]
+    assert payload["micro_content_id"] == MC
+    assert payload["asset_id"] == ASSET
+    assert payload["render_id"] == RENDER
+    assert payload["status"] == "READY"
+    assert payload["object_key"] == KEY
+    assert payload["duration_ms"] == 7700
+    assert payload["size_bytes"] == 3
+    assert payload["mime_type"] == "video/mp4"
+    assert payload["vtt_object_key"] == f"micro-content/{COURSE}/{MC}/ai-{RENDER}.vtt"
+    assert "Đây là khái niệm." in payload["transcript_text"]
+    assert "Đây là ứng dụng." in payload["transcript_text"]
+    assert payload["scene_timeline"] == [
+        {
+            "scene_index": 0,
+            "title": "Cảnh 1: Khái niệm",
+            "start_ms": 0,
+            "end_ms": 3500,
+            "duration_ms": 3500,
+        },
+        {
+            "scene_index": 1,
+            "title": "Cảnh 2: Áp dụng",
+            "start_ms": 3500,
+            "end_ms": 7700,
+            "duration_ms": 4200,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -370,3 +392,65 @@ async def test_published_results_and_parsed_command_match_contract_schemas():
     req = parse_render_job(fixture)
     assert req.render_id == fixture["payload"]["render_id"]
     assert req.source_event_id == fixture["event_id"]
+
+
+@pytest.mark.asyncio
+async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
+    import builtins
+    import sys
+
+    from worker.services.tts_client import EdgeTtsClient
+
+    monkeypatch.delenv("MICRO_CONTENT_ALLOW_MOCK_TTS", raising=False)
+    fake_edge = SimpleNamespace(
+        Communicate=MagicMock(side_effect=RuntimeError("network unreachable"))
+    )
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_edge)
+
+    client = EdgeTtsClient()
+    with pytest.raises(RuntimeError, match="Edge TTS failed"):
+        await client.synthesize("Xin chào", str(tmp_path / "out.mp3"))
+
+
+@pytest.mark.asyncio
+async def test_edge_tts_allows_fallback_only_with_env_flag(tmp_path, monkeypatch):
+    import sys
+
+    from worker.services.tts_client import EdgeTtsClient
+
+    monkeypatch.setenv("MICRO_CONTENT_ALLOW_MOCK_TTS", "true")
+    fake_edge = SimpleNamespace(
+        Communicate=MagicMock(side_effect=RuntimeError("network unreachable"))
+    )
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_edge)
+
+    client = EdgeTtsClient()
+    dur = await client.synthesize("Xin chào các bạn.", str(tmp_path / "out.wav"))
+    assert dur >= 2.0
+    assert (tmp_path / "out.wav").exists()
+
+
+def test_build_webvtt_and_timeline_proportional_and_cues():
+    from worker.services.micro_content_subtitles import SubtitleCue, build_webvtt_and_timeline
+
+    vtt, transcript, timeline = build_webvtt_and_timeline(
+        scenes=[
+            {"title": "Mở đầu", "slide_page": 2, "narration": "Câu một. Câu hai dài hơn chút."},
+            {"title": "Kết luận", "slide_page": 3, "narration": "Tóm tắt nội dung."},
+        ],
+        scene_durations_ms=[3000, 2000],
+        scene_cues=[
+            [SubtitleCue(start_ms=0, end_ms=1200, text="Câu một."), SubtitleCue(start_ms=1200, end_ms=2600, text="Câu hai.")],
+            [],
+        ],
+        speech_durations_ms=[2600, 1600],
+    )
+
+    assert vtt.startswith("WEBVTT\n\n")
+    assert "00:00:00.000 --> 00:00:01.200\nCâu một." in vtt
+    assert "00:00:03.000 --> 00:00:04.600\nTóm tắt nội dung." in vtt
+    assert "[Cảnh 1] Mở đầu" in transcript
+    assert timeline == [
+        {"scene_index": 0, "slide_page": 2, "title": "Mở đầu", "start_ms": 0, "end_ms": 3000, "duration_ms": 3000},
+        {"scene_index": 1, "slide_page": 3, "title": "Kết luận", "start_ms": 3000, "end_ms": 5000, "duration_ms": 2000},
+    ]
