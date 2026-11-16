@@ -25,7 +25,9 @@ from worker.runtime import (
 )
 from document_chunk.application.use_cases.map_chunks_to_los import MapChunksToLosRequest
 
-from worker.use_cases.curriculum_import import CURRICULUM_JOB_NAMES
+from worker.services.document_reporter import job_attempt
+from worker.services.processing_generation import newer_generation
+from worker.use_cases.curriculum_import import CURRICULUM_JOB_NAMES, InvalidCurriculumJob
 from worker.use_cases.run_pipeline import RunPipelineRequest
 
 MAP_DOCUMENT_LOS_JOB = "map_document_los"
@@ -39,7 +41,7 @@ _COMPLETED_DOCUMENT_STATUSES = {
 }
 
 
-def _process_document_job(container, payload: DocumentJobPayload):
+def _process_document_job(container, payload: DocumentJobPayload, attempt: int = 1):
     suffix = Path(payload.file_name).suffix or ".tmp"
     tmp_path: Path | None = None
 
@@ -58,6 +60,8 @@ def _process_document_job(container, payload: DocumentJobPayload):
             original_file_name=payload.file_name,
             language=payload.language,
             metadata=payload.metadata,
+            processing_generation=payload.processing_generation,
+            attempt=attempt,
         )
         result = container.run_pipeline_use_case.execute(request)
         if result.is_err():
@@ -80,11 +84,19 @@ def _process_document_job(container, payload: DocumentJobPayload):
 
 
 async def _process_curriculum_job(container, job):
-    import_id = job.data.get("import_id") if isinstance(job.data, dict) else None
-    if not import_id:
-        logger.error("document_worker.invalid_curriculum_payload", job_id=getattr(job, "id", None))
-        raise UnrecoverableError("curriculum job requires import_id")
-    return await asyncio.to_thread(container.curriculum_import_use_case.run, job.name, import_id)
+    # Xem trước, lệnh map lại chunk → LO của học phần (outbox) và job apply cũ;
+    # use case tự kiểm dữ liệu từng loại. Lỗi gửi kết quả nổi lên để BullMQ chạy lại.
+    data = job.data if isinstance(job.data, dict) else {}
+    try:
+        return await asyncio.to_thread(container.curriculum_import_use_case.run, job.name, data)
+    except InvalidCurriculumJob as exc:
+        logger.error(
+            "document_worker.invalid_curriculum_payload",
+            job_id=getattr(job, "id", None),
+            job_name=job.name,
+            error=str(exc),
+        )
+        raise UnrecoverableError(f"invalid curriculum job: {exc}") from exc
 
 
 def _map_document_los(container, document_id: str, course_id: str):
@@ -126,6 +138,26 @@ async def _process_job(container, job, job_token):
         )
         raise UnrecoverableError(f"invalid document job payload: {exc}") from exc
 
+    # Job của lượt cũ (tài liệu đã được đưa vào hàng đợi lại): ack mà không chạy gì,
+    # không thì chunk/vector của nó ghi chồng lên lượt mới. Không publish: kết quả
+    # trạng thái của lượt cũ vẫn bị core-api bỏ.
+    current_generation = newer_generation(
+        container.metadata_store, payload.document_id, payload.processing_generation
+    )
+    if current_generation is not None:
+        logger.warning(
+            "document_worker.job.stale_generation_skipped",
+            document_id=payload.document_id,
+            job_generation=payload.processing_generation,
+            current_generation=current_generation,
+        )
+        return {
+            "document_id": payload.document_id,
+            "skipped": "stale_generation",
+            "job_generation": payload.processing_generation,
+            "current_generation": current_generation,
+        }
+
     status_result = container.metadata_store.get_document_status(payload.document_id)
     if status_result.is_err():
         raise status_result.error
@@ -148,7 +180,8 @@ async def _process_job(container, job, job_token):
             "chunk_count": chunk_count,
         }
 
-    return await asyncio.to_thread(_process_document_job, container, payload)
+    # Trạng thái đi về core-api kèm lượt + lần chạy để kết quả cũ không đè mới.
+    return await asyncio.to_thread(_process_document_job, container, payload, job_attempt(job))
 
 
 async def _main() -> None:

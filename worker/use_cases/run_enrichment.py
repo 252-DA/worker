@@ -5,6 +5,13 @@ Enrichment stays asynchronous and retryable:
   DONE -> ENRICHING -> ENRICHED
 
 If enrichment fails, document status falls back to DONE so search remains available.
+
+Ranh giới dữ liệu (docs/ke-hoach-ranh-gioi-du-lieu.md):
+- trạng thái tài liệu → DOCUMENT_PROCESSING_RESULT, core-api ghi `documents`;
+- lesson cards + quiz items → ENRICHMENT_CONTENT_RESULT, core-api thay học liệu
+  nháp của tài liệu (bảng lessons/lesson_cards/quiz_items là của core-api);
+- concepts + chunk_concepts (dữ liệu AI) và sự kiện CONCEPT_GRAPH_PROJECT vẫn do
+  worker ghi, cùng một transaction (transactional outbox).
 """
 import re
 import time
@@ -31,6 +38,11 @@ from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
+from worker.services.document_reporter import (
+    STAGE_ENRICHMENT,
+    PublishingDocumentStatusReporter,
+)
+from worker.services.result_publisher import ENRICHMENT_CONTENT_RESULT, make_result_id
 from worker.prompts import enrichment as prompts
 from document_chunk.shared.tracing import get_tracer
 
@@ -113,6 +125,10 @@ class _SectionContext:
 @dataclass
 class RunEnrichmentRequest:
     document_id: str
+    # Lượt xử lý tài liệu (job enrichment mang theo) và lần chạy của job: kèm
+    # mọi kết quả gửi core-api để kết quả cũ không đè mới.
+    processing_generation: int = 0
+    attempt: int = 1
 
 
 @dataclass
@@ -123,6 +139,9 @@ class RunEnrichmentResponse:
     card_count: int
     quiz_count: int
 
+
+# lesson_cards.title là VARCHAR(255); LLM thỉnh thoảng trả tiêu đề dài hơn.
+_MAX_CARD_TITLE = 255
 
 # llm_usage_logs.status CHECK chỉ nhận ba giá trị này, phân biệt hoa thường.
 _USAGE_OK = "OK"
@@ -144,12 +163,14 @@ class RunEnrichmentUseCase:
         self,
         metadata_store: IMetadataStore,
         llm_client: ILLMClient,
+        result_publisher,
         max_section_chars: int = 6000,
         llm_provider: str = "unknown",
         llm_profile: str | None = None,
     ) -> None:
         self._metadata_store = metadata_store
         self._llm_client = llm_client
+        self._publisher = result_publisher
         self._max_section_chars = max_section_chars
         self._role = LlmRole(client=llm_client, provider=llm_provider, profile=llm_profile)
 
@@ -167,17 +188,21 @@ class RunEnrichmentUseCase:
             if context is None:
                 return Err(ProcessingError(f"Document not found for enrichment: {document_id}"))
 
-            status_result = self._metadata_store.update_document_status(
-                document_id,
-                IngestionStatus.ENRICHING,
+            reporter = PublishingDocumentStatusReporter(
+                self._publisher,
+                self._metadata_store,
+                stage=STAGE_ENRICHMENT,
+                processing_generation=request.processing_generation,
+                attempt=request.attempt,
             )
+            status_result = reporter.report_status(document_id, IngestionStatus.ENRICHING)
             if status_result.is_err():
                 return Err(status_result.error)
 
             try:
                 chunks_result = self._metadata_store.list_chunks(document_id)
                 if chunks_result.is_err():
-                    return self._fail_to_done(document_id, chunks_result.error)
+                    return self._fail_to_done(reporter, document_id, chunks_result.error)
 
                 chunks = chunks_result.unwrap()
                 concepts, mentions = self._build_heading_concepts(chunks, context.language)
@@ -222,6 +247,7 @@ class RunEnrichmentUseCase:
                 # bằng rỗng thì tệ hơn là dừng lại báo lỗi.
                 if sections and len(failed_sections) == len(sections):
                     return self._fail_to_done(
+                        reporter,
                         document_id,
                         ProcessingError(
                             f"Tất cả {len(sections)} section đều sinh lỗi; "
@@ -242,6 +268,10 @@ class RunEnrichmentUseCase:
                     event_type = OutboxEventType.CONCEPT_GRAPH_PROJECT
                     outbox_payload = {
                         "document_id": document_id,
+                        # OutboxProjector báo GENERATED_DRAFT sau khi chiếu graph,
+                        # cùng lượt/lần chạy với enrichment này.
+                        "processing_generation": request.processing_generation,
+                        "enrichment_attempt": request.attempt,
                         "concepts": [
                             {
                                 "concept_id": concept.concept_id,
@@ -265,26 +295,38 @@ class RunEnrichmentUseCase:
                         ],
                     }
 
-                persist_result = self._metadata_store.persist_enrichment_batch(
+                # 1. Học liệu nháp → core-api. Gửi trước khi ghi phần AI: lỗi
+                # sau đó thì job chạy lại, gửi lại cùng result_id và BullMQ bỏ
+                # bản trùng, core-api cũng chỉ áp dụng một lần cho mỗi lượt.
+                content_result = self._publish_content(
                     document_id=document_id,
+                    processing_generation=request.processing_generation,
                     lesson_cards=lesson_cards,
                     quiz_items=quiz_items,
+                )
+                if content_result.is_err():
+                    return self._fail_to_done(reporter, document_id, content_result.error)
+
+                # 2. Dữ liệu AI + sự kiện outbox: một transaction của worker.
+                persist_result = self._metadata_store.persist_concept_enrichment(
+                    document_id=document_id,
                     concepts=concepts,
                     chunk_concepts=mentions,
                     outbox_event_type=event_type,
                     outbox_payload=outbox_payload,
                 )
                 if persist_result.is_err():
-                    return self._fail_to_done(document_id, persist_result.error)
+                    return self._fail_to_done(reporter, document_id, persist_result.error)
 
+                # Có sự kiện thì OutboxProjector báo GENERATED_DRAFT sau khi chiếu graph.
                 appended_event_id = persist_result.unwrap()
                 if appended_event_id is None:
-                    enriched_result = self._metadata_store.update_document_status(
+                    enriched_result = reporter.report_status(
                         document_id,
                         IngestionStatus.ENRICHED,
                     )
                     if enriched_result.is_err():
-                        return self._fail_to_done(document_id, enriched_result.error)
+                        return self._fail_to_done(reporter, document_id, enriched_result.error)
 
                 span.set_attribute("concepts.count", len(concepts))
                 span.set_attribute("mentions.count", len(mentions))
@@ -308,7 +350,71 @@ class RunEnrichmentUseCase:
                     )
                 )
             except Exception as exc:
-                return self._fail_to_done(document_id, exc)
+                return self._fail_to_done(reporter, document_id, exc)
+
+    def _publish_content(
+        self,
+        *,
+        document_id: str,
+        processing_generation: int,
+        lesson_cards: list[StoredLessonCard],
+        quiz_items: list[StoredQuizItem],
+    ) -> Result[None, Exception]:
+        """
+        ENRICHMENT_CONTENT_RESULT: core-api thay toàn bộ học liệu nháp của tài
+        liệu bằng bộ này (danh sách rỗng = xoá nháp), đúng ngữ nghĩa cũ của
+        persist_enrichment_batch. Một kết quả cho mỗi lượt xử lý tài liệu.
+        """
+        payload = {
+            "document_id": str(document_id),
+            "processing_generation": processing_generation,
+            "model_id": self._llm_client.model_id,
+            "lesson_cards": [
+                {
+                    "card_id": card.card_id,
+                    # list_chunks trả chunk_id kiểu uuid.UUID: JSON chỉ nhận str.
+                    "primary_chunk_id": str(card.primary_chunk_id),
+                    "source_chunk_ids": [
+                        str(chunk_id)
+                        for chunk_id in (card.source_chunk_ids or (card.primary_chunk_id,))
+                    ],
+                    "heading_path": list(card.heading_path),
+                    "title": card.title[:_MAX_CARD_TITLE],
+                    "bullets": list(card.bullets),
+                    "key_insight": card.key_insight,
+                    "card_index": card.card_index,
+                }
+                for card in lesson_cards
+            ],
+            "quiz_items": [
+                {
+                    "quiz_id": item.question_id,
+                    "primary_chunk_id": str(item.primary_chunk_id),
+                    "source_chunk_ids": [
+                        str(chunk_id)
+                        for chunk_id in (item.source_chunk_ids or (item.primary_chunk_id,))
+                    ],
+                    "question": item.question,
+                    "choices": list(item.choices),
+                    "correct_index": item.correct_index,
+                    "explanation": item.explanation,
+                }
+                for item in quiz_items
+            ],
+        }
+        try:
+            self._publisher.publish_sync(
+                ENRICHMENT_CONTENT_RESULT,
+                payload,
+                result_id=make_result_id(
+                    ENRICHMENT_CONTENT_RESULT,
+                    str(document_id),
+                    f"g{processing_generation}",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 -- Redis/hợp đồng: job phải lỗi để retry
+            return Err(exc)
+        return Ok(None)
 
     def _build_heading_concepts(
         self,
@@ -548,12 +654,20 @@ class RunEnrichmentUseCase:
             return chunk.embedding_input.strip()
         return ""
 
-    def _fail_to_done(self, document_id: str, error: Exception) -> Result[RunEnrichmentResponse, Exception]:
-        self._metadata_store.update_document_status(
-            document_id=document_id,
-            status=IngestionStatus.DONE,
-            error_msg=str(error),
-        )
+    def _fail_to_done(
+        self,
+        reporter: PublishingDocumentStatusReporter,
+        document_id: str,
+        error: Exception,
+    ) -> Result[RunEnrichmentResponse, Exception]:
+        # Best-effort như trước: báo lùi về DONE hỏng thì lỗi gốc vẫn làm job retry.
+        fallback = reporter.report_status(document_id, IngestionStatus.DONE, error_msg=str(error))
+        if fallback.is_err():
+            logger.warning(
+                "run_enrichment.fallback_status_failed",
+                document_id=document_id,
+                error=str(fallback.error),
+            )
         logger.error("run_enrichment.failed", document_id=document_id, error=str(error))
         return Err(error)
 

@@ -1,23 +1,14 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:0.6.14 AS uv
-FROM python:3.10-slim
+FROM ghcr.io/astral-sh/uv:0.11.32 AS uv
+FROM python:3.10-slim AS builder
 
-# Không đặt LLM__* ở đây: model chọn theo task (web hoặc LLM_PROFILE__<TASK>),
-# xem docs/model-routing-design.md.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
-        libmagic1 \
-        zlib1g-dev \
-        ffmpeg \
-        fonts-dejavu-core \
-        # opencv-python (docling OCR) needs these at import time; without
-        # them OCR fails with "libGL.so.1: cannot open shared object file".
-        libgl1 \
-        libglib2.0-0 && \
+        zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -48,7 +39,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Pin the tokenizer snapshot used to enforce the BGE-m3 input budget offline.
 RUN .venv/bin/python -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('BAAI/bge-m3', revision='5617a9f61b028005a4858fdac845db406aefb181').save('/app/bge-m3-tokenizer.json')"
-ENV CHUNKER__TOKENIZER_PATH=/app/bge-m3-tokenizer.json
+
+FROM python:3.10-slim
+
+# Không đặt LLM__* ở đây: model chọn theo task (web hoặc LLM_PROFILE__<TASK>),
+# xem docs/model-routing-design.md.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/worker/.venv/bin:$PATH" \
+    CHUNKER__TOKENIZER_PATH=/app/bge-m3-tokenizer.json
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libmagic1 \
+        # Render video micro-content: ffmpeg ghép cảnh, DejaVu cho chữ trên slide.
+        ffmpeg \
+        fonts-dejavu-core \
+        # opencv-python (docling OCR) needs these at import time; without
+        # them OCR fails with "libGL.so.1: cannot open shared object file".
+        libgl1 \
+        libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /bin/
+COPY --from=builder /app /app
+
+WORKDIR /app/worker
 
 ENTRYPOINT ["uv", "run", "--frozen", "python", "-m"]
 CMD ["worker.runners.document_worker"]

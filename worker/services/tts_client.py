@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
-import struct
 import wave
 from abc import ABC, abstractmethod
 
+from dataclasses import dataclass
+
 from document_chunk.shared.logger import get_logger
+from worker.services.micro_content_subtitles import SubtitleCue
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    duration_seconds: float
+    cues: list[SubtitleCue]
 
 
 class TtsClient(ABC):
@@ -68,8 +75,24 @@ class MockTtsClient(TtsClient):
 class EdgeTtsClient(TtsClient):
     """Sử dụng edge-tts miễn phí với các giọng đọc tiếng Việt chất lượng cao (Hoài My / Nam Minh)."""
 
-    def __init__(self, fallback: TtsClient | None = None) -> None:
-        self._fallback = fallback or MockTtsClient()
+    def __init__(
+        self,
+        fallback: TtsClient | None = None,
+        *,
+        allow_fallback: bool | None = None,
+    ) -> None:
+        if fallback is not None:
+            self._fallback: TtsClient | None = fallback
+        else:
+            import os
+
+            enabled = (
+                os.getenv("MICRO_CONTENT_ALLOW_MOCK_TTS", "").strip().lower()
+                in ("1", "true", "yes")
+                if allow_fallback is None
+                else allow_fallback
+            )
+            self._fallback = MockTtsClient() if enabled else None
 
     async def _measure_duration(self, audio_path: str, fallback_duration: float) -> float:
         try:
@@ -91,23 +114,94 @@ class EdgeTtsClient(TtsClient):
             pass
         return fallback_duration
 
-    async def synthesize(self, text: str, output_path: str, voice: str = "vi-VN-HoaiMyNeural") -> float:
+    async def synthesize_with_cues(
+        self,
+        text: str,
+        output_path: str,
+        voice: str = "vi-VN-HoaiMyNeural",
+    ) -> SynthesisResult:
+        clean_text = text.strip()
+        if not clean_text:
+            clean_text = "Nội dung bài giảng."
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
         try:
             import edge_tts  # type: ignore
 
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(output_path)
+            # Danh sách giọng ưu tiên: giọng chính -> giọng phụ
+            candidate_voices = [voice]
+            if voice == "vi-VN-HoaiMyNeural":
+                candidate_voices.append("vi-VN-NamMinhNeural")
+            elif voice == "vi-VN-NamMinhNeural":
+                candidate_voices.append("vi-VN-HoaiMyNeural")
 
-            words = text.strip().split()
-            fallback_duration = max(2.0, len(words) * 0.38)
-            duration = await self._measure_duration(output_path, fallback_duration)
+            last_error: Exception | None = None
+            for v in candidate_voices:
+                try:
+                    communicate = edge_tts.Communicate(
+                        clean_text,
+                        v,
+                        boundary="SentenceBoundary",
+                    )
+                    audio_buf = bytearray()
+                    cues: list[SubtitleCue] = []
+                    async for chunk in communicate.stream():
+                        ctype = chunk.get("type")
+                        if ctype == "audio":
+                            data = chunk.get("data")
+                            if data:
+                                audio_buf.extend(data)
+                        elif ctype in ("SentenceBoundary", "WordBoundary"):
+                            offset_ms = round(float(chunk.get("offset", 0)) / 10_000)
+                            dur_ms = round(float(chunk.get("duration", 0)) / 10_000)
+                            cue_text = str(chunk.get("text") or "").strip()
+                            if cue_text:
+                                cues.append(
+                                    SubtitleCue(
+                                        start_ms=max(0, offset_ms),
+                                        end_ms=max(offset_ms + 50, offset_ms + dur_ms),
+                                        text=cue_text,
+                                    )
+                                )
 
-            logger.info("edge_tts.synthesized", path=output_path, voice=voice, duration=duration)
-            return duration
+                    if not audio_buf:
+                        raise RuntimeError("Edge TTS returned empty audio stream")
+
+                    with open(output_path, "wb") as f:
+                        f.write(audio_buf)
+
+                    words = clean_text.split()
+                    fallback_duration = max(2.0, len(words) * 0.38)
+                    duration = await self._measure_duration(output_path, fallback_duration)
+
+                    logger.info(
+                        "edge_tts.synthesized",
+                        path=output_path,
+                        voice=v,
+                        duration=duration,
+                        cues=len(cues),
+                    )
+                    return SynthesisResult(duration_seconds=duration, cues=cues)
+                except Exception as voice_err:
+                    last_error = voice_err
+                    logger.warning("edge_tts.voice_failed", voice=v, error=str(voice_err))
+
+            raise RuntimeError(f"All Edge TTS voices failed: {last_error}")
         except Exception as exc:
-            logger.warning("edge_tts.failed_fallback_to_mock", error=str(exc))
-            return await self._fallback.synthesize(text, output_path, voice)
+            if self._fallback is None:
+                logger.error("edge_tts.failed", voice=voice, error=str(exc))
+                raise RuntimeError(f"Edge TTS failed ({voice}): {exc}") from exc
+            logger.warning("edge_tts.failed_fallback_to_mock", voice=voice, error=str(exc))
+
+        if self._fallback is None:
+            raise RuntimeError(f"Edge TTS failed ({voice})")
+        dur = await self._fallback.synthesize(clean_text, output_path, voice)
+        return SynthesisResult(duration_seconds=dur, cues=[])
+
+    async def synthesize(self, text: str, output_path: str, voice: str = "vi-VN-HoaiMyNeural") -> float:
+        result = await self.synthesize_with_cues(text, output_path, voice=voice)
+        return result.duration_seconds
 
 
 def get_default_tts_client() -> TtsClient:

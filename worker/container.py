@@ -23,7 +23,9 @@ from document_chunk.shared.logger import get_logger
 from ai_runtime.catalog import ENRICHMENT, QUIZ_GENERATION, QUIZ_VERIFICATION
 
 from worker.config import WorkerSettings, get_worker_settings
+from worker.runtime import build_redis_options
 from worker.services.outbox_projector import OutboxProjector
+from worker.services.result_publisher import WorkerResultPublisher
 from worker.use_cases.run_enrichment import RunEnrichmentUseCase
 from worker.use_cases.run_pipeline import RunPipelineUseCase
 
@@ -283,6 +285,15 @@ def build_job_queue(settings: WorkerSettings) -> BullMQAdapter:
     return BullMQAdapter(settings.redis)
 
 
+def build_result_publisher(settings: WorkerSettings) -> WorkerResultPublisher:
+    """
+    Kết quả về core-api qua hàng đợi ``worker_results`` thay cho ghi thẳng bảng
+    của core-api. Chưa kết nối Redis cho tới lần gửi đầu tiên.
+    """
+    logger.debug("worker_container.init", component="WorkerResultPublisher")
+    return WorkerResultPublisher(build_redis_options(settings))
+
+
 class DocumentWorkerContainer(BaseWorkerContainer):
     """Build only the dependencies needed by the document processing worker."""
 
@@ -292,6 +303,7 @@ class DocumentWorkerContainer(BaseWorkerContainer):
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.vector_store = self._track("vector_store", build_vector_store(settings))
         self.job_queue = self._track("job_queue", build_job_queue(settings))
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.parsers = build_parsers(settings)
         self.chunker = build_chunker(settings)
         self.embedder = self._track("embedder", build_embedder(settings))
@@ -304,6 +316,7 @@ class DocumentWorkerContainer(BaseWorkerContainer):
             vector_store=self.vector_store,
             metadata_store=self.metadata_store,
             job_queue=self.job_queue,
+            result_publisher=self.result_publisher,
             map_chunks_to_los_use_case=self.map_chunks_to_los_use_case,
         )
         self.curriculum_import_use_case = self._build_curriculum_import()
@@ -313,19 +326,19 @@ class DocumentWorkerContainer(BaseWorkerContainer):
         from document_chunk.application.use_cases.ingest_curriculum import (
             IngestCurriculumUseCase,
         )
-        from worker.services.curriculum_import_store import CurriculumImportStore
+        from worker.services.course_document_index import CourseDocumentIndex
         from worker.use_cases.curriculum_import import CurriculumImportUseCase
 
+        # Worker chỉ parse và gửi kết quả; core-api ghi đề cương khi áp dụng.
         return CurriculumImportUseCase(
-            store=CurriculumImportStore(self.settings.sql),
+            publisher=self.result_publisher,
             file_storage=self.file_storage,
             ingest_curriculum_use_case=IngestCurriculumUseCase(
                 parsers=self.parsers,
                 curriculum_extractor=DcmhExtractor(),
-                metadata_store=self.metadata_store,
-                graph_store=self.graph_store,
             ),
             map_chunks_to_los_use_case=self.map_chunks_to_los_use_case,
+            course_documents=CourseDocumentIndex(self.settings.sql),
         )
 
     def _build_map_chunks_to_los(self):
@@ -336,6 +349,7 @@ class DocumentWorkerContainer(BaseWorkerContainer):
         from document_chunk.application.use_cases.map_chunks_to_los import (
             MapChunksToLosUseCase,
         )
+        from worker.services.document_reporter import PublishingDocumentChapterReporter
 
         return MapChunksToLosUseCase(
             metadata_store=self.metadata_store,
@@ -343,6 +357,8 @@ class DocumentWorkerContainer(BaseWorkerContainer):
             lo_mapper=HeuristicLoMapper(),
             # Khớp chương theo nội dung cho tài liệu không nằm trong module theo chương.
             chapter_matcher=EmbeddingChapterMatcher(self.embedder),
+            # Chương suy luận → core-api ghi documents (không ghi thẳng).
+            chapter_reporter=PublishingDocumentChapterReporter(self.result_publisher),
         )
 
 
@@ -352,6 +368,7 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.model_registry = build_model_registry(settings)
         self.roles = TaskRoles(self.model_registry)
 
@@ -362,6 +379,7 @@ class EnrichmentWorkerContainer(BaseWorkerContainer):
         return RunEnrichmentUseCase(
             metadata_store=self.metadata_store,
             llm_client=role.client,
+            result_publisher=self.result_publisher,
             max_section_chars=self.settings.llm.max_section_chars,
             llm_provider=role.provider,
             llm_profile=role.profile,
@@ -374,10 +392,12 @@ class CurriculumQuizContainer(BaseWorkerContainer):
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.model_registry = build_model_registry(settings)
         self.roles = TaskRoles(self.model_registry)
         self.context_client = build_learning_context_client(settings)
         self._warned_same_model: str | None = None
+        self._warn_lock = threading.Lock()
 
     def _writer_and_judge(self):
         """
@@ -388,13 +408,14 @@ class CurriculumQuizContainer(BaseWorkerContainer):
         writer = self.roles.role(QUIZ_GENERATION)
         judge = self.roles.role(QUIZ_VERIFICATION)
         same = writer.profile if writer.profile == judge.profile else None
-        if same and same != self._warned_same_model:
-            logger.warning(
-                "worker_container.quiz_judge_is_writer",
-                profile=same,
-                hint="chọn model kiểm chứng khác model viết nội dung",
-            )
-        self._warned_same_model = same
+        with self._warn_lock:
+            if same and same != self._warned_same_model:
+                logger.warning(
+                    "worker_container.quiz_judge_is_writer",
+                    profile=same,
+                    hint="chọn model kiểm chứng khác model viết nội dung",
+                )
+            self._warned_same_model = same
         return writer, judge
 
     @property
@@ -432,21 +453,74 @@ class CurriculumQuizContainer(BaseWorkerContainer):
             verifier=judge,
         )
 
+    @property
+    def extract_relations_use_case(self):
+        """
+        Trích quan hệ giữa các ý cho chatbot. Việc này là "viết nội dung bám
+        nguồn" nên dùng model viết của quiz; chi phí vẫn tách được qua use_case
+        relation_extraction. PostgresMetadataStore cũng là ICourseKnowledgeStore.
+        """
+        from worker.use_cases.extract_relations import ExtractRelationsUseCase
+
+        return ExtractRelationsUseCase(
+            knowledge_store=self.metadata_store,
+            metadata_store=self.metadata_store,
+            writer=self.roles.role(QUIZ_GENERATION),
+        )
+
+    @property
+    def generate_micro_outline_use_case(self):
+        from worker.use_cases.generate_micro_outline import GenerateMicroOutlineUseCase
+
+        writer = self.roles.role(QUIZ_GENERATION)
+        return GenerateMicroOutlineUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+        )
+
+    @property
+    def generate_video_script_use_case(self):
+        from worker.use_cases.generate_video_script import GenerateVideoScriptUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateVideoScriptUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
+    @property
+    def generate_micro_quiz_use_case(self):
+        from worker.use_cases.generate_micro_quiz import GenerateMicroQuizUseCase
+
+        writer, judge = self._writer_and_judge()
+        return GenerateMicroQuizUseCase(
+            metadata_store=self.metadata_store,
+            llm_client=writer.client,
+            llm_provider=writer.provider,
+            llm_profile=writer.profile,
+            verifier=judge,
+        )
+
 
 class AnswerGradingContainer(BaseWorkerContainer):
     """
-    Chấm bài của người học: tự luận ngắn trong quiz và bài luận nộp file qua
-    Canvas (Asset Processor). Chỉ cần metadata store, MinIO và model judge,
-    không MCP, không writer.
+    Chấm bài của người học: tự luận ngắn trong quiz, câu tự luận Micro Content
+    và bài luận nộp file qua Canvas (Asset Processor). Lệnh mang đủ dữ liệu
+    chấm, kết quả về core-api qua ``result_publisher``: không đọc/ghi bảng bài
+    làm. metadata store chỉ còn để ghi llm_usage_logs; MinIO để đọc file bài
+    luận; không MCP, không writer.
     """
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
-        from worker.services.essay_submission_store import EssaySubmissionStore
-
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.file_storage = self._track("file_storage", build_file_storage(settings))
-        self.essay_store = EssaySubmissionStore(settings.sql)
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.model_registry = build_model_registry(settings)
         self.roles = TaskRoles(self.model_registry)
 
@@ -456,7 +530,6 @@ class AnswerGradingContainer(BaseWorkerContainer):
         from worker.use_cases.grade_essay_submission import GradeEssaySubmissionUseCase
 
         return GradeEssaySubmissionUseCase(
-            store=self.essay_store,
             file_storage=self.file_storage,
             metadata_store=self.metadata_store,
             grader=self.roles.role(QUIZ_VERIFICATION),
@@ -477,12 +550,11 @@ class AnswerGradingContainer(BaseWorkerContainer):
 
     @property
     def grade_micro_content_answers_use_case(self):
-        """Chấm câu tự luận Micro Content theo rubric."""
-        from worker.services.micro_content_grading_store import MicroContentGradingStore
+        """Chấm câu tự luận Micro Content theo rubric, cùng prompt và model judge với quiz."""
         from worker.use_cases.grade_micro_content_answers import GradeMicroContentAnswersUseCase
 
         return GradeMicroContentAnswersUseCase(
-            store=MicroContentGradingStore(self.settings.sql),
+            metadata_store=self.metadata_store,
             grader=self.roles.role(QUIZ_VERIFICATION),
         )
 
@@ -495,10 +567,12 @@ class OutboxWorkerContainer(BaseWorkerContainer):
         self.metadata_store = self._track("metadata_store", build_metadata_store(settings))
         self.graph_store = self._track("graph_store", build_graph_store(settings))
         self.vector_store = self._track("vector_store", build_vector_store(settings))
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.outbox_projector = OutboxProjector(
             metadata_store=self.metadata_store,
             graph_store=self.graph_store,
             vector_store=self.vector_store,
+            result_publisher=self.result_publisher,
         )
 
 
@@ -533,13 +607,12 @@ class MicroContentVideoContainer(BaseWorkerContainer):
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
-        from worker.services.micro_content_video_store import MicroContentVideoStore
         from worker.services.slide_generator import SlideGenerator
         from worker.services.tts_client import get_default_tts_client
         from worker.services.video_composer import VideoComposer
 
         self.file_storage = self._track("file_storage", build_file_storage(settings))
-        self.video_store = MicroContentVideoStore(settings.sql)
+        self.result_publisher = self._track("result_publisher", build_result_publisher(settings))
         self.tts_client = get_default_tts_client()
         self.slide_generator = SlideGenerator()
         self.video_composer = VideoComposer()
@@ -549,7 +622,7 @@ class MicroContentVideoContainer(BaseWorkerContainer):
         from worker.use_cases.render_micro_content_video import RenderMicroContentVideoUseCase
 
         return RenderMicroContentVideoUseCase(
-            store=self.video_store,
+            result_publisher=self.result_publisher,
             file_storage=self.file_storage,
             tts_client=self.tts_client,
             slide_generator=self.slide_generator,

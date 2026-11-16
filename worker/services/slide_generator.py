@@ -160,3 +160,38 @@ class SlideGenerator:
         img.save(output_path, "PNG")
         logger.info("slide_generator.saved", path=output_path, scene=scene_index)
         return output_path
+
+
+def render_pdf_slide_page(
+    pdf_path: str,
+    page_number: int,
+    output_path: str,
+    *,
+    width: int = 1280,
+    height: int = 720,
+) -> str:
+    """
+    Kết xuất trang slide gốc từ file PDF thành ảnh PNG kích thước chuẩn (mặc định 1280x720)
+    để video hiển thị đúng hình ảnh/biểu đồ của bài giảng thay vì thẻ chữ thuần.
+    """
+    import pymupdf as fitz
+
+    with fitz.open(pdf_path) as doc:
+        if page_number < 1 or page_number > len(doc):
+            raise ValueError(
+                f"Slide page {page_number} out of bounds (total={len(doc)})"
+            )
+        page = doc[page_number - 1]
+        rect = page.rect
+        zoom = min(width / max(1.0, rect.width), height / max(1.0, rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        rendered = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    canvas = Image.new("RGB", (width, height), (248, 250, 252))
+    offset_x = max(0, (width - rendered.width) // 2)
+    offset_y = max(0, (height - rendered.height) // 2)
+    canvas.paste(rendered, (offset_x, offset_y))
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, "PNG")
+    logger.info("slide_generator.pdf_page_saved", path=output_path, page_number=page_number)
+    return output_path

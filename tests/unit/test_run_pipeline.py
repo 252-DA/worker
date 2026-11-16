@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 from dataclasses import replace
 from unittest.mock import MagicMock
-from document_chunk.shared.result import Err, Ok
-from document_chunk.shared.result import Err
 
+from document_chunk.domain.exceptions import DocumentStaleError
+from document_chunk.shared.result import Err, Ok
+
+from tests.support import RecordingResultPublisher
 from worker.use_cases.run_pipeline import RunPipelineRequest, RunPipelineUseCase
 
 
@@ -25,6 +27,7 @@ class TestRunPipelineUseCase:
             vector_store=mock_vector_store,
             metadata_store=mock_metadata_store,
             job_queue=mock_job_queue,
+            result_publisher=RecordingResultPublisher(),
         )
 
         result = use_case.execute(
@@ -61,6 +64,7 @@ class TestRunPipelineUseCase:
             vector_store=mock_vector_store,
             metadata_store=mock_metadata_store,
             job_queue=mock_job_queue,
+            result_publisher=RecordingResultPublisher(),
         )
 
         result = use_case.execute(
@@ -95,6 +99,7 @@ class TestRunPipelineUseCase:
             vector_store=mock_vector_store,
             metadata_store=mock_metadata_store,
             job_queue=mock_job_queue,
+            result_publisher=RecordingResultPublisher(),
             preprocessors=[failing_preprocessor],
         )
 
@@ -129,6 +134,7 @@ class TestLoMappingWiring:
             vector_store=mocks["mock_vector_store"],
             metadata_store=mocks["mock_metadata_store"],
             job_queue=mocks["mock_job_queue"],
+            result_publisher=RecordingResultPublisher(),
             map_chunks_to_los_use_case=mapper,
         )
 
@@ -206,3 +212,131 @@ class TestLoMappingWiring:
         ).execute(self._request(sample_document))
 
         assert result.is_ok()
+
+
+class TestStatusGoesToCoreApi:
+    """
+    documents là bảng của core-api: mỗi chuyển trạng thái là một
+    DOCUMENT_PROCESSING_RESULT, worker không UPDATE documents nữa.
+    """
+
+    def _use_case(self, publisher, mocks):
+        return RunPipelineUseCase(
+            parsers=[mocks["mock_parser"]],
+            chunker=mocks["mock_chunker"],
+            embedder=mocks["mock_embedder"],
+            vector_store=mocks["mock_vector_store"],
+            metadata_store=mocks["mock_metadata_store"],
+            job_queue=mocks["mock_job_queue"],
+            result_publisher=publisher,
+        )
+
+    def _request(self, sample_document, **extra):
+        return RunPipelineRequest(
+            document_id=sample_document.id,
+            file_path=sample_document.path,
+            storage_key="docs/test.pdf",
+            original_file_name=sample_document.name,
+            **extra,
+        )
+
+    def _mocks(self, **kwargs):
+        return {k: v for k, v in kwargs.items() if k.startswith("mock_")}
+
+    def test_each_stage_is_published_with_generation_and_attempt(
+        self, sample_document, mock_parser, mock_chunker, mock_embedder,
+        mock_vector_store, mock_metadata_store, mock_job_queue,
+    ):
+        publisher = RecordingResultPublisher()
+        mocks = self._mocks(
+            mock_parser=mock_parser, mock_chunker=mock_chunker, mock_embedder=mock_embedder,
+            mock_vector_store=mock_vector_store, mock_metadata_store=mock_metadata_store,
+            mock_job_queue=mock_job_queue,
+        )
+
+        result = self._use_case(publisher, mocks).execute(
+            self._request(sample_document, processing_generation=7, attempt=2)
+        )
+
+        assert result.is_ok(), str(result.error)
+        assert [env["kind"] for env in publisher.envelopes] == ["DOCUMENT_PROCESSING_RESULT"] * 4
+        assert [env["payload"]["status"]["value"] for env in publisher.envelopes] == [
+            "PARSING", "CHUNKING", "EMBEDDING", "INDEXED",
+        ]
+        for env in publisher.envelopes:
+            status = env["payload"]["status"]
+            assert env["payload"]["document_id"] == sample_document.id
+            assert (status["stage"], status["processing_generation"], status["attempt"]) == (
+                "processing", 7, 2,
+            )
+        assert publisher.envelopes[0]["result_id"] == (
+            "DOCUMENT_PROCESSING_RESULT.doc-001.g7-processing2-PARSING"
+        )
+        mock_metadata_store.update_document_status.assert_not_called()
+        mock_metadata_store.upsert_document.assert_not_called()
+        # Chunks + outbox chiếu heading graph vẫn do worker ghi (dữ liệu AI).
+        mock_metadata_store.upsert_chunks_with_outbox.assert_called_once()
+        # Lượt xử lý đi tiếp sang job enrichment.
+        enrichment = mock_job_queue.enqueue_enrichment.call_args.args[0]
+        assert enrichment.processing_generation == 7
+
+    def test_failure_is_published_as_error(
+        self, sample_document, mock_parser, mock_chunker, mock_embedder,
+        mock_vector_store, mock_metadata_store, mock_job_queue,
+    ):
+        mock_parser.parse.return_value = Err(RuntimeError("bad pdf"))
+        publisher = RecordingResultPublisher()
+        mocks = self._mocks(
+            mock_parser=mock_parser, mock_chunker=mock_chunker, mock_embedder=mock_embedder,
+            mock_vector_store=mock_vector_store, mock_metadata_store=mock_metadata_store,
+            mock_job_queue=mock_job_queue,
+        )
+
+        result = self._use_case(publisher, mocks).execute(self._request(sample_document))
+
+        assert result.is_err()
+        statuses = [env["payload"]["status"] for env in publisher.envelopes]
+        assert [s["value"] for s in statuses] == ["PARSING", "ERROR"]
+        assert statuses[-1]["error"] == "bad pdf"
+        mock_metadata_store.update_document_status.assert_not_called()
+        mock_job_queue.enqueue_enrichment.assert_not_called()
+
+    def test_publish_failure_fails_the_job_before_any_work(
+        self, sample_document, mock_parser, mock_chunker, mock_embedder,
+        mock_vector_store, mock_metadata_store, mock_job_queue,
+    ):
+        publisher = RecordingResultPublisher(fail_with=ConnectionError("redis down"))
+        mocks = self._mocks(
+            mock_parser=mock_parser, mock_chunker=mock_chunker, mock_embedder=mock_embedder,
+            mock_vector_store=mock_vector_store, mock_metadata_store=mock_metadata_store,
+            mock_job_queue=mock_job_queue,
+        )
+
+        result = self._use_case(publisher, mocks).execute(self._request(sample_document))
+
+        assert result.is_err()
+        assert isinstance(result.error, ConnectionError)
+        mock_parser.parse.assert_not_called()
+        mock_metadata_store.upsert_chunks_with_outbox.assert_not_called()
+        mock_metadata_store.update_document_status.assert_not_called()
+
+    def test_deleted_document_stops_the_pipeline_without_writing(
+        self, sample_document, mock_parser, mock_chunker, mock_embedder,
+        mock_vector_store, mock_metadata_store, mock_job_queue,
+    ):
+        """Delete-race guard: tài liệu đã xoá thì không parse, không ghi gì."""
+        mock_metadata_store.get_document_context.return_value = Ok(None)
+        publisher = RecordingResultPublisher()
+        mocks = self._mocks(
+            mock_parser=mock_parser, mock_chunker=mock_chunker, mock_embedder=mock_embedder,
+            mock_vector_store=mock_vector_store, mock_metadata_store=mock_metadata_store,
+            mock_job_queue=mock_job_queue,
+        )
+
+        result = self._use_case(publisher, mocks).execute(self._request(sample_document))
+
+        assert result.is_err()
+        assert isinstance(result.error, DocumentStaleError)
+        assert publisher.envelopes == []
+        mock_parser.parse.assert_not_called()
+        mock_vector_store.upsert.assert_not_called()

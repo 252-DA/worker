@@ -3,18 +3,19 @@ GenerateCurriculumQuizUseCase — generate quiz items aligned to a specific LO/c
 
 Sibling to RunEnrichmentUseCase (course-scoped, not document-scoped).
 Used by the queued content-generation worker and the legacy synchronous adapter.
+
+Use case chỉ TÍNH: trả về các câu đã kiểm chứng kèm hồ sơ; runner gửi chúng về
+core-api (CONTENT_GENERATION_RESULT) và core-api ghi quiz_items.
 """
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from document_chunk.application.dto.generation_dto import (
-    GenerateCurriculumQuizRequest,
-    GenerateCurriculumQuizResponse,
-)
+from document_chunk.application.dto.generation_dto import GenerateCurriculumQuizRequest
 from document_chunk.application.services.answer_layout import (
     balanced_positions,
     shuffle_choices,
@@ -24,14 +25,20 @@ from document_chunk.application.services.structured_output import generate_struc
 from document_chunk.domain.bloom import bloom_to_level, bloom_to_name
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.ports.llm_client import ILLMClient, LLMUsage
-from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredQuizItem
+from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
 from worker.llm_role import LlmRole
 from worker.prompts import curriculum_quiz as prompts
+from worker.use_cases.generated_content import GeneratedQuizItem, RejectedDraft
 from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
-from worker.use_cases.verification import verify_and_refine
+from worker.use_cases.verification import (
+    JudgeVerdict,
+    RefineResult,
+    collect_verdicts,
+    verify_and_refine,
+)
 
 logger = get_logger(__name__)
 
@@ -236,6 +243,84 @@ def _answer_layout(
     raise ProcessingError(f"Unsupported question type: {question_type}")
 
 
+def _distinct(values: list[str]) -> bool:
+    return len({v.strip().casefold() for v in values}) == len(values)
+
+
+def _answer_key_problem(
+    question_type: str, question: str, choices: list[str], correct_answer: object
+) -> str | None:
+    """
+    Lý do câu sẽ bị core-api từ chối (``normalizeAnswerKey`` trong
+    core-api/src/quiz/question-types.ts), hoặc None nếu hợp lệ.
+
+    core-api kiểm cả mẻ chặt và từ chối cả kết quả nếu một câu sai dạng; lọc
+    trước ở đây để một câu hỏng không làm mất cả mẻ. Schema Pydantic đã bắt gần
+    hết; chỗ còn hở là MCQ_SINGLE có phương án trùng nhau.
+    """
+    if question_type == "MCQ_SINGLE":
+        if len(choices) != 4 or not _distinct(choices):
+            return "invalid answer key: MCQ_SINGLE needs 4 distinct choices"
+        if correct_answer not in choices:
+            return "invalid answer key: correct answer is not one of the choices"
+    elif question_type == "MCQ_MULTI":
+        if not 4 <= len(choices) <= 6 or not _distinct(choices):
+            return "invalid answer key: MCQ_MULTI needs 4-6 distinct choices"
+        if (
+            not isinstance(correct_answer, list)
+            or not correct_answer
+            or len(correct_answer) >= len(choices)
+            or any(c not in choices for c in correct_answer)
+        ):
+            return "invalid answer key: MCQ_MULTI correct answers must be a strict subset of choices"
+    elif question_type == "TRUE_FALSE":
+        if correct_answer not in _TRUE_FALSE_OPTIONS:
+            return "invalid answer key: TRUE_FALSE answer must be Đúng or Sai"
+    elif question_type == "FILL_BLANK":
+        if not _BLANK.search(question):
+            return "invalid answer key: FILL_BLANK question has no ____ blank"
+        if (
+            not isinstance(correct_answer, list)
+            or not 1 <= len(correct_answer) <= 10
+            or not _distinct(correct_answer)
+        ):
+            return "invalid answer key: FILL_BLANK needs 1-10 distinct accepted answers"
+    elif question_type == "SHORT_ANSWER":
+        if (
+            not isinstance(correct_answer, dict)
+            or not str(correct_answer.get("model_answer") or "").strip()
+            or not isinstance(correct_answer.get("rubric"), list)
+            or not 1 <= len(correct_answer["rubric"]) <= 6
+            or not _distinct(correct_answer["rubric"])
+        ):
+            return "invalid answer key: SHORT_ANSWER needs a model answer and 1-6 distinct rubric points"
+    return None
+
+
+@dataclass(frozen=True)
+class GenerateCurriculumQuizResponse:
+    """
+    Kết quả một lần sinh: câu đã qua vòng kiểm chứng, chưa ghi đâu cả.
+
+    ``rejected`` là câu bị loại (judge loại sau lượt sửa cuối, hoặc đáp án sai
+    dạng): không gửi đi để lưu, nhưng được đếm trong kết quả.
+    """
+
+    course_id: str
+    lo_id: str
+    bloom_level: int | None = None
+    items: tuple[GeneratedQuizItem, ...] = ()
+    rejected: tuple[RejectedDraft, ...] = ()
+
+    @property
+    def quiz_count(self) -> int:
+        return len(self.items)
+
+    @property
+    def question_ids(self) -> list[str]:
+        return [item.question_id for item in self.items]
+
+
 # ---------------------------------------------------------------------------
 # Use case
 # ---------------------------------------------------------------------------
@@ -378,7 +463,7 @@ class GenerateCurriculumQuizUseCase:
         # 5b. Verify each question against the retrieved source excerpts and give
         # the model a bounded number of chances to fix anything unsupported
         # before it ever reaches a human reviewer (doc §4.4/§4.5: CoVe + Reflexion).
-        questions, rejected = self._verify_and_refine(
+        refined = self._verify_and_refine(
             questions=list(payload.questions[: request.count]),
             context_parts=context_parts,
             trace_id=trace_id,
@@ -386,29 +471,34 @@ class GenerateCurriculumQuizUseCase:
             question_type=question_type,
             schema=(question_model, schema_name),
         )
+        rejected = [
+            RejectedDraft(reason=r.reason, regeneration_attempts=r.regeneration_attempts)
+            for r in refined.rejected
+        ]
         if rejected:
             logger.warning(
                 "generate_curriculum_quiz.rejected_not_persisted",
                 trace_id=trace_id,
                 lo_id=primary_lo_id,
                 rejected=len(rejected),
-                reasons=[r for _, r in rejected][:3],
+                reasons=[r.reason for r in rejected][:3],
             )
-        if not questions:
+        if not refined.kept:
             return Err(ProcessingError(
                 f"Tất cả {len(rejected)} câu đều không bám được nguồn sau "
                 f"{self._max_verification_retries} lượt sửa; không lưu câu nào "
                 f"cho {primary_lo_id}."
             ))
 
-        # 6. Persist quiz_items with lo_id + bloom_level
-        question_ids: list[str] = []
-        stored_items: list[StoredQuizItem] = []
+        # 6. Dựng quiz_items (lo_id + bloom_level) cho core-api ghi.
+        items: list[GeneratedQuizItem] = []
+        seen_ids: set[str] = set()
+        targets = balanced_positions(len(refined.kept), options=4, seed=primary_lo_id)
+        writer_model = self._writer.client.model_id
+        judge_model = self._verifier.client.model_id
 
-        primary_chunk_id = source_chunk_ids[0]
-        targets = balanced_positions(len(questions), options=4, seed=primary_lo_id)
-
-        for idx, q in enumerate(questions):
+        for idx, kept in enumerate(refined.kept):
+            q = kept.item
             # O3: id tất định theo (LO, nội dung câu hỏi). Trước đây là uuid4 nên
             # một lần retry sau bước lưu sẽ nhân đôi cả bộ câu. Kiểu khác MCQ_SINGLE
             # thêm kiểu vào khoá để không đè lên câu cùng lời của kiểu khác.
@@ -416,7 +506,11 @@ class GenerateCurriculumQuizUseCase:
             if question_type != "MCQ_SINGLE":
                 key = f"{question_type}|{key}"
             qid = str(uuid.uuid5(_QUIZ_ID_NAMESPACE, f"{primary_lo_id}|{key}"))
-            question_ids.append(qid)
+            if qid in seen_ids:
+                # Hai câu cùng lời trong một mẻ là một câu: trước đây câu sau
+                # ghi đè câu trước nhưng vẫn được đếm hai lần.
+                logger.info("generate_curriculum_quiz.duplicate_question_dropped", question_id=qid)
+                continue
             valid_source_ids = tuple(
                 source_id
                 for source_id in q.source_chunk_ids
@@ -425,48 +519,58 @@ class GenerateCurriculumQuizUseCase:
             choices, correct_index, correct_answer = _answer_layout(
                 q, question_type, seed=qid, target_index=targets[idx]
             )
-            item = StoredQuizItem(
+            if correct_answer is None and 0 <= correct_index < len(choices):
+                correct_answer = choices[correct_index]
+            problem = _answer_key_problem(question_type, q.question, choices, correct_answer)
+            if problem is not None:
+                logger.warning(
+                    "generate_curriculum_quiz.invalid_answer_key",
+                    trace_id=trace_id,
+                    question_id=qid,
+                    problem=problem,
+                )
+                rejected.append(RejectedDraft(
+                    reason=problem,
+                    regeneration_attempts=kept.verification.regeneration_attempts,
+                ))
+                continue
+            seen_ids.add(qid)
+            items.append(GeneratedQuizItem(
                 question_id=qid,
-                document_id=source_document_id,
-                primary_chunk_id=primary_chunk_id,
-                source_chunk_ids=valid_source_ids or tuple(source_chunk_ids[:3]),
-                heading_path=(),
+                question_type=question_type,
                 question=q.question,
                 choices=tuple(choices),
                 correct_index=correct_index,
-                explanation=q.explanation,
-                difficulty=q.difficulty,
-                question_index=idx,
-                model_id=self._writer.client.model_id,
-                question_type=question_type,
                 correct_answer=correct_answer,
-            )
-            stored_items.append(item)
+                explanation=q.explanation,
+                bloom_level=bloom_level,
+                source_chunk_ids=valid_source_ids or tuple(source_chunk_ids[:3]),
+                model_id=writer_model,
+                judge_model=judge_model,
+                verification=kept.verification,
+                difficulty=q.difficulty,
+            ))
 
-        persist_result = self._metadata_store.persist_curriculum_quiz_items(
-            lo_id=primary_lo_id,
-            bloom_level=bloom_level,
-            quiz_items=stored_items,
-        )
-        if persist_result.is_err():
-            logger.error(
-                "generate_curriculum_quiz.persist_failed",
-                lo_id=primary_lo_id,
-                error=str(persist_result.error),
-            )
-            return Err(persist_result.error)
+        if not items:
+            return Err(ProcessingError(
+                f"Không còn câu hợp lệ nào cho {primary_lo_id} "
+                f"({len(rejected)} câu bị loại); không lưu câu nào."
+            ))
 
         logger.info(
             "generate_curriculum_quiz.done",
             course_id=request.course_id,
             lo_id=primary_lo_id,
-            count=len(question_ids),
+            count=len(items),
+            rejected=len(rejected),
+            verified=sum(1 for i in items if i.verification.status == "VERIFIED"),
         )
         return Ok(GenerateCurriculumQuizResponse(
             course_id=request.course_id,
             lo_id=primary_lo_id,
-            quiz_count=len(question_ids),
-            question_ids=question_ids,
+            bloom_level=bloom_level,
+            items=tuple(items),
+            rejected=tuple(rejected),
         ))
 
     def _load_context(
@@ -507,20 +611,21 @@ class GenerateCurriculumQuizUseCase:
         course_id: str,
         question_type: str = "MCQ_SINGLE",
         schema: tuple[type[_QuestionBase], str] = _QUESTION_MODELS["MCQ_SINGLE"],
-    ) -> tuple[list[_QuestionBase], list[tuple[_QuestionBase, str]]]:
+    ) -> RefineResult[_QuestionBase]:
         """
         Đối chiếu từng câu với đoạn nguồn, cho model tối đa
-        ``max_verification_retries`` lượt sửa, rồi trả về (giữ lại, bị loại).
+        ``max_verification_retries`` lượt sửa, rồi trả về câu giữ lại (kèm kết
+        luận của judge) và câu bị loại.
 
         V2: câu vẫn bị loại sau khi hết lượt thì **không lưu**. Trước đây nó vẫn
         được lưu kèm một dòng log, tức là đẩy việc phát hiện sai sang người
         duyệt — ngược với mục đích của vòng kiểm tra này.
 
-        Verifier lỗi (LLM/parse hỏng) vẫn coi là không kết luận được, không phải
-        lý do để giữ lại nội dung: người duyệt trong `review.service.ts` vẫn là
-        cổng cuối.
+        Verifier lỗi (LLM/parse hỏng) thì không kết luận được: câu vẫn được giữ
+        với trạng thái INCONCLUSIVE, người duyệt trong `review.service.ts` vẫn
+        là cổng cuối.
         """
-        def find_failing(current: list[_QuestionBase]) -> dict[int, str] | None:
+        def judge(current: list[_QuestionBase]) -> dict[int, JudgeVerdict] | None:
             verdicts = self._run_verifier(
                 questions=current,
                 context_parts=context_parts,
@@ -530,11 +635,11 @@ class GenerateCurriculumQuizUseCase:
             )
             if verdicts is None:
                 return None
-            return {v.question_index: v.reason for v in verdicts if v.verdict != "supported"}
+            return collect_verdicts((v.question_index, v.verdict, v.reason) for v in verdicts)
 
         return verify_and_refine(
             questions,
-            find_failing=find_failing,
+            judge=judge,
             regenerate=lambda original, reason: self._run_regeneration(
                 original=original,
                 reason=reason,

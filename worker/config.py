@@ -37,7 +37,7 @@ class HealthConfig(BaseSettings):
 
 class LearningContextMcpConfig(BaseSettings):
     enabled: bool = False
-    url: str = "http://mcp-server:8001/mcp"
+    url: str = "http://mcp-service:8001/mcp"
     timeout_seconds: float = 30
     fallback_to_local: bool = True
 

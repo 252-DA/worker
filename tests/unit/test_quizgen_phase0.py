@@ -52,7 +52,6 @@ def _curriculum(store, *, bloom_level):
             content_text="Rủi ro dự án được đánh giá theo xác suất và tác động.",
         )
     ])
-    store.persist_curriculum_quiz_items.return_value = Ok(None)
     store.record_llm_usage.return_value = Ok(None)
     return store
 
@@ -102,18 +101,23 @@ def _run(store, llm, *, count=1, bloom_level=4, request_bloom=None):
 # ---------------------------------------------------------------------------
 
 class TestBloomLevel:
+    @staticmethod
+    def _bloom(result):
+        """Mức Bloom gắn cho cả mẻ và cho từng câu gửi về core-api."""
+        resp = result.unwrap()
+        levels = {item.to_payload()["bloom_level"] for item in resp.items}
+        assert levels == {resp.bloom_level}
+        return resp.bloom_level
+
     def test_int_bloom_from_postgres_survives(self, store, llm):
         """LO mức 4 phải lưu 4. Trước đây str(4) không khớp bảng tên → 2."""
-        assert _run(store, llm, bloom_level=4).is_ok()
-        assert store.persist_curriculum_quiz_items.call_args.kwargs["bloom_level"] == 4
+        assert self._bloom(_run(store, llm, bloom_level=4)) == 4
 
     def test_request_bloom_overrides_lo(self, store, llm):
-        assert _run(store, llm, bloom_level=4, request_bloom="remember").is_ok()
-        assert store.persist_curriculum_quiz_items.call_args.kwargs["bloom_level"] == 1
+        assert self._bloom(_run(store, llm, bloom_level=4, request_bloom="remember")) == 1
 
     def test_lo_without_bloom_falls_back_to_understand(self, store, llm):
-        assert _run(store, llm, bloom_level=None).is_ok()
-        assert store.persist_curriculum_quiz_items.call_args.kwargs["bloom_level"] == 2
+        assert self._bloom(_run(store, llm, bloom_level=None)) == 2
 
     @pytest.mark.parametrize("value,level", [
         (3, 3), ("3", 3), ("analyze", 4), ("Phân tích", 4), (None, None), ("", None), (9, None),
@@ -188,8 +192,7 @@ class TestUsageLogging:
 class TestAnswerShuffling:
     def test_correct_answer_moves_and_stays_correct(self, store, llm):
         """LLM luôn đặt đáp án đúng ở vị trí 0; sau khi xáo phải khác đi."""
-        assert _run(store, llm, count=4).is_ok()
-        items = store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"]
+        items = _run(store, llm, count=4).unwrap().items
         for item in items:
             assert item.choices[item.correct_index].startswith("Đúng-")
         assert {item.correct_index for item in items} != {0}
@@ -220,12 +223,10 @@ class TestDeterministicQuizId:
             store = MagicMock()
             client = as_llm_client(MagicMock())
             client.model_id = "gemini-test"
-            assert _run(store, client, count=2).is_ok()
-            items = store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"]
+            items = _run(store, client, count=2).unwrap().items
             ids.append([i.question_id for i in items])
         assert ids[0] == ids[1]
 
     def test_different_questions_give_different_ids(self, store, llm):
-        assert _run(store, llm, count=3).is_ok()
-        items = store.persist_curriculum_quiz_items.call_args.kwargs["quiz_items"]
+        items = _run(store, llm, count=3).unwrap().items
         assert len({i.question_id for i in items}) == 3
