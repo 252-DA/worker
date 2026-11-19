@@ -3,7 +3,7 @@ Unit test cho các sửa lỗi đường ống micro-content:
 - Priority 2: gộp outline theo lượng chữ & bỏ trang bìa/kết thúc, giữ heading_path,
   bỏ fallback chunks[:8], co giãn số cảnh, truyền instructor_prompt & course_title,
   không gắn nhầm cờ not_enough_evidence cho cảnh dài hợp lệ.
-- Priority 3: kết xuất trang slide PDF gốc thành ảnh 1280x720 kèm fallback thẻ chữ,
+- Priority 3: kết xuất trang slide PDF gốc thành ảnh 1920x1080 kèm fallback thẻ chữ,
   và tách phụ đề câu dài thành các cue ngắn gọn.
 - Priority 4: prompt micro-quiz bám đúng dải trang/kịch bản & lọc sạch chunk_id/Bloom
   khỏi lời giải thích cho người học.
@@ -391,7 +391,7 @@ def test_parse_render_job_and_render_pdf_slide_pages_with_fallback(tmp_path):
     single_out = tmp_path / "single.png"
     render_pdf_slide_page(str(pdf_path), 2, str(single_out))
     with Image.open(single_out) as img:
-        assert img.size == (1280, 720)
+        assert img.size == (1920, 1080)
 
     # Check parse_render_job carries source_document_key & mime
     parsed = parse_render_job(
@@ -434,10 +434,15 @@ async def test_render_use_case_uses_pdf_slide_when_available_and_falls_back_on_b
     slide_gen = MagicMock(spec=SlideGenerator)
     slide_gen.width = 1280
     slide_gen.height = 720
-    def _gen_slide(**kwargs):
-        Path(kwargs["output_path"]).write_bytes(b"fallback-png")
-        return kwargs["output_path"]
-    slide_gen.generate_slide.side_effect = _gen_slide
+    def _gen_slide_states(**kwargs):
+        paths = [
+            f"{kwargs['output_prefix']}_{idx:02d}.png"
+            for idx in range(len(kwargs["bullets"]) + 1)
+        ]
+        for path in paths:
+            Path(path).write_bytes(b"fallback-png")
+        return paths
+    slide_gen.generate_slide_states.side_effect = _gen_slide_states
 
     class _FakeTts:
         async def synthesize(self, text: str, output_path: str, voice: str) -> float:
@@ -479,8 +484,8 @@ async def test_render_use_case_uses_pdf_slide_when_available_and_falls_back_on_b
     )
     assert res.is_ok()
     # Cảnh 1 render trực tiếp từ PDF (không gọi thẻ chữ), Cảnh 2 vượt tổng trang nên fallback sang thẻ chữ!
-    assert slide_gen.generate_slide.call_count == 1
-    assert slide_gen.generate_slide.call_args.kwargs["scene_index"] == 2
+    assert slide_gen.generate_slide_states.call_count == 1
+    assert slide_gen.generate_slide_states.call_args.kwargs["scene_index"] == 2
 
 
 def test_subtitle_builder_splits_long_45_word_sentence_into_short_cues():
@@ -580,3 +585,22 @@ def test_micro_quiz_scopes_to_slides_and_sanitizes_explanation():
     assert "chunk" not in item.explanation.lower()
     assert "understand" not in item.explanation.lower()
     assert "mức độ hiểu" not in item.explanation.lower()
+
+
+def test_slide_generator_builds_progressive_1080p_states(tmp_path):
+    generator = SlideGenerator()
+    paths = generator.generate_slide_states(
+        title="RDD là gì?",
+        bullets=["Phân tán trên cụm", "Bất biến", "Theo dõi lineage"],
+        output_prefix=str(tmp_path / "scene"),
+        scene_index=1,
+        total_scenes=2,
+    )
+
+    assert len(paths) == 4
+    pixel_frames = []
+    for path in paths:
+        with Image.open(path) as image:
+            assert image.size == (1920, 1080)
+            pixel_frames.append(image.tobytes())
+    assert len(set(pixel_frames)) == 4

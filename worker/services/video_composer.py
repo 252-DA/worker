@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from document_chunk.shared.logger import get_logger
 
@@ -18,6 +18,10 @@ class SceneMedia:
     slide_image_path: str
     audio_path: str
     duration_seconds: float
+    slide_state_paths: tuple[str, ...] = ()
+    reveal_times_seconds: tuple[float, ...] = ()
+    motion: Literal["none", "zoom_in"] = "zoom_in"
+    animation_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,58 +31,151 @@ class ComposeResult:
 
 
 class VideoComposer:
-    """Ghép ảnh slide và âm thanh đọc thành video MP4 hoàn chỉnh với FFmpeg."""
+    """Ghép slide hoặc animation Manim với âm thanh đọc thành video MP4 1080p."""
 
-    def __init__(self, ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe") -> None:
+    def __init__(
+        self,
+        ffmpeg_bin: str = "ffmpeg",
+        ffprobe_bin: str = "ffprobe",
+        *,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 25,
+    ) -> None:
         self.ffmpeg_bin = ffmpeg_bin
         self.ffprobe_bin = ffprobe_bin
+        self.width = width
+        self.height = height
+        self.fps = fps
 
     def _ensure_binaries(self) -> None:
         if not shutil.which(self.ffmpeg_bin):
             raise RuntimeError(f"FFmpeg binary not found at '{self.ffmpeg_bin}'")
 
-    async def render_scene_clip(self, scene: SceneMedia, output_clip_path: str) -> float:
-        """Render 1 cảnh đơn lẻ thành clip MP4 khớp thời lượng hình và tiếng."""
-        import math
+    def _visual_inputs(
+        self,
+        scene: SceneMedia,
+        *,
+        clip_duration: float,
+        frames: int,
+    ) -> tuple[list[str], str, int]:
+        if scene.animation_path:
+            animation_filter = (
+                f"[0:v]fps={self.fps},scale={self.width}:{self.height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,setsar=1,"
+                "tpad=stop_mode=clone:stop_duration=1,"
+                f"trim=duration={clip_duration:.3f},setpts=PTS-STARTPTS,format=yuv420p[video]"
+            )
+            return ["-i", scene.animation_path], animation_filter, 1
 
+        paths = list(scene.slide_state_paths) or [scene.slide_image_path]
+        if len(paths) > 1 and len(scene.reveal_times_seconds) != len(paths) - 1:
+            raise ValueError("Số mốc hiện bullet phải nhỏ hơn số trạng thái slide một đơn vị")
+
+        input_args: list[str] = []
+        if len(paths) == 1:
+            input_args.extend(
+                [
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    str(self.fps),
+                    "-t",
+                    f"{clip_duration:.3f}",
+                    "-i",
+                    paths[0],
+                ]
+            )
+            video_source = "[0:v]"
+        else:
+            boundaries = [0.0, *scene.reveal_times_seconds, clip_duration]
+            for idx, path in enumerate(paths):
+                state_duration = max(1.0 / self.fps, boundaries[idx + 1] - boundaries[idx])
+                input_args.extend(
+                    [
+                        "-loop",
+                        "1",
+                        "-framerate",
+                        str(self.fps),
+                        "-t",
+                        f"{state_duration:.3f}",
+                        "-i",
+                        path,
+                    ]
+                )
+            sources = "".join(f"[{idx}:v]" for idx in range(len(paths)))
+            video_source = "[reveal]"
+            reveal_filter = f"{sources}concat=n={len(paths)}:v=1:a=0{video_source}"
+        if len(paths) == 1:
+            reveal_filter = ""
+
+        normalization = (
+            f"fps={self.fps},scale={self.width}:{self.height}:"
+            "force_original_aspect_ratio=decrease,"
+            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,setsar=1"
+        )
+        if scene.motion == "zoom_in":
+            zoom_frames = max(1, frames - 1)
+            animated = (
+                f"scale={round(self.width * 1.2)}:{round(self.height * 1.2)},"
+                f"zoompan=z='min(1+0.025*on/{zoom_frames},1.025)':"
+                "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                f"d=1:s={self.width}x{self.height}:fps={self.fps},setsar=1"
+            )
+        else:
+            animated = normalization
+        video_filter = f"{video_source}{animated},format=yuv420p[video]"
+        if reveal_filter:
+            video_filter = f"{reveal_filter};{video_filter}"
+        return input_args, video_filter, len(paths)
+
+    async def render_scene_clip(self, scene: SceneMedia, output_clip_path: str) -> float:
+        """Render một cảnh, hiện dần bullet nếu có và khớp thời lượng hình với tiếng."""
         os.makedirs(os.path.dirname(output_clip_path), exist_ok=True)
         audio_duration = max(0.5, float(scene.duration_seconds or 0.0))
-        frames = max(13, math.ceil((audio_duration + 0.4) * 25))
-        clip_duration = frames / 25.0
-        dur_str = f"{clip_duration:.2f}"
+        frames = max(13, math.ceil((audio_duration + 0.4) * self.fps))
+        clip_duration = frames / float(self.fps)
+        dur_str = f"{clip_duration:.3f}"
+        visual_inputs, video_filter, audio_index = self._visual_inputs(
+            scene,
+            clip_duration=clip_duration,
+            frames=frames,
+        )
         cmd = [
             self.ffmpeg_bin,
             "-y",
-            "-loop",
-            "1",
-            "-framerate",
-            "25",
-            "-t",
-            dur_str,
-            "-i",
-            scene.slide_image_path,
+            *visual_inputs,
             "-i",
             scene.audio_path,
+            "-filter_complex",
+            video_filter,
+            "-map",
+            "[video]",
+            "-map",
+            f"{audio_index}:a",
             "-t",
             dur_str,
-            "-vf",
-            "fps=25,format=yuv420p",
             "-af",
             f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS",
             "-c:v",
             "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "19",
             "-tune",
-            "stillimage",
+            "animation" if scene.animation_path else "stillimage",
             "-pix_fmt",
             "yuv420p",
             "-r",
-            "25",
+            str(self.fps),
             "-c:a",
             "aac",
             "-b:a",
             "192k",
             "-ar",
-            "44100",
+            "48000",
             "-ac",
             "2",
             output_clip_path,
@@ -90,7 +187,7 @@ class VideoComposer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        _, stderr = await proc.communicate()
         if proc.returncode != 0:
             err_msg = stderr.decode("utf-8", errors="replace")
             logger.error("video_composer.scene_render_failed", error=err_msg)
@@ -124,7 +221,7 @@ class VideoComposer:
         return fallback
 
     async def concat_clips(self, clip_paths: Sequence[str], final_output_path: str) -> None:
-        """Ghép nối nhiều clip cảnh, encode lại một luồng AAC liên tục và +faststart."""
+        """Ghép các cảnh, chuẩn hóa âm lượng toàn video và tối ưu phát trực tuyến."""
         os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
         concat_list_path = os.path.join(os.path.dirname(final_output_path), "concat_list.txt")
 
@@ -144,10 +241,16 @@ class VideoComposer:
             concat_list_path,
             "-c:v",
             "copy",
+            "-af",
+            "loudnorm=I=-16:TP=-1.5:LRA=11",
             "-c:a",
             "aac",
             "-b:a",
             "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-movflags",
             "+faststart",
             final_output_path,
@@ -159,7 +262,7 @@ class VideoComposer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        _, stderr = await proc.communicate()
         if proc.returncode != 0:
             err_msg = stderr.decode("utf-8", errors="replace")
             logger.error("video_composer.concat_failed", error=err_msg)
@@ -203,9 +306,6 @@ class VideoComposer:
         work_dir: str,
         output_mp4_path: str,
     ) -> float:
-        """
-        Nhận danh sách SceneMedia, render từng clip cảnh và nối thành file MP4 hoàn chỉnh.
-        Trả về tổng thời lượng (giây).
-        """
+        """Nhận danh sách SceneMedia, dựng video và trả về tổng thời lượng giây."""
         result = await self.compose_video_with_timeline(scenes, work_dir, output_mp4_path)
         return result.duration_seconds

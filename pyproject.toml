@@ -35,6 +35,11 @@ content-generation-worker = "worker.runners.content_generation_worker:main"
 answer-grading-worker = "worker.runners.answer_grading_worker:main"
 micro-content-video-worker = "worker.runners.micro_content_video_worker:main"
 
+[project.optional-dependencies]
+video = [
+    "manim>=0.18.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=7.4.0",

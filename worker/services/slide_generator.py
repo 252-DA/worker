@@ -30,7 +30,6 @@ def _get_font(size: int, bold: bool = False) -> ImageFont.ImageFont | ImageFont.
         ] + FONT_CANDIDATES
     else:
         candidates = FONT_CANDIDATES
-
     for path in candidates:
         if os.path.exists(path):
             try:
@@ -65,9 +64,9 @@ def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int, draw: Image
 
 
 class SlideGenerator:
-    """Tạo slide ảnh 1280x720 cho các cảnh trong Micro Content bằng Pillow."""
+    """Tạo slide 1080p và các trạng thái hiện dần bullet cho từng cảnh."""
 
-    def __init__(self, width: int = 1280, height: int = 720) -> None:
+    def __init__(self, width: int = 1920, height: int = 1080) -> None:
         self.width = width
         self.height = height
 
@@ -79,84 +78,117 @@ class SlideGenerator:
         scene_index: int = 1,
         total_scenes: int = 1,
     ) -> str:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        return self._generate_slide(
+            title=title,
+            bullets=bullets,
+            output_path=output_path,
+            scene_index=scene_index,
+            total_scenes=total_scenes,
+            visible_bullet_count=None,
+        )
 
-        # Background canvas (Slate-950)
+    def generate_slide_states(
+        self,
+        title: str,
+        bullets: Sequence[str],
+        output_prefix: str,
+        scene_index: int = 1,
+        total_scenes: int = 1,
+    ) -> list[str]:
+        bullet_list = list(bullets)[:5]
+        paths: list[str] = []
+        for visible_count in range(len(bullet_list) + 1):
+            output_path = f"{output_prefix}_{visible_count:02d}.png"
+            paths.append(
+                self._generate_slide(
+                    title=title,
+                    bullets=bullet_list,
+                    output_path=output_path,
+                    scene_index=scene_index,
+                    total_scenes=total_scenes,
+                    visible_bullet_count=visible_count,
+                )
+            )
+        return paths
+
+    def _generate_slide(
+        self,
+        title: str,
+        bullets: Sequence[str],
+        output_path: str,
+        scene_index: int,
+        total_scenes: int,
+        visible_bullet_count: int | None,
+    ) -> str:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        scale = self.width / 1280
+
+        def s(value: int) -> int:
+            return round(value * scale)
+
         img = Image.new("RGB", (self.width, self.height), color=(15, 23, 42))
         draw = ImageDraw.Draw(img)
 
-        # Header bar / badge
-        badge_font = _get_font(18, bold=True)
-        title_font = _get_font(38, bold=True)
-        bullet_font = _get_font(24, bold=False)
+        badge_font = _get_font(s(18), bold=True)
+        title_font = _get_font(s(38), bold=True)
+        bullet_font = _get_font(s(24), bold=False)
 
-        # Inner Card container: x: 80, y: 60, w: 1120, h: 600
-        card_x0, card_y0 = 80, 60
-        card_x1, card_y1 = self.width - 80, self.height - 60
-        card_radius = 20
-
-        # Draw card background (Slate-900)
+        card_x0, card_y0 = s(80), s(60)
+        card_x1, card_y1 = self.width - s(80), self.height - s(60)
         draw.rounded_rectangle(
             [card_x0, card_y0, card_x1, card_y1],
-            radius=card_radius,
+            radius=s(20),
             fill=(30, 41, 59),
             outline=(51, 65, 85),
-            width=2,
+            width=s(2),
         )
-
-        # Top Accent gradient-like line (Blue-500)
         draw.rounded_rectangle(
-            [card_x0 + 20, card_y0 + 2, card_x1 - 20, card_y0 + 8],
-            radius=3,
+            [card_x0 + s(20), card_y0 + s(2), card_x1 - s(20), card_y0 + s(8)],
+            radius=s(3),
             fill=(59, 130, 246),
         )
 
-        # Scene counter badge (e.g. "CẢNH 1 / 3")
         badge_text = f"CẢNH {scene_index} / {total_scenes}"
         draw.text(
-            (card_x0 + 50, card_y0 + 35),
+            (card_x0 + s(50), card_y0 + s(35)),
             badge_text,
             fill=(96, 165, 250),
             font=badge_font,
         )
 
-        # Scene title (wrapped if necessary)
-        max_title_w = (card_x1 - card_x0) - 100
+        max_title_w = (card_x1 - card_x0) - s(100)
         title_lines = _wrap_text(title, title_font, max_title_w, draw)
-        curr_y = card_y0 + 75
-        for line in title_lines[:2]:  # max 2 lines for title
-            draw.text((card_x0 + 50, curr_y), line, fill=(248, 250, 252), font=title_font)
-            curr_y += 50
+        curr_y = card_y0 + s(75)
+        for line in title_lines[:2]:
+            draw.text((card_x0 + s(50), curr_y), line, fill=(248, 250, 252), font=title_font)
+            curr_y += s(50)
 
-        # Divider line
-        curr_y += 15
+        curr_y += s(15)
         draw.line(
-            [(card_x0 + 50, curr_y), (card_x1 - 50, curr_y)],
+            [(card_x0 + s(50), curr_y), (card_x1 - s(50), curr_y)],
             fill=(71, 85, 105),
-            width=1,
+            width=s(1),
         )
-        curr_y += 35
+        curr_y += s(35)
 
-        # Bullets
-        max_bullet_w = (card_x1 - card_x0) - 140
-        for bullet in bullets[:5]:  # max 5 bullets per slide to avoid clutter
+        max_bullet_w = (card_x1 - card_x0) - s(140)
+        visible_bullets = bullets if visible_bullet_count is None else bullets[:visible_bullet_count]
+        for bullet in visible_bullets[:5]:
             lines = _wrap_text(bullet, bullet_font, max_bullet_w, draw)
-            # Draw bullet icon
             draw.ellipse(
-                [card_x0 + 50, curr_y + 8, card_x0 + 60, curr_y + 18],
+                [card_x0 + s(50), curr_y + s(8), card_x0 + s(60), curr_y + s(18)],
                 fill=(59, 130, 246),
             )
-            for line_idx, line in enumerate(lines):
+            for line in lines:
                 draw.text(
-                    (card_x0 + 75, curr_y),
+                    (card_x0 + s(75), curr_y),
                     line,
                     fill=(226, 232, 240),
                     font=bullet_font,
                 )
-                curr_y += 36
-            curr_y += 12
+                curr_y += s(36)
+            curr_y += s(12)
 
-        # Save image
         img.save(output_path, "PNG")
         logger.info("slide_generator.saved", path=output_path, scene=scene_index)
         return output_path
@@ -167,20 +199,15 @@ def render_pdf_slide_page(
     page_number: int,
     output_path: str,
     *,
-    width: int = 1280,
-    height: int = 720,
+    width: int = 1920,
+    height: int = 1080,
 ) -> str:
-    """
-    Kết xuất trang slide gốc từ file PDF thành ảnh PNG kích thước chuẩn (mặc định 1280x720)
-    để video hiển thị đúng hình ảnh/biểu đồ của bài giảng thay vì thẻ chữ thuần.
-    """
+    """Kết xuất nguyên trang PDF thành ảnh 16:9, giữ nguyên hình và biểu đồ nguồn."""
     import pymupdf as fitz
 
     with fitz.open(pdf_path) as doc:
         if page_number < 1 or page_number > len(doc):
-            raise ValueError(
-                f"Slide page {page_number} out of bounds (total={len(doc)})"
-            )
+            raise ValueError(f"Slide page {page_number} out of bounds (total={len(doc)})")
         page = doc[page_number - 1]
         rect = page.rect
         zoom = min(width / max(1.0, rect.width), height / max(1.0, rect.height))

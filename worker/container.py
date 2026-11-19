@@ -603,7 +603,7 @@ def build_answer_grading_container(
 
 
 class MicroContentVideoContainer(BaseWorkerContainer):
-    """Phục vụ sinh video AI cho Micro Content (slide + giọng đọc + render)."""
+    """Phục vụ sinh video AI cho Micro Content (slide/Manim + giọng đọc + render)."""
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)

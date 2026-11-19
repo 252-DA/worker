@@ -216,6 +216,7 @@ class TestGenerateVideoScriptUseCase:
                 "slide_page": 2,
                 "bullets": ["Tập dữ liệu bất biến", "Chia phân vùng trên cụm"],
                 "narration": _valid_narration(52),
+                "visual": {"type": "bullet_reveal", "motion": "none"},
             },
             {
                 "title": "Lineage khôi phục",
@@ -228,6 +229,12 @@ class TestGenerateVideoScriptUseCase:
                 "slide_page": 3,
                 "bullets": ["Chờ action mới thực thi"],
                 "narration": _valid_narration(50),
+                "visual": {
+                    "type": "manim",
+                    "diagram": "flow",
+                    "items": ["Transformation", "Action"],
+                    "motion": "none",
+                },
             },
             {
                 "title": "Tổng kết dải trang",
@@ -312,9 +319,16 @@ class TestGenerateVideoScriptUseCase:
             "Tổng kết dải trang",
         ]
         assert scenes[0]["check"]["status"] == "VERIFIED"
+        assert scenes[0]["visual"] == {"type": "bullet_reveal", "motion": "none"}
         assert scenes[1]["check"]["status"] == "FLAGGED"
         assert "tham chiếu ngoài bài" in scenes[1]["check"]["reason"]
         assert scenes[2]["check"]["status"] == "VERIFIED"
+        assert scenes[2]["visual"] == {
+            "type": "manim",
+            "motion": "none",
+            "diagram": "flow",
+            "items": ["Transformation", "Action"],
+        }
         assert scenes[3]["check"]["status"] == "VERIFIED"
         assert scenes[3]["slide_page"] == 3
         assert len(resp.rejected) == 1

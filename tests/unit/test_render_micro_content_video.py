@@ -74,7 +74,14 @@ def make_use_case(publisher=None, tts_side_effect=(3.5, 4.2)):
     tts_client = MagicMock()
     tts_client.synthesize = AsyncMock(side_effect=tts_side_effect)
     slide_gen = MagicMock()
-    slide_gen.generate_slide.return_value = "slide.png"
+
+    def fake_slide_states(**kwargs):
+        return [
+            f"{kwargs['output_prefix']}_{idx:02d}.png"
+            for idx in range(len(kwargs["bullets"]) + 1)
+        ]
+
+    slide_gen.generate_slide_states.side_effect = fake_slide_states
 
     async def fake_compose(scenes, work_dir, output_mp4_path):
         # Use case đọc kích thước file đầu ra sau khi ghép.
@@ -83,6 +90,13 @@ def make_use_case(publisher=None, tts_side_effect=(3.5, 4.2)):
 
     video_composer = MagicMock()
     video_composer.compose_video = AsyncMock(side_effect=fake_compose)
+
+    async def fake_manim(**kwargs):
+        Path(kwargs["output_path"]).write_bytes(b"manim")
+        return kwargs["output_path"]
+
+    manim_generator = MagicMock()
+    manim_generator.generate = AsyncMock(side_effect=fake_manim)
     publisher = publisher if publisher is not None else RecordingResultPublisher()
     use_case = RenderMicroContentVideoUseCase(
         result_publisher=publisher,
@@ -90,6 +104,7 @@ def make_use_case(publisher=None, tts_side_effect=(3.5, 4.2)):
         tts_client=tts_client,
         slide_generator=slide_gen,
         video_composer=video_composer,
+        manim_generator=manim_generator,
     )
     return SimpleNamespace(
         use_case=use_case,
@@ -97,6 +112,8 @@ def make_use_case(publisher=None, tts_side_effect=(3.5, 4.2)):
         file_storage=file_storage,
         tts_client=tts_client,
         slide_gen=slide_gen,
+        video_composer=video_composer,
+        manim_generator=manim_generator,
     )
 
 
@@ -152,7 +169,11 @@ async def test_render_micro_content_video_success():
     assert data.duration_seconds == 7.7
     assert data.size_bytes == 3
     assert t.tts_client.synthesize.await_count == 2
-    assert t.slide_gen.generate_slide.call_count == 2
+    assert t.slide_gen.generate_slide_states.call_count == 2
+    scene_media = t.video_composer.compose_video.call_args.kwargs["scenes"]
+    assert [len(scene.slide_state_paths) for scene in scene_media] == [3, 2]
+    assert [len(scene.reveal_times_seconds) for scene in scene_media] == [2, 1]
+    assert all(scene.motion == "zoom_in" for scene in scene_media)
     # VTT tải lên trước, MP4 tải lên sau để không ghi đè file của lần render khác.
     assert t.file_storage.upload.call_count == 2
     assert t.file_storage.upload.call_args_list[0].args[1] == (
@@ -396,7 +417,6 @@ async def test_published_results_and_parsed_command_match_contract_schemas():
 
 @pytest.mark.asyncio
 async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
-    import builtins
     import sys
 
     from worker.services.tts_client import EdgeTtsClient
@@ -410,6 +430,8 @@ async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
     client = EdgeTtsClient()
     with pytest.raises(RuntimeError, match="Edge TTS failed"):
         await client.synthesize("Xin chào", str(tmp_path / "out.mp3"))
+    assert fake_edge.Communicate.call_count == 2
+    assert fake_edge.Communicate.call_args.args[1] == "vi-VN-HoaiMyNeural"
 
 
 @pytest.mark.asyncio
@@ -454,3 +476,212 @@ def test_build_webvtt_and_timeline_proportional_and_cues():
         {"scene_index": 0, "slide_page": 2, "title": "Mở đầu", "start_ms": 0, "end_ms": 3000, "duration_ms": 3000},
         {"scene_index": 1, "slide_page": 3, "title": "Kết luận", "start_ms": 3000, "end_ms": 5000, "duration_ms": 2000},
     ]
+
+
+def test_video_composer_builds_bullet_reveal_with_subtle_zoom():
+    from worker.services.video_composer import SceneMedia, VideoComposer
+
+    composer = VideoComposer()
+    inputs, video_filter, audio_index = composer._visual_inputs(
+        SceneMedia(
+            slide_image_path="final.png",
+            audio_path="audio.mp3",
+            duration_seconds=4.0,
+            slide_state_paths=("base.png", "one.png", "two.png"),
+            reveal_times_seconds=(0.8, 2.0),
+            motion="zoom_in",
+        ),
+        clip_duration=4.4,
+        frames=110,
+    )
+
+    assert inputs.count("-i") == 3
+    assert "0.800" in inputs
+    assert "1.200" in inputs
+    assert "2.400" in inputs
+    assert "concat=n=3:v=1:a=0" in video_filter
+    assert "zoompan=" in video_filter
+    assert audio_index == 3
+
+
+def test_video_composer_supports_static_legacy_scene():
+    from worker.services.video_composer import SceneMedia, VideoComposer
+
+    composer = VideoComposer()
+    inputs, video_filter, audio_index = composer._visual_inputs(
+        SceneMedia(
+            slide_image_path="slide.png",
+            audio_path="audio.mp3",
+            duration_seconds=4.0,
+            motion="none",
+        ),
+        clip_duration=4.4,
+        frames=110,
+    )
+
+    assert inputs.count("-i") == 1
+    assert "scale=1920:1080" in video_filter
+    assert "concat=" not in video_filter
+    assert "zoompan=" not in video_filter
+    assert audio_index == 1
+
+
+@pytest.mark.asyncio
+async def test_edge_tts_retries_the_same_voice_after_transient_failure(tmp_path, monkeypatch):
+    import sys
+
+    from worker.services.tts_client import EdgeTtsClient
+
+    class SuccessfulCommunication:
+        async def stream(self):
+            yield {"type": "audio", "data": b"mp3-audio"}
+
+    fake_edge = SimpleNamespace(
+        Communicate=MagicMock(
+            side_effect=[RuntimeError("temporary no audio"), SuccessfulCommunication()]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_edge)
+
+    client = EdgeTtsClient()
+    duration = await client.synthesize("Xin chào", str(tmp_path / "retry.mp3"))
+
+    assert duration >= 2.0
+    assert fake_edge.Communicate.call_count == 2
+    assert [
+        call.args[1] for call in fake_edge.Communicate.call_args_list
+    ] == ["vi-VN-HoaiMyNeural", "vi-VN-HoaiMyNeural"]
+
+
+
+@pytest.mark.asyncio
+async def test_render_manim_scene_uses_animation_instead_of_slide():
+    t = make_use_case(tts_side_effect=(4.0,))
+    script = {
+        "scenes": [
+            {
+                "title": "Luồng xử lý RDD",
+                "bullets": ["Transformation", "Action"],
+                "narration": "Transformation tạo RDD mới, còn action kích hoạt tính toán.",
+                "visual": {
+                    "type": "manim",
+                    "diagram": "flow",
+                    "items": ["RDD nguồn", "Transformation", "Action"],
+                    "motion": "zoom_in",
+                },
+            }
+        ]
+    }
+
+    result = await t.use_case.execute(request(script))
+
+    assert result.is_ok()
+    t.slide_gen.generate_slide_states.assert_not_called()
+    call = t.manim_generator.generate.await_args.kwargs
+    assert call["visual"].diagram == "flow"
+    assert call["visual"].items == ("RDD nguồn", "Transformation", "Action")
+    assert call["duration_seconds"] == pytest.approx(4.4)
+    scene_media = t.video_composer.compose_video.call_args.kwargs["scenes"][0]
+    assert scene_media.animation_path.endswith("manim_00.mp4")
+    assert scene_media.motion == "none"
+    assert scene_media.slide_state_paths == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "visual",
+    [
+        {"type": "manim", "items": ["Một", "Hai"]},
+        {"type": "manim", "diagram": "flow", "items": ["Một"]},
+        {"type": "manim", "diagram": "tree", "items": ["Gốc", "Nhánh"]},
+        {"type": "manim", "diagram": "flow", "items": ["Một", "x" * 81]},
+    ],
+)
+async def test_invalid_manim_spec_is_permanent_render_error(visual):
+    t = make_use_case(tts_side_effect=(4.0,))
+    script = {
+        "scenes": [
+            {
+                "title": "Sơ đồ sai",
+                "narration": "Nội dung cảnh.",
+                "visual": visual,
+            }
+        ]
+    }
+
+    result = await t.use_case.execute(request(script))
+
+    assert result.is_err()
+    assert isinstance(result.error, InvalidRenderRequest)
+    t.tts_client.synthesize.assert_not_awaited()
+    t.manim_generator.generate.assert_not_awaited()
+
+
+def test_video_composer_accepts_manim_movie():
+    from worker.services.video_composer import SceneMedia, VideoComposer
+
+    inputs, video_filter, audio_index = VideoComposer()._visual_inputs(
+        SceneMedia(
+            slide_image_path="unused.png",
+            audio_path="audio.mp3",
+            duration_seconds=4.0,
+            animation_path="diagram.mp4",
+        ),
+        clip_duration=4.4,
+        frames=110,
+    )
+
+    assert inputs == ["-i", "diagram.mp4"]
+    assert "tpad=stop_mode=clone" in video_filter
+    assert "trim=duration=4.400" in video_filter
+    assert "zoompan=" not in video_filter
+    assert audio_index == 1
+
+
+@pytest.mark.asyncio
+async def test_manim_generator_invokes_cli_with_validated_json(tmp_path, monkeypatch):
+    import json
+
+    from worker.services import manim_generator as module
+
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: object())
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            cmd = captured["cmd"]
+            media_dir = Path(cmd[cmd.index("--media_dir") + 1])
+            stem = cmd[cmd.index("--output_file") + 1]
+            output = media_dir / "videos" / "manim_diagram_scene" / "1080p25" / f"{stem}.mp4"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"manim-mp4")
+            return b"", b""
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", fake_exec)
+    output = tmp_path / "diagram.mp4"
+    result = await module.ManimGenerator().generate(
+        visual=module.ManimVisual(diagram="array", items=("RDD 1", "RDD 2")),
+        title="Mảng RDD",
+        duration_seconds=4.4,
+        output_path=str(output),
+    )
+
+    assert result == str(output)
+    assert output.read_bytes() == b"manim-mp4"
+    assert captured["cmd"][1:3] == ["-m", "manim"]
+    assert "1920,1080" in captured["cmd"]
+    assert captured["cmd"][-1] == "MicroContentDiagram"
+    spec = json.loads(captured["env"]["DA_MANIM_SPEC"])
+    assert spec == {
+        "title": "Mảng RDD",
+        "diagram": "array",
+        "items": ["RDD 1", "RDD 2"],
+        "duration_seconds": 4.4,
+    }

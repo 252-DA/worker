@@ -17,6 +17,8 @@ uv sync
 
 `uv` resolves `document-chunk` from the local sibling path `../packages-ai`, so worker and core stay in sync during development.
 
+Manim is an optional dependency for diagram scenes in micro-content videos. The Docker image already includes it. For a local Manim render, install Cairo, Pango and FFmpeg first, then run `uv sync --extra video`; the default unit-test environment does not need these native libraries.
+
 ## Run
 
 ```bash
@@ -25,6 +27,7 @@ uv run enrichment-worker
 uv run outbox-worker
 uv run content-generation-worker
 uv run answer-grading-worker
+uv run --extra video micro-content-video-worker
 ```
 
 `answer-grading-worker` consumes the `answer_grading` BullMQ queue: core-api

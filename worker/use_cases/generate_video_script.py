@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.exceptions import ProcessingError
@@ -109,11 +109,35 @@ def _strip_markdown(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+class _GeneratedVisual(BaseModel):
+    type: Literal["auto", "source_slide", "bullet_reveal", "manim"] = "auto"
+    motion: Literal["none", "zoom_in"] = "zoom_in"
+    diagram: Literal["flow", "array", "stack"] | None = None
+    items: list[str] | None = Field(default=None, max_length=6)
+
+    @field_validator("items")
+    @classmethod
+    def _clean_items(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return [_strip_markdown(value)[:80] for value in values if value and _strip_markdown(value)]
+
+    @model_validator(mode="after")
+    def _validate_manim(self) -> "_GeneratedVisual":
+        if self.type == "manim":
+            if self.diagram is None:
+                raise ValueError("manim visual requires a diagram")
+            if self.items is None or not 2 <= len(self.items) <= 6:
+                raise ValueError("manim visual requires 2 to 6 items")
+        return self
+
+
 class _GeneratedScene(BaseModel):
     title: str
     slide_page: int = Field(ge=1)
     bullets: list[str] = Field(default_factory=list, max_length=6)
     narration: str
+    visual: _GeneratedVisual | None = None
 
     @field_validator("title")
     @classmethod
@@ -621,7 +645,7 @@ def _scene_to_dict(
 ) -> dict[str, Any]:
     word_count = len(scene.narration.split())
     estimated_sec = max(12, round(word_count / 2.6))
-    return {
+    result = {
         "title": scene.title,
         "slide_page": slide_page,
         "bullets": list(scene.bullets),
@@ -636,3 +660,6 @@ def _scene_to_dict(
             "source_chunk_ids": list(source_chunk_ids[:20]),
         },
     }
+    if scene.visual is not None:
+        result["visual"] = scene.visual.model_dump(exclude_none=True)
+    return result

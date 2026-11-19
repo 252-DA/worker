@@ -171,6 +171,13 @@ def video_script_generation(
         "   - `bullets`: từ 1 đến 4 gạch đầu dòng súc tích hiển thị trên slide (giữ thuật ngữ chuyên ngành/tên riêng).\n"
         f"   - `narration`: lời giảng đọc tự nhiên bằng tiếng Việt, độ dài **BẮT BUỘC {min_words} đến {max_words} từ mỗi cảnh**, "
         "không chứa Markdown (`**`, `` ` ``, `#`), không emoji, không URL.\n"
+        "   - `visual`: storyboard trình bày gồm `type` và `motion`. Chọn `source_slide` khi cần giữ bố cục/hình/công thức "
+        "của trang gốc; chọn `bullet_reveal` khi các ý chính nên xuất hiện tuần tự. `motion` chỉ nhận `zoom_in` hoặc `none`; "
+        "dùng zoom nhẹ cho slide tĩnh, không thêm nội dung hình ảnh ngoài nguồn.\n"
+        "   Chỉ khi nguồn có quy trình hoặc cấu trúc dữ liệu rõ ràng, chọn `type=manim` với `diagram` là `flow`, `array` hoặc `stack`, "
+        "`items` gồm 2–6 nhãn ngắn BÁM NGUỒN (mỗi nhãn <= 80 ký tự) và `motion=none`. `flow` xếp bước từ trên xuống, "
+        "`array` từ trái sang, `stack` từ dưới lên; không dùng Manim để thay một danh sách ý thông thường.\n"
+        "   Ví dụ visual quy trình: {\"type\":\"manim\",\"diagram\":\"flow\",\"items\":[\"Bước nguồn\",\"Bước đích\"],\"motion\":\"none\"}.\n"
         "4. QUY TẮC NGÔN NGỮ:\n"
         "   - Giảng hoàn toàn bằng tiếng Việt tự nhiên.\n"
         "   - Giữ nguyên tên riêng và thuật ngữ kỹ thuật phổ biến (ví dụ: Spark, RDD, SparkContext, JVM, HDFS, API, SQL).\n"
@@ -182,7 +189,7 @@ def video_script_generation(
         "(c) khẳng định sự thật/kiến thức mới ngoài slide; "
         "(d) cụm từ tham chiếu ngoài bài như 'trong bài trước', 'ở phần sau', 'video tiếp theo'.\n\n"
         "Trả về ĐÚNG JSON:\n"
-        '{"scenes":[{"title":"...","slide_page":1,"bullets":["..."],"narration":"..."}]}'
+        '{"scenes":[{"title":"...","slide_page":1,"bullets":["..."],"narration":"...","visual":{"type":"bullet_reveal","motion":"zoom_in"}}]}'
     )
     return Prompt(
         name="micro_video_script_generation",
@@ -206,6 +213,7 @@ def video_script_verification(
             f"[Cảnh index={idx}] slide_page={scene.slide_page}\n"
             f"Title: {scene.title}\n"
             f"Bullets: {json.dumps(list(scene.bullets), ensure_ascii=False)}\n"
+            f"Visual: {json.dumps(scene.visual.model_dump(exclude_none=True) if scene.visual else None, ensure_ascii=False)}\n"
             f"Narration: {scene.narration}"
         )
     scenes_block = "\n\n".join(rendered_scenes)
@@ -256,10 +264,11 @@ def video_script_regeneration(
         "YÊU CẦU VIẾT LẠI CẢNH NÀY:\n"
         f"- Giữ `slide_page` trong [{page_from}, {page_to}].\n"
         "- Tối đa 4 gạch đầu dòng trong `bullets`.\n"
+        "- Giữ nguyên `visual` nếu đã hợp lệ; với `manim`, `diagram` và `items` phải tiếp tục bám nguồn.\n"
         f"- `narration` tiếng Việt tự nhiên từ **{min_words} đến {max_words} từ**, không Markdown, không URL.\n"
         "- Loại bỏ toàn bộ số liệu/tên riêng/khẳng định ngoài slide và không nhắc 'bài trước'/'bài sau'.\n\n"
         "Trả về ĐÚNG JSON cho 1 cảnh:\n"
-        '{"title":"...","slide_page":1,"bullets":["..."],"narration":"..."}'
+        '{"title":"...","slide_page":1,"bullets":["..."],"narration":"...","visual":{"type":"bullet_reveal","motion":"zoom_in"}}'
     )
     return Prompt(
         name="micro_video_script_regeneration",

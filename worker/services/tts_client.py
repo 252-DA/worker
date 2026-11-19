@@ -129,19 +129,12 @@ class EdgeTtsClient(TtsClient):
         try:
             import edge_tts  # type: ignore
 
-            # Danh sách giọng ưu tiên: giọng chính -> giọng phụ
-            candidate_voices = [voice]
-            if voice == "vi-VN-HoaiMyNeural":
-                candidate_voices.append("vi-VN-NamMinhNeural")
-            elif voice == "vi-VN-NamMinhNeural":
-                candidate_voices.append("vi-VN-HoaiMyNeural")
-
             last_error: Exception | None = None
-            for v in candidate_voices:
+            for attempt in range(2):
                 try:
                     communicate = edge_tts.Communicate(
                         clean_text,
-                        v,
+                        voice,
                         boundary="SentenceBoundary",
                     )
                     audio_buf = bytearray()
@@ -178,16 +171,23 @@ class EdgeTtsClient(TtsClient):
                     logger.info(
                         "edge_tts.synthesized",
                         path=output_path,
-                        voice=v,
+                        voice=voice,
                         duration=duration,
                         cues=len(cues),
                     )
                     return SynthesisResult(duration_seconds=duration, cues=cues)
                 except Exception as voice_err:
                     last_error = voice_err
-                    logger.warning("edge_tts.voice_failed", voice=v, error=str(voice_err))
+                    logger.warning(
+                        "edge_tts.voice_failed",
+                        voice=voice,
+                        attempt=attempt + 1,
+                        error=str(voice_err),
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(0.4)
 
-            raise RuntimeError(f"All Edge TTS voices failed: {last_error}")
+            raise RuntimeError(f"Edge TTS voice '{voice}' failed: {last_error}")
         except Exception as exc:
             if self._fallback is None:
                 logger.error("edge_tts.failed", voice=voice, error=str(exc))

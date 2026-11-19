@@ -8,6 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
+        pkg-config \
+        libcairo2-dev \
+        libpango1.0-dev \
         zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
@@ -35,7 +38,7 @@ COPY worker/worker/ /app/worker/worker/
 WORKDIR /app/worker
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev --extra video
 
 # Pin the tokenizer snapshot used to enforce the BGE-m3 input budget offline.
 RUN .venv/bin/python -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('BAAI/bge-m3', revision='5617a9f61b028005a4858fdac845db406aefb181').save('/app/bge-m3-tokenizer.json')"
@@ -55,6 +58,9 @@ RUN apt-get update && \
         # Render video micro-content: ffmpeg ghép cảnh, DejaVu cho chữ trên slide.
         ffmpeg \
         fonts-dejavu-core \
+        # Manim dùng Cairo/Pango để dựng sơ đồ, không cần LaTeX cho Text.
+        libcairo2 \
+        libpango-1.0-0 \
         # opencv-python (docling OCR) needs these at import time; without
         # them OCR fails with "libGL.so.1: cannot open shared object file".
         libgl1 \
@@ -66,5 +72,5 @@ COPY --from=builder /app /app
 
 WORKDIR /app/worker
 
-ENTRYPOINT ["uv", "run", "--frozen", "python", "-m"]
+ENTRYPOINT ["uv", "run", "--frozen", "--extra", "video", "python", "-m"]
 CMD ["worker.runners.document_worker"]

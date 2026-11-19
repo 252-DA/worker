@@ -1,5 +1,5 @@
 """
-Render video AI cho Micro Content: slide + giọng đọc + ghép FFmpeg → object
+Render video AI cho Micro Content: slide/Manim + giọng đọc + ghép FFmpeg → object
 storage, rồi gửi MICRO_CONTENT_VIDEO_RESULT về core-api.
 
 Worker không ghi ``micro_contents`` hay ``video_assets``: core-api áp dụng kết
@@ -20,6 +20,7 @@ from document_chunk.domain.ports.file_storage import IFileStorage
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
+from worker.services.manim_generator import ManimGenerator, parse_manim_visual
 from worker.services.micro_content_subtitles import (
     SubtitleCue,
     build_webvtt_and_timeline,
@@ -111,6 +112,15 @@ def _is_pdf_document(key: str | None, mime: str | None) -> bool:
     return key.lower().endswith(".pdf")
 
 
+def _bullet_reveal_times(duration_seconds: float, bullet_count: int) -> tuple[float, ...]:
+    if bullet_count <= 0:
+        return ()
+    start = min(0.8, max(0.2, duration_seconds * 0.1))
+    last_start = max(start, duration_seconds * 0.78)
+    interval = (last_start - start) / max(1, bullet_count - 1)
+    return tuple(round(start + idx * interval, 3) for idx in range(bullet_count))
+
+
 def _scenes_of(script: Any) -> tuple[list[dict], str]:
     if not script or not isinstance(script, dict):
         raise InvalidRenderRequest("No valid script found for this render request")
@@ -130,12 +140,14 @@ class RenderMicroContentVideoUseCase:
         tts_client: TtsClient | None = None,
         slide_generator: SlideGenerator | None = None,
         video_composer: VideoComposer | None = None,
+        manim_generator: ManimGenerator | None = None,
     ) -> None:
         self.result_publisher = result_publisher
         self.file_storage = file_storage
         self.tts_client = tts_client or get_default_tts_client()
         self.slide_generator = slide_generator or SlideGenerator()
         self.video_composer = video_composer or VideoComposer()
+        self.manim_generator = manim_generator or ManimGenerator()
 
     async def execute(
         self, request: RenderMicroContentVideoRequest
@@ -182,8 +194,8 @@ class RenderMicroContentVideoUseCase:
                             error=str(exc),
                         )
 
-                slide_width = getattr(self.slide_generator, "width", 1280)
-                slide_height = getattr(self.slide_generator, "height", 720)
+                slide_width = getattr(self.slide_generator, "width", 1920)
+                slide_height = getattr(self.slide_generator, "height", 1080)
 
                 for idx, scene in enumerate(scenes):
                     title = scene.get("title", f"Cảnh {idx + 1}")
@@ -191,12 +203,29 @@ class RenderMicroContentVideoUseCase:
                     narration = scene.get("narration") or title
                     voice = scene.get("voice") or script_voice
                     slide_page = _scene_slide_page(scene)
+                    raw_visual = scene.get("visual")
+                    visual = raw_visual if isinstance(raw_visual, dict) else {}
+                    visual_type = visual.get("type") or "auto"
+                    try:
+                        manim_visual = parse_manim_visual(visual)
+                    except ValueError as exc:
+                        return Err(InvalidRenderRequest(f"Cảnh {idx + 1}: {exc}"))
+                    motion = (
+                        "none"
+                        if manim_visual is not None
+                        else visual.get("motion") if visual.get("motion") in ("none", "zoom_in") else "zoom_in"
+                    )
 
                     slide_img_path = os.path.join(temp_dir, f"slide_{idx:02d}.png")
                     audio_path = os.path.join(temp_dir, f"audio_{idx:02d}.mp3")
+                    slide_state_paths: tuple[str, ...] = ()
 
                     rendered_from_pdf = False
-                    if local_pdf_path is not None and slide_page is not None:
+                    if (
+                        local_pdf_path is not None
+                        and slide_page is not None
+                        and visual_type not in ("bullet_reveal", "manim")
+                    ):
                         try:
                             render_pdf_slide_page(
                                 str(local_pdf_path),
@@ -213,14 +242,19 @@ class RenderMicroContentVideoUseCase:
                                 error=str(exc),
                             )
 
-                    if not rendered_from_pdf:
-                        self.slide_generator.generate_slide(
-                            title=title,
-                            bullets=bullets,
-                            output_path=slide_img_path,
-                            scene_index=idx + 1,
-                            total_scenes=total_scenes,
+                    if not rendered_from_pdf and manim_visual is None:
+                        slide_state_paths = tuple(
+                            self.slide_generator.generate_slide_states(
+                                title=title,
+                                bullets=bullets,
+                                output_prefix=os.path.join(temp_dir, f"slide_{idx:02d}_state"),
+                                scene_index=idx + 1,
+                                total_scenes=total_scenes,
+                            )
                         )
+                        if not slide_state_paths:
+                            raise RuntimeError(f"Không tạo được hình cho cảnh {idx + 1}")
+                        slide_img_path = slide_state_paths[-1]
 
                     tts_text = normalize_for_tts(narration) or narration
                     if use_cue_tts:
@@ -239,12 +273,30 @@ class RenderMicroContentVideoUseCase:
                         )
                         scene_cues.append([])
 
+                    animation_path: str | None = None
+                    if manim_visual is not None:
+                        animation_path = await self.manim_generator.generate(
+                            visual=manim_visual,
+                            title=title,
+                            duration_seconds=duration + 0.4,
+                            output_path=os.path.join(temp_dir, f"manim_{idx:02d}.mp4"),
+                        )
+
                     speech_durations_ms.append(max(400, round(duration * 1000)))
+                    reveal_times = (
+                        _bullet_reveal_times(duration, len(slide_state_paths) - 1)
+                        if len(slide_state_paths) > 1
+                        else ()
+                    )
                     scene_media_list.append(
                         SceneMedia(
                             slide_image_path=slide_img_path,
                             audio_path=audio_path,
                             duration_seconds=duration,
+                            slide_state_paths=slide_state_paths,
+                            reveal_times_seconds=reveal_times,
+                            motion=motion,
+                            animation_path=animation_path,
                         )
                     )
 
