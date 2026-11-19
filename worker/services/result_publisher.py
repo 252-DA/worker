@@ -50,7 +50,7 @@ CURRICULUM_IMPORT_RESULT = "CURRICULUM_IMPORT_RESULT"
 MICRO_CONTENT_VIDEO_RESULT = "MICRO_CONTENT_VIDEO_RESULT"
 DOCUMENT_PROCESSING_RESULT = "DOCUMENT_PROCESSING_RESULT"
 
-# Khớp WORKER_RESULT_KINDS ở core-api/src/worker-results/worker-results.constants.ts
+# Khớp WORKER_RESULT_KINDS ở core-api/src/messaging/worker-results/worker-results.constants.ts
 # và enum `kind` của schema envelope; test hai phía đối chiếu với schema.
 WORKER_RESULT_KINDS: tuple[str, ...] = (
     QUIZ_GRADING_RESULT,

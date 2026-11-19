@@ -3,7 +3,7 @@ Prompt sinh câu hỏi theo LO (``GenerateCurriculumQuizUseCase``).
 
 Ba bước: sinh một mẻ câu, kiểm tra từng câu với đoạn nguồn, viết lại câu bị loại.
 Mỗi mẻ một kiểu câu; phần khác nhau giữa các kiểu nằm trong ``_KINDS``. Dạng
-đáp án lưu xuống DB của từng kiểu: core-api ``quiz/question-types.ts``.
+đáp án lưu xuống DB của từng kiểu: core-api ``src/modules/question/question-types.ts``.
 """
 import json
 from collections.abc import Callable, Sequence

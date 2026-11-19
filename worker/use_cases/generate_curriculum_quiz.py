@@ -252,7 +252,7 @@ def _answer_key_problem(
 ) -> str | None:
     """
     Lý do câu sẽ bị core-api từ chối (``normalizeAnswerKey`` trong
-    core-api/src/quiz/question-types.ts), hoặc None nếu hợp lệ.
+    core-api/src/modules/question/question-types.ts), hoặc None nếu hợp lệ.
 
     core-api kiểm cả mẻ chặt và từ chối cả kết quả nếu một câu sai dạng; lọc
     trước ở đây để một câu hỏng không làm mất cả mẻ. Schema Pydantic đã bắt gần

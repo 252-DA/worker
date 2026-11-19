@@ -4,7 +4,7 @@ Trạng thái và chương của tài liệu → core-api qua ``worker_results``
 `documents` là bảng của core-api: worker không UPDATE nữa mà gửi kết quả
 DOCUMENT_PROCESSING_RESULT (contracts/integration-events/v1/
 document-processing-result.json); core-api
-(src/document/document-processing-result.handler.ts) ghi.
+(src/modules/document/handlers/document-processing-result.handler.ts) ghi.
 
 Kết quả đi qua hàng đợi nên có thể đến trễ hoặc lệch thứ tự (handler bên
 core-api retry). Mỗi báo trạng thái mang đủ dữ kiện để core-api xếp thứ tự:
