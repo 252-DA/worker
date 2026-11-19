@@ -24,7 +24,15 @@ uv run document-worker
 uv run enrichment-worker
 uv run outbox-worker
 uv run content-generation-worker
+uv run answer-grading-worker
 ```
+
+`answer-grading-worker` consumes the `answer_grading` BullMQ queue: core-api
+emits `ANSWER_GRADING_REQUESTED` when a submission contains short-answer
+questions, and the worker grades each answer against the question frozen at
+submit time, using the judge model (`LLM_PROFILE__QUIZ_VERIFICATION`). It runs
+apart from `content-generation-worker` so learners waiting for a grade never
+queue behind quiz generation. Set `WORKER_TYPE=answer_grading`.
 
 `content-generation-worker` consumes the `content_generation` BullMQ queue,
 retrieves LO-grounded source chunks from MCP, calls the configured model

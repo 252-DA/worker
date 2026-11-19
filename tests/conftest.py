@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.support import as_llm_client
 from document_chunk.domain.entities.chunk import Chunk, ChunkMetadata
 from document_chunk.domain.entities.document import Document, DocumentType, ElementType, ParsedDocument, Section
 from document_chunk.domain.entities.embedding import Embedding
@@ -177,22 +178,21 @@ def mock_metadata_store(
     sample_document_context: StoredDocumentContext,
 ) -> MagicMock:
     store = MagicMock()
-    store.upsert_document.return_value = Ok(None)
-    store.update_document_status.return_value = Ok(None)
     store.upsert_chunks.return_value = Ok(None)
     store.upsert_chunks_with_outbox.return_value = Ok(None)
     store.get_document_context.return_value = Ok(sample_document_context)
     store.list_chunks.return_value = Ok([sample_stored_chunk_metadata])
     store.upsert_concepts.return_value = Ok(None)
     store.upsert_chunk_concepts.return_value = Ok(None)
-    store.persist_enrichment_batch.return_value = Ok("event-001")
-    store.persist_curriculum_quiz_items.return_value = Ok(None)
+    store.persist_concept_enrichment.return_value = Ok("event-001")
+    store.soft_delete_document_chunks.return_value = Ok(0)
+    store.record_llm_usage.return_value = Ok(None)
     store.list_lesson_cards.return_value = Ok([])
     store.list_quiz_items.return_value = Ok([])
     store.get.return_value = Ok(sample_document)
     store.list.return_value = Ok([sample_document])
-    store.delete.return_value = Ok(None)
     store.get_document_status.return_value = Ok(None)
+    store.get_document_processing_generation.return_value = Ok(None)
     return store
 
 
@@ -217,4 +217,4 @@ def mock_job_queue() -> MagicMock:
 def mock_llm_client() -> MagicMock:
     client = MagicMock()
     client.model_id = "gemini-test"
-    return client
+    return as_llm_client(client)

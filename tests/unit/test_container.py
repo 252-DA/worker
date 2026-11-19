@@ -94,6 +94,8 @@ class TestBuildFunctions:
         settings = WorkerSettings()
         parsers = build_parsers(settings)
         assert len(parsers) == 4  # PDF, DOCX, PPTX, Markdown
+        from document_chunk.adapters.parsers.adaptive_pdf_parser import AdaptivePdfParser
+        assert isinstance(parsers[0], AdaptivePdfParser)
 
     def test_build_chunker(self):
         settings = WorkerSettings()
@@ -195,3 +197,15 @@ class TestBuilderShortcuts:
         container = build_outbox_container(settings)
         assert isinstance(container, OutboxWorkerContainer)
         container.close()
+
+
+def test_structural_chunker_selected_from_settings(tmp_path, monkeypatch):
+    from tokenizers import Tokenizer, models
+    from worker.config import WorkerSettings
+    from worker.container import build_chunker
+    from document_chunk.adapters.chunkers.structural import StructuralChunker
+    path = tmp_path/'tokenizer.json'
+    Tokenizer(models.WordLevel({'[UNK]': 0}, unk_token='[UNK]')).save(str(path))
+    monkeypatch.setenv('CHUNKER__STRATEGY', 'structural')
+    monkeypatch.setenv('CHUNKER__TOKENIZER_PATH', str(path))
+    assert isinstance(build_chunker(WorkerSettings()), StructuralChunker)

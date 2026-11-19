@@ -1,70 +1,25 @@
-name: worker
+name: ci
+
+# Test repo này trên layout meta-repo: lấy da-platform nhánh dev làm nền
+# (đủ repo anh em + contracts), đặt commit đang test vào worker/, rồi chạy
+# scripts/ci/test-component.sh worker. Định nghĩa đầy đủ:
+# 252-DA/da-platform/.github/workflows/component.yaml.
+#
+# Không còn SHA repo anh em ghim cứng ở đây (nguyên nhân CI đỏ từ 09/2026).
+# PR cần sửa đồng thời repo khác thì CI ở đây đỏ cho tới khi repo kia vào dev;
+# kết quả chuẩn là CI của PR meta-repo bump gitlink cả hai.
 
 on:
   push:
-    branches: [master]
+    branches: [dev, master]
   pull_request:
   workflow_dispatch:
 
-# Image ~9GB (torch/docling) vượt quota GHCR private free (500MB) →
-# CI chỉ BUILD để validate Dockerfile, chưa push. Khi slim image xong
-# (torch CPU-only, multi-stage) thì chọn registry và bật push lại
-# (cần thêm permissions: packages: write + bước docker/login-action).
 permissions:
   contents: read
 
-env:
-  IMAGE: ghcr.io/252-da/worker
-
 jobs:
   test:
-    runs-on: ubuntu-latest
-    steps:
-      # Tái tạo layout ~/DA: worker/, packages-ai/ và ai-sdk/ nằm cạnh nhau
-      - uses: actions/checkout@v4
-        with:
-          path: worker
-
-      - uses: 252-DA/core-chunking/.github/actions/materialize@a82c16963c8cebb79d543e31e1a328d18ad78e0e
-        with:
-          path: packages-ai
-
-      - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
-        with:
-          path: ai-sdk
-
-      - uses: astral-sh/setup-uv@v5
-
-      - name: Install deps
-        working-directory: worker
-        run: uv sync --frozen --python 3.10
-
-      - name: Run unit tests
-        working-directory: worker
-        run: uv run pytest tests/unit -q
-
-  build-image:
-    # PR chỉ cần test; build+push image chỉ khi code thật sự vào master
-    if: github.event_name != 'pull_request'
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: worker
-
-      - uses: 252-DA/core-chunking/.github/actions/materialize@a82c16963c8cebb79d543e31e1a328d18ad78e0e
-        with:
-          path: packages-ai
-
-      - uses: 252-DA/ai-sdk/.github/actions/materialize@e4fc97d87e23b3a63eab53c489e325bdc117f923
-        with:
-          path: ai-sdk
-
-      - uses: docker/build-push-action@v6
-        with:
-          # context = workspace root (chứa cả worker/ lẫn packages-ai/) — đúng thiết kế Dockerfile
-          context: .
-          file: worker/Dockerfile
-          push: false
-          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+    uses: 252-DA/da-platform/.github/workflows/component.yaml@dev
+    with:
+      component: worker

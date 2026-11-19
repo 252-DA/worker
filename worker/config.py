@@ -8,7 +8,14 @@ from document_chunk.infrastructure.config import Settings as CoreSettings
 
 
 class WorkerRuntimeConfig(BaseSettings):
-    type: Literal["document", "enrichment", "outbox", "content_generation"] = "document"
+    type: Literal[
+        "document",
+        "enrichment",
+        "outbox",
+        "content_generation",
+        "answer_grading",
+        "micro_content_video",
+    ] = "document"
     concurrency: int = 3
     shutdown_grace_seconds: float = 30.0
     service_name: str | None = None
@@ -30,7 +37,7 @@ class HealthConfig(BaseSettings):
 
 class LearningContextMcpConfig(BaseSettings):
     enabled: bool = False
-    url: str = "http://mcp-server:8001/mcp"
+    url: str = "http://mcp-service:8001/mcp"
     timeout_seconds: float = 30
     fallback_to_local: bool = True
 
@@ -108,6 +115,8 @@ def get_worker_settings(
         "enrichment",
         "outbox",
         "content_generation",
+        "answer_grading",
+        "micro_content_video",
     ]
     | None = None,
 ) -> WorkerSettings:

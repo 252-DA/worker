@@ -7,6 +7,8 @@ Assumes:
   - file_path is a local temp file downloaded from MinIO by the worker
 
 Delegates the full parse → chunk → embed → upsert → graph cycle to PipelineCore.
+Status transitions go to core-api as DOCUMENT_PROCESSING_RESULT (worker_results
+queue); the worker never writes the ``documents`` table itself.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,11 @@ from document_chunk.shared.metrics import ACTIVE_REQUESTS
 from document_chunk.shared.result import Err, Ok, Result
 from document_chunk.shared.tracing import get_tracer
 
+from worker.services.document_reporter import (
+    STAGE_PROCESSING,
+    PublishingDocumentStatusReporter,
+)
+
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
@@ -39,6 +46,10 @@ class RunPipelineRequest:
     original_file_name: str
     language: str | None = None
     metadata: dict | None = None
+    # Lượt xử lý core-api cấp (job process_document mang theo) và lần chạy của
+    # job BullMQ: core-api dùng để không cho kết quả cũ đè trạng thái mới.
+    processing_generation: int = 0
+    attempt: int = 1
 
 
 @dataclass
@@ -57,9 +68,14 @@ class RunPipelineUseCase:
         vector_store: IVectorStore,
         metadata_store: IMetadataStore,
         job_queue: IJobQueue,
+        result_publisher,
         preprocessors: list[IPreprocessor] | None = None,
+        map_chunks_to_los_use_case=None,
     ) -> None:
         self._job_queue = job_queue
+        self._metadata_store = metadata_store
+        self._result_publisher = result_publisher
+        self._map_chunks_to_los = map_chunks_to_los_use_case
         self._pipeline = PipelineCore(
             parsers=parsers,
             chunker=chunker,
@@ -96,10 +112,18 @@ class RunPipelineUseCase:
                     mime_type=MIME_MAP.get(doc_type, "application/octet-stream"),
                 )
 
+                status_reporter = PublishingDocumentStatusReporter(
+                    self._result_publisher,
+                    self._metadata_store,
+                    stage=STAGE_PROCESSING,
+                    processing_generation=request.processing_generation,
+                    attempt=request.attempt,
+                )
                 core_result = self._pipeline.run(
                     document=document,
                     metadata=metadata,
                     language=request.language,
+                    status_reporter=status_reporter,
                 )
 
                 if core_result.is_err():
@@ -117,7 +141,8 @@ class RunPipelineUseCase:
                     chunks=len(core.chunks),
                     duration_ms=round(core.duration_ms, 2),
                 )
-                self._enqueue_enrichment(document_id)
+                self._map_chunks_to_los_best_effort(document_id)
+                self._enqueue_enrichment(document_id, request.processing_generation)
                 return Ok(
                     RunPipelineResponse(
                         document_id=document_id,
@@ -128,9 +153,66 @@ class RunPipelineUseCase:
         finally:
             ACTIVE_REQUESTS.dec()
 
-    def _enqueue_enrichment(self, document_id: str) -> None:
+    def _map_chunks_to_los_best_effort(self, document_id: str) -> None:
+        """
+        Gắn chunk vừa index với chuẩn đầu ra của học phần.
+
+        Đây là chỗ `chunk_lo_mappings` được ghi. Trước đây `MapChunksToLosUseCase`
+        chỉ được khai báo trong container mà không nơi nào gọi, nên bảng luôn
+        rỗng: sinh quiz theo LO báo "No grounded source chunks", còn enrichment
+        sinh xong rồi INSERT ... SELECT ra 0 dòng và mất im lặng.
+
+        Best-effort: tài liệu đã index xong và đã nằm trong Qdrant/Postgres;
+        không map được thì để lần chạy sau hoặc backfill, không huỷ cả pipeline.
+        """
+        if self._map_chunks_to_los is None:
+            return
+
+        context_result = self._metadata_store.get_document_context(document_id)
+        if context_result.is_err():
+            logger.warning(
+                "run_pipeline.lo_mapping_context_failed",
+                document_id=document_id,
+                error=str(context_result.error),
+            )
+            return
+
+        context = context_result.unwrap()
+        course_id = getattr(context, "course_id", None) if context else None
+        if not course_id:
+            # Tài liệu chưa gắn học phần thì không có đề cương để đối chiếu.
+            logger.debug("run_pipeline.lo_mapping_skipped", document_id=document_id)
+            return
+
+        from document_chunk.application.use_cases.map_chunks_to_los import (
+            MapChunksToLosRequest,
+        )
+
+        result = self._map_chunks_to_los.execute(
+            MapChunksToLosRequest(document_id=document_id, course_id=course_id)
+        )
+        if result.is_err():
+            logger.warning(
+                "run_pipeline.lo_mapping_failed",
+                document_id=document_id,
+                course_id=course_id,
+                error=str(result.error),
+            )
+            return
+
+        logger.info(
+            "run_pipeline.lo_mapping_done",
+            document_id=document_id,
+            course_id=course_id,
+            mappings=result.unwrap().mapping_count,
+        )
+
+    def _enqueue_enrichment(self, document_id: str, processing_generation: int) -> None:
         enqueue_result = self._job_queue.enqueue_enrichment(
-            EnrichmentJobPayload(document_id=document_id)
+            EnrichmentJobPayload(
+                document_id=document_id,
+                processing_generation=processing_generation,
+            )
         )
         if enqueue_result.is_err():
             logger.warning(
