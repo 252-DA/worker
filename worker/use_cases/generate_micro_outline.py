@@ -88,7 +88,10 @@ class _OutlineSectionItem(BaseModel):
 
 
 class _OutlinePayload(BaseModel):
-    sections: list[_OutlineSectionItem] = Field(min_length=1, max_length=MAX_OUTLINE_SECTIONS)
+    # Không chặn trần số mục ở đây: bộ slide dài (vd. 101 trang) model hay trả
+    # > MAX_OUTLINE_SECTIONS mục, chặn bằng schema thì cả yêu cầu FAILED. Trần
+    # của contract được giữ ở validate_and_normalize_sections bằng cách gộp mục.
+    sections: list[_OutlineSectionItem] = Field(min_length=1)
 
 
 @dataclass(frozen=True)
@@ -161,18 +164,7 @@ def _normalize_pages(
                 }
             )
     chunks_by_page: dict[int, list[StoredChunkMetadata]] = {}
-    if raw_pages:
-        for idx, p in enumerate(raw_pages, start=1):
-            pno = int(p.get("page_number") or idx)
-            if pno < 1:
-                continue
-            by_page.setdefault(pno, []).append(
-                {
-                    "heading": str(p.get("heading") or "").strip(),
-                    "text": str(p.get("text") or "").strip(),
-                }
-            )
-    else:
+    if not raw_pages:
         for idx, c in enumerate(chunks, start=1):
             pno = int(c.page_number) if c.page_number and c.page_number >= 1 else idx
             chunks_by_page.setdefault(pno, []).append(c)
@@ -310,6 +302,30 @@ def _merge_sparse_sections(
     return merged
 
 
+def _cap_section_count(
+    sections: list[OutlineSection],
+    *,
+    page_char_counts: dict[int, int],
+    max_sections: int = MAX_OUTLINE_SECTIONS,
+) -> list[OutlineSection]:
+    """
+    Ép số mục về <= max_sections (trần của contract content-generation-result và
+    core-api). Mỗi lượt gộp cặp mục liền kề có tổng chữ nhỏ nhất (hòa thì cặp ít
+    trang hơn) để các mục sau khi gộp vẫn cân đối; không bỏ trang nào.
+    """
+    merged = list(sections)
+    while len(merged) > max_sections:
+        best = min(
+            range(len(merged) - 1),
+            key=lambda i: (
+                _section_char_count(merged[i].page_from, merged[i + 1].page_to, page_char_counts),
+                merged[i + 1].page_to - merged[i].page_from,
+            ),
+        )
+        merged[best : best + 2] = [_merge_two_sections(merged[best], merged[best + 1], page_char_counts)]
+    return merged
+
+
 def validate_and_normalize_sections(
     raw_sections: list[_OutlineSectionItem],
     *,
@@ -321,13 +337,15 @@ def validate_and_normalize_sections(
     """
     Kiểm tra dải trang hợp lệ [1, total_pages], không lộn ngược, không chồng lấn,
     bỏ trang bìa/kết thúc thuần túy, gộp các mục quá thưa chữ và chỉ giữ suggested_lo_id hợp lệ.
+    Model trả nhiều hơn MAX_OUTLINE_SECTIONS mục thì gộp bớt (không cắt đuôi: cắt
+    đuôi làm mất các trang cuối của bộ slide).
     """
     ordered = sorted(raw_sections, key=lambda s: (s.page_from, s.page_to))
     normalized: list[OutlineSection] = []
     last_end = 0
     texts = page_texts or {}
 
-    for item in ordered[:MAX_OUTLINE_SECTIONS]:
+    for item in ordered:
         p_from = max(1, min(item.page_from, total_pages))
         p_to = max(1, min(item.page_to, total_pages))
         if p_to < p_from:
@@ -384,7 +402,7 @@ def validate_and_normalize_sections(
         total_pages=total_pages,
         page_char_counts=page_char_counts,
     )
-    return tuple(merged)
+    return tuple(_cap_section_count(merged, page_char_counts=page_char_counts))
 
 
 class GenerateMicroOutlineUseCase:
@@ -460,6 +478,7 @@ class GenerateMicroOutlineUseCase:
             total_pages=total_pages,
             page_summaries=page_summaries,
             candidate_los=candidate_los,
+            max_sections=MAX_OUTLINE_SECTIONS,
         )
 
         started = time.monotonic()

@@ -150,6 +150,94 @@ def test_outline_skips_cover_and_closing_and_merges_sparse_sections():
     assert "course-uuid-1" not in calls[0]["prompt"]
 
 
+def test_outline_long_deck_more_than_20_sections_is_merged_not_failed():
+    # Tái hiện Ch2_LSH_lecture.pdf (101 trang) trên dev: model trả 21 mục, schema
+    # chặn max 20 nên cả yêu cầu FAILED. Nay gộp bớt về <= 20, không mất trang cuối.
+    total_pages = 100
+    chunks = [
+        _chunk(f"c{p}", p, f"Trang {p}: " + " ".join([f"Nội dung kiến thức số {p}."] * 30), (f"Mục {p}",))
+        for p in range(1, total_pages + 1)
+    ]
+    store = _fake_metadata_store(chunks)
+    raw_sections = [
+        {
+            "title": f"Nội dung {i + 1}",
+            "summary": f"Tóm tắt {i + 1}",
+            "page_from": i * 4 + 1,
+            "page_to": i * 4 + 4,
+            "suggested_lo_id": "lo-1",
+        }
+        for i in range(25)
+    ]
+    llm, calls = _fake_llm({"sections": raw_sections})
+
+    uc = GenerateMicroOutlineUseCase(metadata_store=store, llm_client=llm)
+    res = uc.execute(GenerateMicroOutlineRequest(course_id="course-uuid-1", document_id="doc-1"))
+
+    assert res.is_ok(), res
+    sections = res.unwrap().sections
+    assert len(sections) == 20
+    assert sections[0].page_from == 1
+    assert sections[-1].page_to == total_pages
+    for prev, cur in zip(sections, sections[1:]):
+        assert cur.page_from == prev.page_to + 1
+    assert len(calls) == 1  # không tốn lượt "repair" vì vượt trần
+    assert "TỐI ĐA 20 nội dung" in calls[0]["prompt"]
+
+
+def test_outline_prompt_tells_model_to_grow_sections_for_long_deck():
+    from worker.prompts.micro_content import outline_suggestion
+
+    def _pages(total_chars_per_page: int, n: int):
+        return [
+            {"page_number": p, "text_snippet": "x", "char_count": total_chars_per_page}
+            for p in range(1, n + 1)
+        ]
+
+    long_deck = outline_suggestion(
+        course_title="C",
+        document_title="D",
+        chapter_code=None,
+        total_pages=100,
+        page_summaries=_pages(600, 100),  # 60.000 ký tự -> >= 3.000 ký tự/mục
+        candidate_los=[],
+    )
+    assert "3,000 ký tự chữ trở lên" in long_deck.user
+    assert "TỐI ĐA 20 nội dung" in long_deck.user
+
+    short_deck = outline_suggestion(
+        course_title="C",
+        document_title="D",
+        chapter_code=None,
+        total_pages=10,
+        page_summaries=_pages(300, 10),
+        candidate_los=[],
+    )
+    assert "1.000–2.500 ký tự" in short_deck.user
+
+
+def test_outline_raw_pages_are_not_counted_twice():
+    store = _fake_metadata_store([])
+    text = "Nội dung trang hai về kiến trúc lambda."
+    llm, calls = _fake_llm(
+        {"sections": [{"title": "A", "summary": "a", "page_from": 1, "page_to": 2, "suggested_lo_id": "lo-1"}]}
+    )
+    uc = GenerateMicroOutlineUseCase(metadata_store=store, llm_client=llm)
+    res = uc.execute(
+        GenerateMicroOutlineRequest(
+            course_id="course-uuid-1",
+            document_id="doc-1",
+            pages=[
+                {"page_number": 1, "text": "Trang một."},
+                {"page_number": 2, "text": text},
+            ],
+        )
+    )
+    assert res.is_ok(), res
+    assert f"[Trang 2/2 | {len(text)} ký tự]\n{text}\n" in calls[0]["prompt"]
+    assert f"{text}\n{text}" not in calls[0]["prompt"]
+
+
 def test_video_script_preserves_heading_path_and_never_borrows_page_1():
     chunks = [
         _chunk("c1", 1, "Trang 1 tổng quan về Big Data", ("Trang bìa",)),

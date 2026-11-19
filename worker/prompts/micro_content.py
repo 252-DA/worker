@@ -24,6 +24,7 @@ def outline_suggestion(
     total_pages: int,
     page_summaries: Sequence[dict[str, Any]],
     candidate_los: Sequence[dict[str, Any]],
+    max_sections: int = 20,
 ) -> Prompt:
     lo_lines: list[str] = []
     for lo in candidate_los:
@@ -48,6 +49,20 @@ def outline_suggestion(
         )
     pages_block = "\n\n".join(page_lines)
 
+    # Bộ slide dài: 1.000–2.500 ký tự/nội dung sẽ vượt trần max_sections, model
+    # phải chọn một trong hai và hay chọn vượt trần. Nói rõ trần thắng.
+    min_chars_per_section = -(-total_chars // max_sections) if total_chars else 0
+    if min_chars_per_section > 2500:
+        size_rule = (
+            f"Bộ slide này dài (~{total_chars:,} ký tự) nên mỗi nội dung phải gộp nhiều hơn, "
+            f"khoảng **{min_chars_per_section:,} ký tự chữ trở lên**, để tổng số nội dung KHÔNG vượt {max_sections}"
+        )
+    else:
+        size_rule = (
+            "~1.000–2.500 ký tự chữ cho mỗi nội dung, thường gộp **3–10 trang** liên tiếp nếu slide thưa chữ "
+            "hoặc nhiều hình ảnh"
+        )
+
     chapter_note = f"Chương: {chapter_code}" if chapter_code else "Chương: (chưa gắn)"
     user = (
         f"Học phần: {course_title}\n"
@@ -59,8 +74,8 @@ def outline_suggestion(
         "NỘI DUNG TỪNG TRANG SLIDE (1..N):\n"
         f"{pages_block}\n\n"
         "YÊU CẦU BẮT BUỘC:\n"
-        "1. Chia theo **dung lượng kiến thức thực tế** (~1.000–2.500 ký tự chữ cho mỗi nội dung, thường gộp "
-        "**3–10 trang** liên tiếp nếu slide thưa chữ hoặc nhiều hình ảnh), tổng cộng tối đa 20 nội dung và KHÔNG gối trang, "
+        f"1. Chia theo **dung lượng kiến thức thực tế** ({size_rule}). Tổng cộng **TỐI ĐA {max_sections} nội dung** "
+        f"(giới hạn cứng, ưu tiên hơn mức ký tự ở trên) và KHÔNG gối trang, "
         f"KHÔNG lộn ngược thứ tự (page_from <= page_to, trong khoảng 1..{total_pages}). "
         "TUYỆT ĐỐI không cắt vụn thành nhiều phần nhỏ dưới ~450 ký tự chỉ để chia đều số trang.\n"
         "2. **Bỏ qua hoàn toàn trang bìa** (trang mở đầu chỉ có tên môn, tên giảng viên, phòng lab, ngày tháng), "
