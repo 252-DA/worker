@@ -37,7 +37,7 @@ class GeneratedQuizItem:
     choices: tuple[str, ...]
     correct_index: int
     # Đáp án đúng đã quy về dạng cột quiz_items.correct_answer theo kiểu câu
-    # (core-api quiz/question-types.ts); MCQ_SINGLE là chính phương án đúng.
+    # (core-api src/modules/question/question-types.ts); MCQ_SINGLE là chính phương án đúng.
     correct_answer: Any
     explanation: str | None
     bloom_level: int | None

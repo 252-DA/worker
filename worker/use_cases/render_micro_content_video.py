@@ -3,7 +3,7 @@ Render video AI cho Micro Content: slide + giọng đọc + ghép FFmpeg → obj
 storage, rồi gửi MICRO_CONTENT_VIDEO_RESULT về core-api.
 
 Worker không ghi ``micro_contents`` hay ``video_assets``: core-api áp dụng kết
-quả (core-api/src/micro-content/micro-content-video-result.handler.ts). Lệnh
+quả (core-api/src/modules/micro-content/handlers/micro-content-video-result.handler.ts). Lệnh
 MICRO_CONTENT_RENDER_REQUESTED mang đủ dữ liệu (kịch bản, asset, render_id) nên
 cũng không đọc DB. Xem docs/ke-hoach-ranh-gioi-du-lieu.md.
 """

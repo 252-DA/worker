@@ -6,7 +6,7 @@ kèm câu/card đã kiểm chứng, thất bại) được gửi về core-api t
 CONTENT_GENERATION_RESULT trên hàng đợi ``worker_results``
 (contracts/integration-events/v1/content-generation-result.json). core-api là
 nơi duy nhất ghi ``content_generation_requests``, ``lessons``, ``quiz_items``,
-``lesson_cards`` (src/content-generation/content-generation-result.handler.ts).
+``lesson_cards`` (src/modules/content-generation/handlers/content-generation-result.handler.ts).
 """
 
 import asyncio

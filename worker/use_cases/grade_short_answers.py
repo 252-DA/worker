@@ -3,7 +3,7 @@ GradeShortAnswersUseCase — chấm câu tự luận ngắn (SHORT_ANSWER) của
 
 core-api ghi bài làm với grading_status PENDING, giữ cả lượt nộp ở ags_status
 AWAITING_GRADE và phát ANSWER_GRADING_REQUESTED kèm đề lúc nộp (grading_input)
-và bài làm của từng câu (xem core-api quiz/answer-grading.ts). Ở đây mỗi câu
+và bài làm của từng câu (xem core-api src/modules/question/answer-grading.ts). Ở đây mỗi câu
 được LLM phán từng ý trong rubric của đề lúc nộp, điểm = số ý đạt / tổng số ý.
 
 Use case chỉ tính, không đọc hay ghi bảng bài làm: runner gửi kết quả
