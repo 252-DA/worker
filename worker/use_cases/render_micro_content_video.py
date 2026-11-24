@@ -75,6 +75,9 @@ class RenderMicroContentVideoResponse:
     vtt_object_key: str | None = None
     transcript_text: str | None = None
     scene_timeline: list[dict[str, Any]] | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    fallbacks: list[dict[str, Any]] | None = None
 
 
 def video_object_key(course_id: str, micro_content_id: str, render_id: str) -> str:
@@ -155,6 +158,7 @@ class RenderMicroContentVideoUseCase:
                 scene_media_list: list[SceneMedia] = []
                 scene_cues: list[list[SubtitleCue]] = []
                 speech_durations_ms: list[int] = []
+                fallbacks: list[dict[str, Any]] = []
                 total_scenes = len(scenes)
                 use_cue_tts = inspect.iscoroutinefunction(
                     getattr(type(self.tts_client), "synthesize_with_cues", None)
@@ -240,11 +244,61 @@ class RenderMicroContentVideoUseCase:
                         scene_cues.append([])
 
                     speech_durations_ms.append(max(400, round(duration * 1000)))
+
+                    visual_mode = str(scene.get("visual_mode") or "SLIDE_STATIC").upper()
+                    custom_clip_path = scene.get("video_clip_path") or scene.get("manim_clip_path")
+                    manim_clip_key = scene.get("manim_clip_key")
+
+                    manim_clip_path: str | None = None
+                    if visual_mode in ("MANIM", "MANIM_AUTO", "MANIM_CUSTOM") or custom_clip_path or manim_clip_key:
+                        candidate_clip: Path | None = None
+                        if custom_clip_path and os.path.exists(custom_clip_path):
+                            candidate_clip = Path(custom_clip_path)
+                        elif manim_clip_key:
+                            local_clip = Path(temp_dir) / f"manim_scene_{idx:02d}.mp4"
+                            try:
+                                dl_clip_res = self.file_storage.download(manim_clip_key, local_clip)
+                                if dl_clip_res.is_ok() and local_clip.exists():
+                                    candidate_clip = local_clip
+                                else:
+                                    logger.warning(
+                                        "render_micro_content_video.manim_download_failed",
+                                        key=manim_clip_key,
+                                        error=str(dl_clip_res.error) if dl_clip_res.is_err() else "missing file",
+                                    )
+                            except Exception as dl_err:
+                                logger.warning(
+                                    "render_micro_content_video.manim_download_error",
+                                    key=manim_clip_key,
+                                    error=str(dl_err),
+                                )
+
+                        if candidate_clip and candidate_clip.exists():
+                            manim_clip_path = str(candidate_clip)
+                        else:
+                            fallback_reason_item = (
+                                f"Clip Manim '{custom_clip_path or manim_clip_key or visual_mode}' không khả dụng; tự động lùi về slide tĩnh"
+                            )
+                            logger.warning(
+                                "render_micro_content_video.fallback_to_slide",
+                                scene_index=idx,
+                                visual_mode=visual_mode,
+                                reason=fallback_reason_item,
+                            )
+                            fallbacks.append({
+                                "scene_index": idx,
+                                "title": title,
+                                "requested_visual_mode": visual_mode,
+                                "fallback_mode": "SLIDE_STATIC",
+                                "reason": fallback_reason_item,
+                            })
+
                     scene_media_list.append(
                         SceneMedia(
                             slide_image_path=slide_img_path,
                             audio_path=audio_path,
                             duration_seconds=duration,
+                            video_clip_path=manim_clip_path,
                         )
                     )
 
@@ -297,6 +351,9 @@ class RenderMicroContentVideoUseCase:
 
                 size_bytes = os.path.getsize(final_mp4_path)
 
+            fallback_used = len(fallbacks) > 0
+            fallback_reason = "; ".join(f["reason"] for f in fallbacks) if fallbacks else None
+
             response = RenderMicroContentVideoResponse(
                 micro_content_id=request.micro_content_id,
                 asset_id=request.asset_id,
@@ -307,6 +364,9 @@ class RenderMicroContentVideoUseCase:
                 vtt_object_key=vtt_key,
                 transcript_text=transcript_text,
                 scene_timeline=timeline,
+                fallback_used=fallback_used,
+                fallback_reason=fallback_reason,
+                fallbacks=fallbacks,
             )
             # Chỉ báo READY khi file đã nằm trên storage. Gửi lỗi thì nổi lên
             # thành Err: job gốc lỗi và BullMQ render lại, không hoàn tất khi

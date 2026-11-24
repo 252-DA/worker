@@ -122,6 +122,9 @@ async def process_video_job(container, bull_job, job_token):
             "size": resp.size_bytes,
             "asset_id": resp.asset_id,
             "render_id": resp.render_id,
+            "fallback_used": resp.fallback_used,
+            "fallback_reason": resp.fallback_reason,
+            "fallbacks": resp.fallbacks,
         }
 
     if event_type == "MICRO_CONTENT_SCRIPT_REQUESTED":

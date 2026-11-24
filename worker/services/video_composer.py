@@ -18,6 +18,7 @@ class SceneMedia:
     slide_image_path: str
     audio_path: str
     duration_seconds: float
+    video_clip_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,14 @@ class VideoComposer:
             raise RuntimeError(f"FFmpeg binary not found at '{self.ffmpeg_bin}'")
 
     async def render_scene_clip(self, scene: SceneMedia, output_clip_path: str) -> float:
-        """Render 1 cảnh đơn lẻ thành clip MP4 khớp thời lượng hình và tiếng."""
+        """
+        Render 1 cảnh đơn lẻ thành clip MP4 khớp thời lượng hình và tiếng.
+        Hỗ trợ cả:
+        - Cảnh Slide tĩnh: loop ảnh slide với giọng đọc TTS.
+        - Cảnh Video động (Manim): chuẩn hóa độ phân giải 1280x720 25fps,
+          ràng buộc tốc độ trong [0.75x, 1.35x], tpad đóng băng frame cuối nếu thiếu,
+          bỏ track audio gốc của clip Manim và thay bằng giọng đọc TTS.
+        """
         import math
 
         os.makedirs(os.path.dirname(output_clip_path), exist_ok=True)
@@ -46,43 +54,124 @@ class VideoComposer:
         frames = max(13, math.ceil((audio_duration + 0.4) * 25))
         clip_duration = frames / 25.0
         dur_str = f"{clip_duration:.2f}"
-        cmd = [
-            self.ffmpeg_bin,
-            "-y",
-            "-loop",
-            "1",
-            "-framerate",
-            "25",
-            "-t",
-            dur_str,
-            "-i",
-            scene.slide_image_path,
-            "-i",
-            scene.audio_path,
-            "-t",
-            dur_str,
-            "-vf",
-            "fps=25,format=yuv420p",
-            "-af",
-            f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS",
-            "-c:v",
-            "libx264",
-            "-tune",
-            "stillimage",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            "25",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            output_clip_path,
-        ]
+
+        # Bộ lọc chuẩn hóa hình ảnh thống nhất 1280x720, SAR=1, 25fps, yuv420p
+        normalize_vf = (
+            "scale=1280:720:force_original_aspect_ratio=decrease,"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
+            "setsar=1,fps=25,format=yuv420p"
+        )
+        audio_filter = f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS"
+
+        if scene.video_clip_path and os.path.exists(scene.video_clip_path):
+            # Nhánh Cảnh dùng Video Clip (Manim / Hoạt họa động)
+            raw_clip_dur = await self._probe_duration(scene.video_clip_path, audio_duration)
+            raw_speed = raw_clip_dur / audio_duration if audio_duration > 0 else 1.0
+
+            # Ràng buộc điều chỉnh tốc độ trong khoảng an toàn [0.75x, 1.35x]
+            clamped_speed = max(0.75, min(1.35, raw_speed))
+            pts_factor = 1.0 / clamped_speed
+
+            if raw_speed > 1.35:
+                logger.warning(
+                    "video_composer.clip_longer_than_audio_capped",
+                    clip_path=scene.video_clip_path,
+                    clip_duration=raw_clip_dur,
+                    audio_duration=audio_duration,
+                    raw_speed=round(raw_speed, 2),
+                    clamped_speed=1.35,
+                )
+            elif raw_speed < 0.75:
+                logger.info(
+                    "video_composer.clip_shorter_than_audio_frozen",
+                    clip_path=scene.video_clip_path,
+                    clip_duration=raw_clip_dur,
+                    audio_duration=audio_duration,
+                    raw_speed=round(raw_speed, 2),
+                    clamped_speed=0.75,
+                )
+
+            # Tính thời lượng video sau khi co giãn tốc độ (duration_scaled = raw_clip_dur * pts_factor)
+            duration_scaled = raw_clip_dur * pts_factor
+            # Khớp tuyệt đối với thời lượng luồng audio sau đệm an toàn (clip_duration) để tránh lệch WebVTT khi concat
+            pad_needed = max(0.0, clip_duration - duration_scaled)
+            tpad_filter = f",tpad=stop_mode=clone:stop_duration={pad_needed:.3f}" if pad_needed > 0.02 else ""
+
+            # setpts điều chỉnh tốc độ + tpad đóng băng frame cuối nếu thiếu + scale pad chuẩn
+            vf = f"setpts={pts_factor:.6f}*PTS{tpad_filter},{normalize_vf}"
+
+            cmd = [
+                self.ffmpeg_bin,
+                "-y",
+                "-i",
+                scene.video_clip_path,
+                "-i",
+                scene.audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                dur_str,
+                "-vf",
+                vf,
+                "-af",
+                audio_filter,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                "25",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                output_clip_path,
+            ]
+        else:
+            # Nhánh Cảnh Slide tĩnh (Static Slide Image)
+            cmd = [
+                self.ffmpeg_bin,
+                "-y",
+                "-loop",
+                "1",
+                "-framerate",
+                "25",
+                "-t",
+                dur_str,
+                "-i",
+                scene.slide_image_path,
+                "-i",
+                scene.audio_path,
+                "-t",
+                dur_str,
+                "-vf",
+                normalize_vf,
+                "-af",
+                audio_filter,
+                "-c:v",
+                "libx264",
+                "-tune",
+                "stillimage",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                "25",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                output_clip_path,
+            ]
 
         logger.debug("video_composer.rendering_scene", cmd=" ".join(cmd))
         proc = await asyncio.create_subprocess_exec(
