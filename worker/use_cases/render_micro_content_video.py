@@ -20,6 +20,7 @@ from document_chunk.domain.ports.file_storage import IFileStorage
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
+from worker.services.manim_generator import ManimGenerationRequest, ManimGenerator
 from worker.services.micro_content_subtitles import (
     SubtitleCue,
     build_webvtt_and_timeline,
@@ -133,12 +134,14 @@ class RenderMicroContentVideoUseCase:
         tts_client: TtsClient | None = None,
         slide_generator: SlideGenerator | None = None,
         video_composer: VideoComposer | None = None,
+        manim_generator: ManimGenerator | None = None,
     ) -> None:
         self.result_publisher = result_publisher
         self.file_storage = file_storage
         self.tts_client = tts_client or get_default_tts_client()
         self.slide_generator = slide_generator or SlideGenerator()
         self.video_composer = video_composer or VideoComposer()
+        self.manim_generator = manim_generator
 
     async def execute(
         self, request: RenderMicroContentVideoRequest
@@ -250,8 +253,16 @@ class RenderMicroContentVideoUseCase:
                     manim_clip_key = scene.get("manim_clip_key")
 
                     manim_clip_path: str | None = None
-                    if visual_mode in ("MANIM", "MANIM_AUTO", "MANIM_CUSTOM") or custom_clip_path or manim_clip_key:
+                    if (
+                        visual_mode in ("MANIM", "MANIM_AUTO", "MANIM_TEMPLATE", "MANIM_CUSTOM")
+                        or custom_clip_path
+                        or manim_clip_key
+                    ):
                         candidate_clip: Path | None = None
+                        gen_error_detail: str | None = None
+                        gen_error_category: str | None = None
+                        gen_attempts: int = 0
+
                         if custom_clip_path and os.path.exists(custom_clip_path):
                             candidate_clip = Path(custom_clip_path)
                         elif manim_clip_key:
@@ -272,26 +283,63 @@ class RenderMicroContentVideoUseCase:
                                     key=manim_clip_key,
                                     error=str(dl_err),
                                 )
+                        elif (
+                            visual_mode in ("MANIM_AUTO", "MANIM_TEMPLATE", "MANIM_CUSTOM")
+                            and self.manim_generator is not None
+                        ):
+                            local_gen_clip = os.path.join(temp_dir, f"manim_gen_scene_{idx:02d}.mp4")
+                            gen_req = ManimGenerationRequest(
+                                title=title,
+                                narration=narration,
+                                bullets=[str(b) for b in bullets] if isinstance(bullets, list) else [],
+                                target_duration_seconds=duration,
+                                visual_mode=visual_mode,
+                                template_name=scene.get("manim_template"),
+                                template_params=scene.get("manim_params")
+                                if isinstance(scene.get("manim_params"), dict)
+                                else None,
+                                custom_source_code=scene.get("manim_source_code"),
+                            )
+                            gen_res = await self.manim_generator.generate_scene_clip(
+                                gen_req, local_gen_clip
+                            )
+                            gen_attempts = gen_res.attempts
+                            if gen_res.success and gen_res.clip_path and os.path.exists(gen_res.clip_path):
+                                candidate_clip = Path(gen_res.clip_path)
+                            else:
+                                gen_error_detail = gen_res.error
+                                gen_error_category = gen_res.error_category
 
                         if candidate_clip and candidate_clip.exists():
                             manim_clip_path = str(candidate_clip)
                         else:
-                            fallback_reason_item = (
-                                f"Clip Manim '{custom_clip_path or manim_clip_key or visual_mode}' không khả dụng; tự động lùi về slide tĩnh"
-                            )
+                            if gen_error_detail:
+                                fallback_reason_item = (
+                                    f"Sinh Manim ({visual_mode}) thất bại sau {gen_attempts} lần "
+                                    f"[{gen_error_category or 'ERROR'}]: {gen_error_detail}; tự động lùi về slide tĩnh"
+                                )
+                            else:
+                                fallback_reason_item = (
+                                    f"Clip Manim '{custom_clip_path or manim_clip_key or visual_mode}' không khả dụng; tự động lùi về slide tĩnh"
+                                )
                             logger.warning(
                                 "render_micro_content_video.fallback_to_slide",
                                 scene_index=idx,
                                 visual_mode=visual_mode,
                                 reason=fallback_reason_item,
                             )
-                            fallbacks.append({
+                            fallback_entry: dict[str, Any] = {
                                 "scene_index": idx,
                                 "title": title,
                                 "requested_visual_mode": visual_mode,
                                 "fallback_mode": "SLIDE_STATIC",
                                 "reason": fallback_reason_item,
-                            })
+                            }
+                            if gen_attempts:
+                                fallback_entry["manim_attempts"] = gen_attempts
+                            if gen_error_category:
+                                fallback_entry["error_category"] = gen_error_category
+                            fallbacks.append(fallback_entry)
 
                     scene_media_list.append(
                         SceneMedia(
@@ -432,6 +480,12 @@ class RenderMicroContentVideoUseCase:
             payload["transcript_text"] = response.transcript_text
         if response.scene_timeline:
             payload["scene_timeline"] = response.scene_timeline
+        if response.fallback_used:
+            payload["fallback_used"] = True
+            if response.fallback_reason:
+                payload["fallback_reason"] = response.fallback_reason[:MAX_ERROR_CHARS]
+            if response.fallbacks:
+                payload["fallbacks"] = response.fallbacks
         return await self.result_publisher.publish(
             MICRO_CONTENT_VIDEO_RESULT,
             payload,
