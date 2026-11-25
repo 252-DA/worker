@@ -51,9 +51,6 @@ class VideoComposer:
 
         os.makedirs(os.path.dirname(output_clip_path), exist_ok=True)
         audio_duration = max(0.5, float(scene.duration_seconds or 0.0))
-        frames = max(13, math.ceil((audio_duration + 0.4) * 25))
-        clip_duration = frames / 25.0
-        dur_str = f"{clip_duration:.2f}"
 
         # Bộ lọc chuẩn hóa hình ảnh thống nhất 1280x720, SAR=1, 25fps, yuv420p
         normalize_vf = (
@@ -61,25 +58,39 @@ class VideoComposer:
             "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
             "setsar=1,fps=25,format=yuv420p"
         )
-        audio_filter = f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS"
 
         if scene.video_clip_path and os.path.exists(scene.video_clip_path):
             # Nhánh Cảnh dùng Video Clip (Manim / Hoạt họa động)
             raw_clip_dur = await self._probe_duration(scene.video_clip_path, audio_duration)
             raw_speed = raw_clip_dur / audio_duration if audio_duration > 0 else 1.0
 
-            # Ràng buộc điều chỉnh tốc độ trong khoảng an toàn [0.75x, 1.35x]
-            clamped_speed = max(0.75, min(1.35, raw_speed))
+            # Khi lời đọc ngắn hơn quá nhiều so với hoạt họa (VD: cảnh mới thêm lời mẫu
+            # ~2.5s nhưng animation dài ~31s), giữ nguyên tốc độ tự nhiên 1.0x và kéo dài
+            # khung cảnh theo animation thay vì ép tốc độ hay cắt cụt mất phần hoạt họa.
+            if raw_speed > 2.0:
+                clamped_speed = 1.0
+            else:
+                # Ràng buộc điều chỉnh tốc độ trong khoảng an toàn [0.75x, 1.35x]
+                clamped_speed = max(0.75, min(1.35, raw_speed))
             pts_factor = 1.0 / clamped_speed
 
-            if raw_speed > 1.35:
-                logger.warning(
-                    "video_composer.clip_longer_than_audio_capped",
+            # Tính thời lượng video sau khi co giãn tốc độ (duration_scaled = raw_clip_dur * pts_factor)
+            duration_scaled = raw_clip_dur * pts_factor
+            target_dur = max(audio_duration + 0.4, duration_scaled + 0.4)
+            frames = max(13, math.ceil(target_dur * 25))
+            clip_duration = frames / 25.0
+            dur_str = f"{clip_duration:.2f}"
+            audio_filter = f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS"
+
+            if duration_scaled > audio_duration + 0.05:
+                logger.info(
+                    "video_composer.clip_longer_than_audio_extended",
                     clip_path=scene.video_clip_path,
                     clip_duration=raw_clip_dur,
                     audio_duration=audio_duration,
                     raw_speed=round(raw_speed, 2),
-                    clamped_speed=1.35,
+                    clamped_speed=round(clamped_speed, 2),
+                    final_duration=clip_duration,
                 )
             elif raw_speed < 0.75:
                 logger.info(
@@ -91,9 +102,7 @@ class VideoComposer:
                     clamped_speed=0.75,
                 )
 
-            # Tính thời lượng video sau khi co giãn tốc độ (duration_scaled = raw_clip_dur * pts_factor)
-            duration_scaled = raw_clip_dur * pts_factor
-            # Khớp tuyệt đối với thời lượng luồng audio sau đệm an toàn (clip_duration) để tránh lệch WebVTT khi concat
+            # Khớp tuyệt đối với thời lượng đích sau đệm an toàn (clip_duration) để tránh lệch WebVTT khi concat
             pad_needed = max(0.0, clip_duration - duration_scaled)
             tpad_filter = f",tpad=stop_mode=clone:stop_duration={pad_needed:.3f}" if pad_needed > 0.02 else ""
 
@@ -135,6 +144,10 @@ class VideoComposer:
             ]
         else:
             # Nhánh Cảnh Slide tĩnh (Static Slide Image)
+            frames = max(13, math.ceil((audio_duration + 0.4) * 25))
+            clip_duration = frames / 25.0
+            dur_str = f"{clip_duration:.2f}"
+            audio_filter = f"apad,atrim=0:{dur_str},asetpts=PTS-STARTPTS"
             cmd = [
                 self.ffmpeg_bin,
                 "-y",
