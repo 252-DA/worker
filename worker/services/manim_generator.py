@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from document_chunk.shared.logger import get_logger
-from document_chunk.shared.result import Result
+from document_chunk.shared.result import Err, Ok, Result
 
 logger = get_logger(__name__)
 
@@ -101,6 +103,54 @@ class SimpleLLMClient(Protocol):
     def generate(self, prompt: str, system: str | None = None) -> Result[str, Exception]: ...
 
 
+class EnvGeminiLLMClient:
+    """
+    Client gọi trực tiếp Gemini REST API từ biến môi trường GEMINI_API_KEY
+    cho MicroContentVideoContainer (không cần kết nối Postgres theo đúng
+    ranh giới dữ liệu của video worker).
+    """
+
+    def __init__(self, api_key: str, model: str | None = None) -> None:
+        self._api_key = api_key.strip()
+        self._model = (model or os.getenv("MANIM_LLM_MODEL") or "gemini-2.5-flash").strip()
+
+    def generate(self, prompt: str, system: str | None = None) -> Result[str, Exception]:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._model}:generateContent?key={self._api_key}"
+        )
+        payload: dict[str, Any] = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    return Err(RuntimeError("Gemini trả về danh sách candidates rỗng"))
+                parts = (candidates[0].get("content") or {}).get("parts") or []
+                text = "".join(str(p.get("text") or "") for p in parts)
+                return Ok(text)
+        except Exception as exc:
+            return Err(exc)
+
+
+def build_default_manim_llm_client() -> SimpleLLMClient | None:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return EnvGeminiLLMClient(api_key=api_key)
+
+
 @dataclass(frozen=True)
 class ManimGenerationRequest:
     title: str
@@ -112,7 +162,7 @@ class ManimGenerationRequest:
     template_params: dict[str, Any] | None = None
     custom_source_code: str | None = None
     max_attempts: int = 3
-    timeout_seconds: int = 60
+    timeout_seconds: int = 180
     resolution: tuple[int, int] = (1280, 720)
     fps: int = 25
 
@@ -272,11 +322,21 @@ def _sanitize_int_array(raw: Any, default: list[int], min_len: int = 3, max_len:
     return list(default)
 
 
+def _sanitize_pace(raw: Any, default: float = 1.0) -> float:
+    """Hệ số nhịp độ hoạt họa (1.0 = chậm vừa dễ hiểu, >1.0 = rất chậm, <1.0 = nhanh hơn)."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return round(max(0.5, min(2.0, val)), 2)
+
+
 def render_insertion_sort_template(params: dict[str, Any] | None = None) -> str:
-    """Sinh code Manim tham số hóa cho Straight Insertion Sort với mảng đầu vào bất kỳ."""
+    """Sinh code Manim tham số hóa ĐẦY ĐỦ cho Straight Insertion Sort (nhịp độ chậm, dễ theo dõi)."""
     params = params or {}
     arr = _sanitize_int_array(params.get("array"), default=[23, 78, 45, 8, 32, 56])
     title_text = str(params.get("title") or "Straight Insertion Sort — Array Trace")[:60]
+    pace = _sanitize_pace(params.get("pace"), default=1.0)
 
     return f'''from manim import *
 import numpy as np
@@ -291,9 +351,12 @@ class GeneratedScene(Scene):
         STROKE_SORTED = "#10b981"
         BG_ACTIVE = "#78350f"
         STROKE_ACTIVE = "#f59e0b"
+        BG_COMPARE = "#1e3a5f"
+        STROKE_COMPARE = "#38bdf8"
         TEXT_WHITE = "#f8fafc"
         TEXT_MUTED = "#94a3b8"
 
+        P = {pace!r}
         values = {arr!r}
         n = len(values)
         box_w = min(1.2, 9.0 / max(n, 1))
@@ -301,19 +364,25 @@ class GeneratedScene(Scene):
         gap = 0.28
         step_x = box_w + gap
         start_x = -((n - 1) * step_x) / 2.0
-        base_y = -0.35
-        temp_y = base_y + box_h + 0.65
+        base_y = -0.45
+        temp_y = base_y + box_h + 0.72
 
         def slot_pos(idx: int) -> np.ndarray:
             return np.array([start_x + idx * step_x, base_y, 0.0])
 
         title = Text({title_text!r}, font_size=32, weight=BOLD, color=TEXT_WHITE)
-        title.to_edge(UP, buff=0.4)
+        title.to_edge(UP, buff=0.38)
         if title.width > 12.0:
             title.scale_to_fit_width(12.0)
 
-        banner = Text(f"Initial array: {{values}}", font_size=24, color="#38bdf8")
-        banner.next_to(title, DOWN, buff=0.3)
+        def make_banner(txt: str, col: str = "#38bdf8"):
+            b = Text(txt, font_size=23, color=col)
+            b.next_to(title, DOWN, buff=0.28)
+            if b.width > 12.0:
+                b.scale_to_fit_width(12.0)
+            return b
+
+        banner = make_banner(f"Initial array: {{values}}  (index 0 starts as sorted)")
 
         cells = []
         idx_labels = VGroup()
@@ -330,68 +399,89 @@ class GeneratedScene(Scene):
             lbl.next_to(slot_pos(i), DOWN, buff=box_h / 2 + 0.22)
             idx_labels.add(lbl)
 
-        self.play(FadeIn(title), FadeIn(banner), FadeIn(VGroup(*cells)), FadeIn(idx_labels), run_time=0.9)
+        self.play(FadeIn(title), FadeIn(banner), FadeIn(VGroup(*cells)), FadeIn(idx_labels), run_time=1.2 * P)
         cells[0][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
-        self.wait(0.6)
+        self.wait(1.0 * P)
 
         arr_state = list(values)
         for current in range(1, n):
             key_val = arr_state[current]
             key_cell = cells[current]
-            b_pick = Text(f"Pass {{current}}: Extract temp = {{key_val}}", font_size=24, color=STROKE_ACTIVE)
-            b_pick.next_to(title, DOWN, buff=0.3)
+            b_pick = make_banner(f"Pass {{current}}: Pick temp = {{key_val}} from index [{{current}}]", STROKE_ACTIVE)
 
             key_cell[0].set_fill(BG_ACTIVE).set_stroke(STROKE_ACTIVE, width=4.0)
+            temp_tag = Text("temp", font_size=18, weight=BOLD, color=STROKE_ACTIVE)
+            temp_tag.next_to(np.array([slot_pos(current)[0], temp_y, 0.0]), UP, buff=box_h / 2 + 0.1)
             self.play(
-                ReplacementTransform(banner, b_pick),
+                FadeTransform(banner, b_pick),
                 key_cell.animate.move_to(np.array([slot_pos(current)[0], temp_y, 0.0])),
-                run_time=0.55,
+                FadeIn(temp_tag),
+                run_time=0.9 * P,
             )
             banner = b_pick
+            self.wait(0.65 * P)
 
+            # So sánh & dời từng phần tử lớn hơn sang phải (từng bước để dễ quan sát)
             walker = current - 1
-            shifts = []
             while walker >= 0 and arr_state[walker] > key_val:
-                arr_state[walker + 1] = arr_state[walker]
-                cells[walker + 1] = cells[walker]
-                shifts.append(cells[walker].animate.move_to(slot_pos(walker + 1)))
+                w_val = arr_state[walker]
+                w_cell = cells[walker]
+                w_cell[0].set_fill(BG_COMPARE).set_stroke(STROKE_COMPARE, width=3.5)
+                b_shift = make_banner(
+                    f"Compare {{w_val}} > temp ({{key_val}})  ->  shift {{w_val}} right to [{{walker + 1}}]",
+                    STROKE_COMPARE,
+                )
+                self.play(FadeTransform(banner, b_shift), run_time=0.45 * P)
+                banner = b_shift
+                self.wait(0.35 * P)
+
+                arr_state[walker + 1] = w_val
+                cells[walker + 1] = w_cell
+                w_cell[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                self.play(
+                    w_cell.animate.move_to(slot_pos(walker + 1)),
+                    key_cell.animate.move_to(np.array([slot_pos(walker)[0], temp_y, 0.0])),
+                    temp_tag.animate.next_to(np.array([slot_pos(walker)[0], temp_y, 0.0]), UP, buff=box_h / 2 + 0.1),
+                    run_time=0.72 * P,
+                )
+                self.wait(0.25 * P)
                 walker -= 1
 
             target_idx = walker + 1
             arr_state[target_idx] = key_val
             cells[target_idx] = key_cell
 
-            if shifts:
-                shifts.append(key_cell.animate.move_to(np.array([slot_pos(target_idx)[0], temp_y, 0.0])))
-                self.play(*shifts, run_time=0.65)
-
-            b_ins = Text(f"Insert {{key_val}} at index [{{target_idx}}] -> {{arr_state}}", font_size=22, color=STROKE_SORTED)
-            b_ins.next_to(title, DOWN, buff=0.3)
-            if b_ins.width > 12.0:
-                b_ins.scale_to_fit_width(12.0)
-
+            b_ins = make_banner(f"Insert temp = {{key_val}} at index [{{target_idx}}]  ->  {{arr_state}}", STROKE_SORTED)
             key_cell[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
             self.play(
-                ReplacementTransform(banner, b_ins),
+                FadeTransform(banner, b_ins),
                 key_cell.animate.move_to(slot_pos(target_idx)),
-                run_time=0.6,
+                FadeOut(temp_tag),
+                run_time=0.85 * P,
             )
             banner = b_ins
-            self.wait(0.35)
+            self.wait(0.75 * P)
 
-        b_done = Text(f"Sorted Complete: {{arr_state}}", font_size=26, weight=BOLD, color=STROKE_SORTED)
-        b_done.next_to(title, DOWN, buff=0.3)
-        self.play(ReplacementTransform(banner, b_done), run_time=0.5)
-        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in cells], run_time=0.5)
-        self.wait(1.2)
+        b_done = make_banner(f"Sorted Complete! Straight Insertion Sort: {{arr_state}}", STROKE_SORTED)
+        self.play(FadeTransform(banner, b_done), run_time=0.65 * P)
+        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in cells], run_time=0.75 * P)
+        self.wait(1.8 * P)
 '''
 
 
 def render_merge_sort_template(params: dict[str, Any] | None = None) -> str:
-    """Sinh code Manim tham số hóa cho Merge Sort (Divide & Conquer) với mảng bất kỳ."""
+    """
+    Sinh code Manim tham số hóa ĐẦY ĐỦ TOÀN BỘ THUẬT TOÁN Merge Sort (Divide & Conquer)
+    cho mảng đầu vào bất kỳ (3..8 phần tử), nhịp độ sư phạm chậm rãi rõ ràng:
+      - Giai đoạn 1 (Divide): Chia đệ quy đầy đủ từng tầng đến các mảng con 1 phần tử (Base Case).
+      - Giai đoạn 2 (Bottom-Up Conquer): Trộn thực sự từng cặp mảng con từ dưới lên trên (so sánh & sắp xếp).
+      - Giai đoạn 3 (Final Two-Pointer Merge): Minh họa chi tiết 2 con trỏ i, j so sánh từng cặp phần tử
+        của nửa trái & nửa phải, di chuyển phần tử nhỏ hơn vào mảng kết quả cho tới khi hoàn tất 100%.
+    """
     params = params or {}
     arr = _sanitize_int_array(params.get("array"), default=[38, 27, 43, 3, 9, 82])
-    title_text = str(params.get("title") or "Merge Sort — Divide & Conquer Trace")[:60]
+    title_text = str(params.get("title") or "Merge Sort — Full Divide & Conquer Trace")[:60]
+    pace = _sanitize_pace(params.get("pace"), default=1.0)
 
     return f'''from manim import *
 import numpy as np
@@ -406,102 +496,739 @@ class GeneratedScene(Scene):
         STROKE_LEFT = "#38bdf8"
         BG_RIGHT = "#4c1d95"
         STROKE_RIGHT = "#a78bfa"
+        BG_ACTIVE = "#78350f"
+        STROKE_ACTIVE = "#f59e0b"
         BG_SORTED = "#064e3b"
         STROKE_SORTED = "#10b981"
         TEXT_WHITE = "#f8fafc"
+        TEXT_MUTED = "#94a3b8"
 
+        P = {pace!r}
         values = {arr!r}
         n = len(values)
-        box_w = min(1.05, 9.2 / max(n, 1))
-        box_h = 0.85
-        gap = 0.22
+        box_w = 0.78 if n <= 6 else 0.68
+        box_h = 0.64 if n <= 6 else 0.58
+        inner_gap = 0.06
+        font_sz = 23 if n <= 6 else 20
 
-        def make_array_row(vals, y_pos, fill_c=BG_DEFAULT, stroke_c=STROKE_DEFAULT, x_center=0.0):
+        def make_cell(val, fill_c=BG_DEFAULT, stroke_c=STROKE_DEFAULT, w=box_w, h=box_h, fz=font_sz):
+            rect = RoundedRectangle(
+                width=w, height=h, corner_radius=0.11,
+                fill_color=fill_c, fill_opacity=1.0,
+                stroke_color=stroke_c, stroke_width=2.4,
+            )
+            txt = Text(str(val), font_size=fz, weight=BOLD, color=TEXT_WHITE)
+            return VGroup(rect, txt)
+
+        def make_row(vals, center_x, y_pos, fill_c=BG_DEFAULT, stroke_c=STROKE_DEFAULT, w=box_w, h=box_h, gap=inner_gap, fz=font_sz):
             grp = VGroup()
-            step = box_w + gap
-            sx = x_center - ((len(vals) - 1) * step) / 2.0
+            step = w + gap
+            sx = center_x - ((len(vals) - 1) * step) / 2.0
             for i, v in enumerate(vals):
-                rect = RoundedRectangle(
-                    width=box_w, height=box_h, corner_radius=0.12,
-                    fill_color=fill_c, fill_opacity=1.0,
-                    stroke_color=stroke_c, stroke_width=2.5,
-                )
-                txt = Text(str(v), font_size=26, weight=BOLD, color=TEXT_WHITE)
-                cell = VGroup(rect, txt).move_to(np.array([sx + i * step, y_pos, 0.0]))
+                cell = make_cell(v, fill_c=fill_c, stroke_c=stroke_c, w=w, h=h, fz=fz)
+                cell.move_to(np.array([sx + i * step, y_pos, 0.0]))
                 grp.add(cell)
             return grp
 
-        title = Text({title_text!r}, font_size=32, weight=BOLD, color=TEXT_WHITE)
-        title.to_edge(UP, buff=0.35)
-        if title.width > 12.0:
-            title.scale_to_fit_width(12.0)
+        def make_banner(text_str, color="#38bdf8"):
+            b = Text(text_str, font_size=22, color=color)
+            b.next_to(title, DOWN, buff=0.22)
+            if b.width > 12.2:
+                b.scale_to_fit_width(12.2)
+            return b
 
-        banner = Text(f"Input array (n = {{n}}): {{values}}", font_size=24, color=STROKE_LEFT)
-        banner.next_to(title, DOWN, buff=0.25)
+        def make_pill(text_str, stroke_c=STROKE_DEFAULT, text_c=TEXT_WHITE):
+            t = Text(text_str, font_size=20, weight=BOLD, color=text_c)
+            if t.width > 11.4:
+                t.scale_to_fit_width(11.4)
+            bg = RoundedRectangle(
+                width=t.width + 0.6, height=0.52, corner_radius=0.12,
+                fill_color="#1e293b", fill_opacity=0.95,
+                stroke_color=stroke_c, stroke_width=2.0,
+            )
+            return VGroup(bg, t).to_edge(DOWN, buff=0.28)
 
-        root_row = make_array_row(values, y_pos=1.25)
-        self.play(FadeIn(title), FadeIn(banner), FadeIn(root_row), run_time=1.0)
-        self.wait(0.8)
+        # Xây dựng cây đệ quy Merge Sort thực tế cho mảng bất kỳ (3..8 phần tử)
+        def build_tree(sub_vals, depth=0, side="root"):
+            node = {{
+                "vals": list(sub_vals),
+                "sorted_vals": sorted(sub_vals),
+                "depth": depth,
+                "side": side,
+                "left": None,
+                "right": None,
+            }}
+            if len(sub_vals) > 1:
+                mid = len(sub_vals) // 2
+                node["left"] = build_tree(sub_vals[:mid], depth + 1, "left" if depth == 0 else side)
+                node["right"] = build_tree(sub_vals[mid:], depth + 1, "right" if depth == 0 else side)
+            return node
 
-        # Phase 1: Divide into Left & Right halves
-        mid = n // 2
-        left_vals = values[:mid]
-        right_vals = values[mid:]
-        b_div = Text(f"Divide: Left {{left_vals}}  |  Right {{right_vals}}", font_size=23, color="#f59e0b")
-        b_div.next_to(title, DOWN, buff=0.25)
+        root = build_tree(values)
 
-        left_row = make_array_row(left_vals, y_pos=-0.1, fill_c=BG_LEFT, stroke_c=STROKE_LEFT, x_center=-3.1)
-        right_row = make_array_row(right_vals, y_pos=-0.1, fill_c=BG_RIGHT, stroke_c=STROKE_RIGHT, x_center=3.1)
-        arr_l = Arrow(root_row.get_bottom() + LEFT * 0.5, left_row.get_top(), color=STROKE_LEFT, buff=0.15)
-        arr_r = Arrow(root_row.get_bottom() + RIGHT * 0.5, right_row.get_top(), color=STROKE_RIGHT, buff=0.15)
+        def get_max_depth(node):
+            if not node["left"] and not node["right"]:
+                return node["depth"]
+            return max(get_max_depth(node["left"]), get_max_depth(node["right"]))
+
+        max_d = get_max_depth(root)
+        # Tọa độ Y theo từng tầng (phủ gọn vùng y in [1.55, -1.85])
+        y_top = 1.55
+        y_bot = -1.85 if max_d >= 3 else -1.45
+        level_y = [
+            y_top - (y_top - y_bot) * (d / max(max_d, 1))
+            for d in range(max_d + 1)
+        ]
+
+        # Gán tọa độ X không bao giờ chồng lấn bằng không gian lá đều nhau
+        leaves = []
+
+        def collect_leaves(node):
+            if not node["left"] and not node["right"]:
+                leaves.append(node)
+                return
+            collect_leaves(node["left"])
+            collect_leaves(node["right"])
+
+        collect_leaves(root)
+        leaf_step = min(1.55, 11.2 / max(len(leaves), 1))
+        leaf_start_x = -((len(leaves) - 1) * leaf_step) / 2.0
+        for idx, lf in enumerate(leaves):
+            lf["x"] = leaf_start_x + idx * leaf_step
+
+        def assign_internal_x(node):
+            if not node["left"] and not node["right"]:
+                return node["x"]
+            lx = assign_internal_x(node["left"])
+            rx = assign_internal_x(node["right"])
+            node["x"] = (lx + rx) / 2.0
+            return node["x"]
+
+        assign_internal_x(root)
+
+        # Thu thập các nút theo từng tầng
+        nodes_by_depth = {{d: [] for d in range(max_d + 1)}}
+
+        def collect_by_depth(node):
+            nodes_by_depth[node["depth"]].append(node)
+            if node["left"]:
+                collect_by_depth(node["left"])
+            if node["right"]:
+                collect_by_depth(node["right"])
+
+        collect_by_depth(root)
+
+        # Kiểm tra chống đè ngang giữa các nút anh em cùng tầng
+        for d in range(1, max_d + 1):
+            row_nodes = nodes_by_depth[d]
+            for k in range(1, len(row_nodes)):
+                prev_n = row_nodes[k - 1]
+                curr_n = row_nodes[k]
+                prev_w = len(prev_n["vals"]) * (box_w + inner_gap)
+                curr_w = len(curr_n["vals"]) * (box_w + inner_gap)
+                min_dist = (prev_w + curr_w) / 2.0 + 0.28
+                if curr_n["x"] - prev_n["x"] < min_dist:
+                    shift = (min_dist - (curr_n["x"] - prev_n["x"])) / 2.0
+                    prev_n["x"] -= shift
+                    curr_n["x"] += shift
+
+        # Tiêu đề & Banner
+        title = Text({title_text!r}, font_size=30, weight=BOLD, color=TEXT_WHITE)
+        title.to_edge(UP, buff=0.32)
+        if title.width > 12.2:
+            title.scale_to_fit_width(12.2)
+
+        banner = make_banner(f"Step 1 (Divide): Input array (n = {{n}}) -> split recursively to size 1", STROKE_LEFT)
+        pill = make_pill(f"Input: {{values}}")
+
+        root["mob"] = make_row(root["vals"], root["x"], level_y[0])
+        self.play(FadeIn(title), FadeIn(banner), FadeIn(root["mob"]), FadeIn(pill), run_time=1.3 * P)
+        self.wait(1.0 * P)
+
+        # =====================================================================
+        # GIAI ĐOẠN 1: CHIA ĐỆ QUY ĐẦY ĐỦ TỪNG TẦNG TỚI BASE CASE (LEN == 1)
+        # =====================================================================
+        tree_arrows = VGroup()
+        for d in range(1, max_d + 1):
+            anims = []
+            level_groups_str = []
+            for parent in nodes_by_depth[d - 1]:
+                if not parent["left"] or not parent["right"]:
+                    continue
+                for child in (parent["left"], parent["right"]):
+                    fc = BG_LEFT if child["side"] == "left" else BG_RIGHT
+                    sc = STROKE_LEFT if child["side"] == "left" else STROKE_RIGHT
+                    child["mob"] = make_row(child["vals"], child["x"], level_y[d], fill_c=fc, stroke_c=sc)
+                    arr_edge = Arrow(
+                        parent["mob"].get_bottom(),
+                        child["mob"].get_top(),
+                        color=sc, stroke_width=2.2, max_tip_length_to_length_ratio=0.18, buff=0.08,
+                    )
+                    tree_arrows.add(arr_edge)
+                    anims.extend([GrowArrow(arr_edge), FadeIn(child["mob"], shift=DOWN * 0.15)])
+                    level_groups_str.append(str(child["vals"]))
+
+            b_div = make_banner(f"Divide Level {{d}}: " + "  |  ".join(level_groups_str), STROKE_ACTIVE)
+            self.play(FadeTransform(banner, b_div), *anims, run_time=1.45 * P)
+            banner = b_div
+            self.wait(0.95 * P)
+
+        # Đánh dấu toàn bộ các lá đơn (Base Case = đã sắp xếp)
+        b_base = make_banner("Base Case reached: Every single-element subarray is trivially sorted!", STROKE_SORTED)
+        for lf in leaves:
+            lf["mob"][0][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=2.8)
+        self.play(
+            FadeTransform(banner, b_base),
+            *[Indicate(lf["mob"], color=STROKE_SORTED, scale_factor=1.08) for lf in leaves],
+            run_time=1.15 * P,
+        )
+        banner = b_base
+        self.wait(1.0 * P)
+
+        # =====================================================================
+        # GIAI ĐOẠN 2: TRỘN TỪNG TẦNG TỪ DƯỚI LÊN (BOTTOM-UP MERGE tới Tầng 1)
+        # =====================================================================
+        for d in range(max_d - 1, 0, -1):
+            merge_targets = [nd for nd in nodes_by_depth[d] if nd["left"] and nd["right"]]
+            if not merge_targets:
+                continue
+            parts_desc = []
+            anims = []
+            for nd in merge_targets:
+                fc = BG_LEFT if nd["side"] == "left" else BG_RIGHT
+                sc = STROKE_LEFT if nd["side"] == "left" else STROKE_RIGHT
+                sorted_mob = make_row(nd["sorted_vals"], nd["x"], level_y[d], fill_c=fc, stroke_c=sc)
+                for c in sorted_mob:
+                    c[0].set_stroke(STROKE_SORTED, width=3.0)
+                anims.append(ReplacementTransform(nd["mob"], sorted_mob))
+                nd["mob"] = sorted_mob
+                parts_desc.append(f"{{nd['left']['sorted_vals']}}+{{nd['right']['sorted_vals']}}->{{nd['sorted_vals']}}")
+
+            b_up = make_banner("Bottom-Up Merge (Level " + str(d) + "): " + "  |  ".join(parts_desc), STROKE_SORTED)
+            p_up = make_pill("Merged subarrays: " + "  |  ".join(str(nd["sorted_vals"]) for nd in merge_targets), stroke_c=STROKE_SORTED)
+            self.play(FadeTransform(banner, b_up), FadeTransform(pill, p_up), *anims, run_time=1.55 * P)
+            banner, pill = b_up, p_up
+            self.wait(1.15 * P)
+
+        # =====================================================================
+        # GIAI ĐOẠN 3: TRỘN CUỐI CÙNG BẰNG 2 CON TRỎ i, j (STEP-BY-STEP MERGE)
+        # =====================================================================
+        left_half = root["left"]
+        right_half = root["right"]
+        left_vals = left_half["sorted_vals"]
+        right_vals = right_half["sorted_vals"]
+
+        fade_out_mobs = [root["mob"], tree_arrows]
+        for d in range(2, max_d + 1):
+            for nd in nodes_by_depth[d]:
+                fade_out_mobs.append(nd["mob"])
+
+        stage_w = min(1.05, 8.8 / max(n, 1))
+        stage_h = 0.86
+        stage_gap = 0.16
+        stage_fz = 28 if n <= 6 else 24
+
+        left_stage = make_row(left_vals, -3.15, 0.85, fill_c=BG_LEFT, stroke_c=STROKE_LEFT, w=stage_w, h=stage_h, gap=stage_gap, fz=stage_fz)
+        right_stage = make_row(right_vals, 3.15, 0.85, fill_c=BG_RIGHT, stroke_c=STROKE_RIGHT, w=stage_w, h=stage_h, gap=stage_gap, fz=stage_fz)
+        left_tag = Text("Sorted Left Half", font_size=19, weight=BOLD, color=STROKE_LEFT).next_to(left_stage, UP, buff=0.55)
+        right_tag = Text("Sorted Right Half", font_size=19, weight=BOLD, color=STROKE_RIGHT).next_to(right_stage, UP, buff=0.55)
+
+        res_step = stage_w + stage_gap
+        res_sx = -((n - 1) * res_step) / 2.0
+        res_y = -1.25
+
+        def res_slot_pos(idx):
+            return np.array([res_sx + idx * res_step, res_y, 0.0])
+
+        empty_slots = VGroup()
+        for k in range(n):
+            slot = DashedVMobject(
+                RoundedRectangle(width=stage_w, height=stage_h, corner_radius=0.12, stroke_color=TEXT_MUTED, stroke_width=2.0),
+                num_dashes=16,
+            ).move_to(res_slot_pos(k))
+            empty_slots.add(slot)
+
+        b_final_intro = make_banner("Final Merge: Two pointers (i, j) compare front elements & pick smaller", STROKE_SORTED)
+        p_final_intro = make_pill(f"Left = {{left_vals}}   vs   Right = {{right_vals}}", stroke_c=STROKE_LEFT)
 
         self.play(
-            ReplacementTransform(banner, b_div),
-            GrowArrow(arr_l), GrowArrow(arr_r),
-            FadeIn(left_row), FadeIn(right_row),
-            run_time=1.3,
+            *[FadeOut(m) for m in fade_out_mobs],
+            ReplacementTransform(left_half["mob"], left_stage),
+            ReplacementTransform(right_half["mob"], right_stage),
+            FadeIn(left_tag), FadeIn(right_tag), FadeIn(empty_slots),
+            FadeTransform(banner, b_final_intro),
+            FadeTransform(pill, p_final_intro),
+            run_time=1.45 * P,
         )
-        banner = b_div
-        self.wait(0.9)
+        banner, pill = b_final_intro, p_final_intro
+        self.wait(0.8 * P)
 
-        # Phase 2: Sort each half recursively
-        left_sorted = sorted(left_vals)
-        right_sorted = sorted(right_vals)
-        b_sub = Text(f"Conquer (Recursive Sort): {{left_sorted}}  &  {{right_sorted}}", font_size=23, color=STROKE_LEFT)
-        b_sub.next_to(title, DOWN, buff=0.25)
+        ptr_i = Text("i", font_size=24, weight=BOLD, color=STROKE_ACTIVE).next_to(left_stage[0], UP, buff=0.12)
+        ptr_j = Text("j", font_size=24, weight=BOLD, color="#38bdf8").next_to(right_stage[0], UP, buff=0.12)
+        self.play(FadeIn(ptr_i), FadeIn(ptr_j), run_time=0.55 * P)
+        self.wait(0.5 * P)
 
-        left_s_row = make_array_row(left_sorted, y_pos=-0.1, fill_c=BG_LEFT, stroke_c=STROKE_LEFT, x_center=-3.1)
-        right_s_row = make_array_row(right_sorted, y_pos=-0.1, fill_c=BG_RIGHT, stroke_c=STROKE_RIGHT, x_center=3.1)
+        i_idx, j_idx, k_idx = 0, 0, 0
+        merged_cells = []
+        merged_nums = []
 
+        while i_idx < len(left_vals) and j_idx < len(right_vals):
+            lv, rv = left_vals[i_idx], right_vals[j_idx]
+            lc, rc = left_stage[i_idx], right_stage[j_idx]
+
+            lc[0].set_stroke(STROKE_ACTIVE, width=4.0)
+            rc[0].set_stroke(STROKE_ACTIVE, width=4.0)
+
+            if lv <= rv:
+                b_cmp = make_banner(f"Compare L[{{i_idx}}] = {{lv}}  <=  R[{{j_idx}}] = {{rv}}   ->   pick {{lv}}", STROKE_ACTIVE)
+                self.play(FadeTransform(banner, b_cmp), run_time=0.55 * P)
+                banner = b_cmp
+                self.wait(0.65 * P)
+
+                rc[0].set_stroke(STROKE_RIGHT, width=2.4)
+                lc[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                move_anims = [lc.animate.move_to(res_slot_pos(k_idx))]
+                i_idx += 1
+                if i_idx < len(left_vals):
+                    move_anims.append(ptr_i.animate.next_to(left_stage[i_idx], UP, buff=0.12))
+                else:
+                    move_anims.append(FadeOut(ptr_i))
+                merged_cells.append(lc)
+                merged_nums.append(lv)
+            else:
+                b_cmp = make_banner(f"Compare L[{{i_idx}}] = {{lv}}  >  R[{{j_idx}}] = {{rv}}   ->   pick {{rv}}", STROKE_ACTIVE)
+                self.play(FadeTransform(banner, b_cmp), run_time=0.55 * P)
+                banner = b_cmp
+                self.wait(0.65 * P)
+
+                lc[0].set_stroke(STROKE_LEFT, width=2.4)
+                rc[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                move_anims = [rc.animate.move_to(res_slot_pos(k_idx))]
+                j_idx += 1
+                if j_idx < len(right_vals):
+                    move_anims.append(ptr_j.animate.next_to(right_stage[j_idx], UP, buff=0.12))
+                else:
+                    move_anims.append(FadeOut(ptr_j))
+                merged_cells.append(rc)
+                merged_nums.append(rv)
+
+            p_step = make_pill(f"Merged [{{k_idx + 1}}/{{n}}]: {{merged_nums}}", stroke_c=STROKE_SORTED)
+            self.play(*move_anims, FadeTransform(pill, p_step), run_time=0.95 * P)
+            pill = p_step
+            self.wait(0.45 * P)
+            k_idx += 1
+
+        # Sao chép các phần tử còn sót lại ở nửa trái hoặc nửa phải
+        while i_idx < len(left_vals):
+            lv = left_vals[i_idx]
+            lc = left_stage[i_idx]
+            b_rem = make_banner(f"Right exhausted -> copy remaining Left element {{lv}}", STROKE_SORTED)
+            lc[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+            move_anims = [FadeTransform(banner, b_rem), lc.animate.move_to(res_slot_pos(k_idx))]
+            i_idx += 1
+            if i_idx < len(left_vals):
+                move_anims.append(ptr_i.animate.next_to(left_stage[i_idx], UP, buff=0.12))
+            else:
+                move_anims.append(FadeOut(ptr_i))
+            merged_cells.append(lc)
+            merged_nums.append(lv)
+            p_step = make_pill(f"Merged [{{k_idx + 1}}/{{n}}]: {{merged_nums}}", stroke_c=STROKE_SORTED)
+            self.play(*move_anims, FadeTransform(pill, p_step), run_time=0.9 * P)
+            banner, pill = b_rem, p_step
+            self.wait(0.4 * P)
+            k_idx += 1
+
+        while j_idx < len(right_vals):
+            rv = right_vals[j_idx]
+            rc = right_stage[j_idx]
+            b_rem = make_banner(f"Left exhausted -> copy remaining Right element {{rv}}", STROKE_SORTED)
+            rc[0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+            move_anims = [FadeTransform(banner, b_rem), rc.animate.move_to(res_slot_pos(k_idx))]
+            j_idx += 1
+            if j_idx < len(right_vals):
+                move_anims.append(ptr_j.animate.next_to(right_stage[j_idx], UP, buff=0.12))
+            else:
+                move_anims.append(FadeOut(ptr_j))
+            merged_cells.append(rc)
+            merged_nums.append(rv)
+            p_step = make_pill(f"Merged [{{k_idx + 1}}/{{n}}]: {{merged_nums}}", stroke_c=STROKE_SORTED)
+            self.play(*move_anims, FadeTransform(pill, p_step), run_time=0.9 * P)
+            banner, pill = b_rem, p_step
+            self.wait(0.4 * P)
+            k_idx += 1
+
+        # Hoàn tất toàn bộ mảng đã sắp xếp
+        b_done = make_banner("Sorted Complete! Merge Sort guarantees O(n log n) in all cases", STROKE_SORTED)
+        p_done = make_pill(f"Sorted: {{merged_nums}}", stroke_c=STROKE_SORTED, text_c="#bbf7d0")
         self.play(
-            ReplacementTransform(banner, b_sub),
-            ReplacementTransform(left_row, left_s_row),
-            ReplacementTransform(right_row, right_s_row),
-            run_time=1.2,
+            FadeOut(empty_slots), FadeOut(left_tag), FadeOut(right_tag),
+            FadeTransform(banner, b_done),
+            FadeTransform(pill, p_done),
+            run_time=0.8 * P,
         )
-        banner = b_sub
-        self.wait(0.9)
+        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in merged_cells], run_time=0.8 * P)
+        self.wait(2.0 * P)
+'''
 
-        # Phase 3: Merge two sorted halves element-by-element
-        merged_vals = sorted(values)
-        b_merge = Text("Merge: Compare front elements & place smaller value", font_size=23, color=STROKE_SORTED)
-        b_merge.next_to(title, DOWN, buff=0.25)
-        self.play(ReplacementTransform(banner, b_merge), run_time=0.6)
-        banner = b_merge
 
-        merged_row = make_array_row(merged_vals, y_pos=-1.9, fill_c=BG_SORTED, stroke_c=STROKE_SORTED, x_center=0.0)
-        merge_arr_l = Arrow(left_s_row.get_bottom(), merged_row.get_top() + LEFT * 0.6, color=STROKE_SORTED, buff=0.15)
-        merge_arr_r = Arrow(right_s_row.get_bottom(), merged_row.get_top() + RIGHT * 0.6, color=STROKE_SORTED, buff=0.15)
-        self.play(GrowArrow(merge_arr_l), GrowArrow(merge_arr_r), run_time=0.6)
+def render_selection_sort_template(params: dict[str, Any] | None = None) -> str:
+    """Sinh code Manim tham số hóa ĐẦY ĐỦ cho Selection Sort (nhịp độ chậm, có nhãn min & hoán đổi vòng cung)."""
+    params = params or {}
+    arr = _sanitize_int_array(params.get("array"), default=[29, 10, 14, 37, 13, 8])
+    title_text = str(params.get("title") or "Selection Sort — Full Algorithm Trace")[:60]
+    pace = _sanitize_pace(params.get("pace"), default=1.0)
 
-        for cell in merged_row:
-            self.play(FadeIn(cell, shift=DOWN * 0.25), run_time=0.45)
+    return f'''from manim import *
+import numpy as np
 
-        b_done = Text(f"Merge Complete — O(n log n): {{merged_vals}}", font_size=25, weight=BOLD, color=STROKE_SORTED)
-        b_done.next_to(title, DOWN, buff=0.25)
-        self.play(ReplacementTransform(banner, b_done), run_time=0.5)
-        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in merged_row], run_time=0.6)
-        self.wait(1.5)
+
+class GeneratedScene(Scene):
+    def construct(self):
+        self.camera.background_color = "#0f172a"
+        BG_DEFAULT = "#1e293b"
+        STROKE_DEFAULT = "#64748b"
+        BG_SCAN = "#1e3a5f"
+        STROKE_SCAN = "#38bdf8"
+        BG_MIN = "#78350f"
+        STROKE_MIN = "#f59e0b"
+        BG_SORTED = "#064e3b"
+        STROKE_SORTED = "#10b981"
+        TEXT_WHITE = "#f8fafc"
+        TEXT_MUTED = "#94a3b8"
+
+        P = {pace!r}
+        values = {arr!r}
+        n = len(values)
+        box_w = min(1.15, 8.8 / max(n, 1))
+        box_h = box_w
+        gap = 0.25
+        step_x = box_w + gap
+        start_x = -((n - 1) * step_x) / 2.0
+        base_y = -0.2
+
+        def slot_pos(idx):
+            return np.array([start_x + idx * step_x, base_y, 0.0])
+
+        title = Text({title_text!r}, font_size=30, weight=BOLD, color=TEXT_WHITE).to_edge(UP, buff=0.35)
+        if title.width > 12.2:
+            title.scale_to_fit_width(12.2)
+
+        def make_banner(txt, col=STROKE_SCAN):
+            b = Text(txt, font_size=22, color=col).next_to(title, DOWN, buff=0.25)
+            if b.width > 12.2:
+                b.scale_to_fit_width(12.2)
+            return b
+
+        cells = []
+        idx_labels = VGroup()
+        for i, v in enumerate(values):
+            rect = RoundedRectangle(width=box_w, height=box_h, corner_radius=0.14, fill_color=BG_DEFAULT, fill_opacity=1.0, stroke_color=STROKE_DEFAULT, stroke_width=2.5)
+            num = Text(str(v), font_size=28, weight=BOLD, color=TEXT_WHITE)
+            cells.append(VGroup(rect, num).move_to(slot_pos(i)))
+            idx_labels.add(Text(str(i), font_size=18, color=TEXT_MUTED).next_to(slot_pos(i), DOWN, buff=box_h / 2 + 0.2))
+
+        banner = make_banner(f"Input array: {{values}} -> find min in unsorted region each pass")
+        self.play(FadeIn(title), FadeIn(banner), FadeIn(VGroup(*cells)), FadeIn(idx_labels), run_time=1.2 * P)
+        self.wait(1.0 * P)
+
+        arr_state = list(values)
+        for i in range(n - 1):
+            min_idx = i
+            cells[min_idx][0].set_fill(BG_MIN).set_stroke(STROKE_MIN, width=3.8)
+            min_tag = Text("min", font_size=18, weight=BOLD, color=STROKE_MIN).next_to(slot_pos(min_idx), UP, buff=box_h / 2 + 0.16)
+            b_pass = make_banner(f"Pass {{i + 1}}: Scan unsorted [{{i}}..{{n - 1}}] -> initial min = {{arr_state[min_idx]}}", STROKE_MIN)
+            self.play(FadeTransform(banner, b_pass), FadeIn(min_tag), run_time=0.65 * P)
+            banner = b_pass
+            self.wait(0.55 * P)
+
+            for j in range(i + 1, n):
+                cells[j][0].set_fill(BG_SCAN).set_stroke(STROKE_SCAN, width=3.4)
+                self.wait(0.32 * P)
+                if arr_state[j] < arr_state[min_idx]:
+                    cells[min_idx][0].set_fill(BG_DEFAULT).set_stroke(STROKE_DEFAULT, width=2.5)
+                    min_idx = j
+                    cells[min_idx][0].set_fill(BG_MIN).set_stroke(STROKE_MIN, width=3.8)
+                    b_new = make_banner(f"Pass {{i + 1}}: Found smaller min = {{arr_state[min_idx]}} at index [{{min_idx}}]", STROKE_MIN)
+                    self.play(
+                        FadeTransform(banner, b_new),
+                        min_tag.animate.next_to(slot_pos(min_idx), UP, buff=box_h / 2 + 0.16),
+                        Indicate(cells[min_idx], color=STROKE_MIN),
+                        run_time=0.65 * P,
+                    )
+                    banner = b_new
+                    self.wait(0.4 * P)
+                else:
+                    cells[j][0].set_fill(BG_DEFAULT).set_stroke(STROKE_DEFAULT, width=2.5)
+
+            if min_idx != i:
+                b_sw = make_banner(f"Swap index [{{i}}] ({{arr_state[i]}}) <-> min [{{min_idx}}] ({{arr_state[min_idx]}})", STROKE_SORTED)
+                arr_state[i], arr_state[min_idx] = arr_state[min_idx], arr_state[i]
+                cells[i], cells[min_idx] = cells[min_idx], cells[i]
+                cells[i][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                self.play(
+                    FadeTransform(banner, b_sw),
+                    FadeOut(min_tag),
+                    cells[i].animate(path_arc=-0.8).move_to(slot_pos(i)),
+                    cells[min_idx].animate(path_arc=-0.8).move_to(slot_pos(min_idx)),
+                    run_time=1.05 * P,
+                )
+                banner = b_sw
+            else:
+                cells[i][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                b_keep = make_banner(f"Index [{{i}}] ({{arr_state[i]}}) is already minimum -> lock sorted", STROKE_SORTED)
+                self.play(FadeTransform(banner, b_keep), FadeOut(min_tag), run_time=0.65 * P)
+                banner = b_keep
+            self.wait(0.75 * P)
+
+        cells[n - 1][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+        b_done = make_banner(f"Sorted Complete — O(n^2) comparisons, O(n) swaps: {{arr_state}}", STROKE_SORTED)
+        self.play(FadeTransform(banner, b_done), run_time=0.7 * P)
+        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in cells], run_time=0.75 * P)
+        self.wait(1.8 * P)
+'''
+
+
+def render_bubble_sort_template(params: dict[str, Any] | None = None) -> str:
+    """Sinh code Manim tham số hóa ĐẦY ĐỦ cho Bubble Sort (nhịp độ chậm, rõ từng cặp so sánh & hoán đổi)."""
+    params = params or {}
+    arr = _sanitize_int_array(params.get("array"), default=[52, 18, 41, 9, 33, 24])
+    title_text = str(params.get("title") or "Bubble Sort — Full Algorithm Trace")[:60]
+    pace = _sanitize_pace(params.get("pace"), default=1.0)
+
+    return f'''from manim import *
+import numpy as np
+
+
+class GeneratedScene(Scene):
+    def construct(self):
+        self.camera.background_color = "#0f172a"
+        BG_DEFAULT = "#1e293b"
+        STROKE_DEFAULT = "#64748b"
+        BG_ACTIVE = "#78350f"
+        STROKE_ACTIVE = "#f59e0b"
+        BG_SORTED = "#064e3b"
+        STROKE_SORTED = "#10b981"
+        TEXT_WHITE = "#f8fafc"
+        TEXT_MUTED = "#94a3b8"
+
+        P = {pace!r}
+        values = {arr!r}
+        n = len(values)
+        box_w = min(1.15, 8.8 / max(n, 1))
+        box_h = box_w
+        gap = 0.25
+        step_x = box_w + gap
+        start_x = -((n - 1) * step_x) / 2.0
+        base_y = -0.2
+
+        def slot_pos(idx):
+            return np.array([start_x + idx * step_x, base_y, 0.0])
+
+        title = Text({title_text!r}, font_size=30, weight=BOLD, color=TEXT_WHITE).to_edge(UP, buff=0.35)
+        if title.width > 12.2:
+            title.scale_to_fit_width(12.2)
+
+        def make_banner(txt, col="#38bdf8"):
+            b = Text(txt, font_size=22, color=col).next_to(title, DOWN, buff=0.25)
+            if b.width > 12.2:
+                b.scale_to_fit_width(12.2)
+            return b
+
+        cells = []
+        idx_labels = VGroup()
+        for i, v in enumerate(values):
+            rect = RoundedRectangle(width=box_w, height=box_h, corner_radius=0.14, fill_color=BG_DEFAULT, fill_opacity=1.0, stroke_color=STROKE_DEFAULT, stroke_width=2.5)
+            num = Text(str(v), font_size=28, weight=BOLD, color=TEXT_WHITE)
+            cells.append(VGroup(rect, num).move_to(slot_pos(i)))
+            idx_labels.add(Text(str(i), font_size=18, color=TEXT_MUTED).next_to(slot_pos(i), DOWN, buff=box_h / 2 + 0.2))
+
+        banner = make_banner(f"Input array: {{values}} -> bubble largest element to the right")
+        self.play(FadeIn(title), FadeIn(banner), FadeIn(VGroup(*cells)), FadeIn(idx_labels), run_time=1.2 * P)
+        self.wait(1.0 * P)
+
+        arr_state = list(values)
+        for p in range(n - 1):
+            swapped = False
+            b_p = make_banner(f"Pass {{p + 1}}: Compare adjacent pairs in [0..{{n - 1 - p}}]", STROKE_ACTIVE)
+            self.play(FadeTransform(banner, b_p), run_time=0.6 * P)
+            banner = b_p
+            self.wait(0.55 * P)
+
+            for j in range(n - 1 - p):
+                cells[j][0].set_fill(BG_ACTIVE).set_stroke(STROKE_ACTIVE, width=3.5)
+                cells[j + 1][0].set_fill(BG_ACTIVE).set_stroke(STROKE_ACTIVE, width=3.5)
+                self.wait(0.45 * P)
+                if arr_state[j] > arr_state[j + 1]:
+                    swapped = True
+                    arr_state[j], arr_state[j + 1] = arr_state[j + 1], arr_state[j]
+                    cells[j], cells[j + 1] = cells[j + 1], cells[j]
+                    self.play(
+                        cells[j].animate(path_arc=-0.65).move_to(slot_pos(j)),
+                        cells[j + 1].animate(path_arc=-0.65).move_to(slot_pos(j + 1)),
+                        run_time=0.72 * P,
+                    )
+                    self.wait(0.28 * P)
+                else:
+                    self.wait(0.32 * P)
+                cells[j][0].set_fill(BG_DEFAULT).set_stroke(STROKE_DEFAULT, width=2.5)
+                cells[j + 1][0].set_fill(BG_DEFAULT).set_stroke(STROKE_DEFAULT, width=2.5)
+
+            locked = n - 1 - p
+            cells[locked][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+            self.play(Indicate(cells[locked], color=STROKE_SORTED, scale_factor=1.08), run_time=0.55 * P)
+            self.wait(0.45 * P)
+            if not swapped:
+                for k in range(locked):
+                    cells[k][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                break
+
+        cells[0][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+        b_done = make_banner(f"Sorted Complete — Bubble Sort: {{arr_state}}", STROKE_SORTED)
+        self.play(FadeTransform(banner, b_done), run_time=0.65 * P)
+        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in cells], run_time=0.75 * P)
+        self.wait(1.8 * P)
+'''
+
+
+def render_quicksort_template(params: dict[str, Any] | None = None) -> str:
+    """Sinh code Manim tham số hóa ĐẦY ĐỦ cho QuickSort (Lomuto Partition, chậm rãi, nhãn pivot & swap vòng cung)."""
+    params = params or {}
+    arr = _sanitize_int_array(params.get("array"), default=[38, 12, 45, 7, 29, 21])
+    title_text = str(params.get("title") or "QuickSort (Lomuto) — Full Algorithm Trace")[:60]
+    pace = _sanitize_pace(params.get("pace"), default=1.0)
+
+    return f'''from manim import *
+import numpy as np
+
+
+class GeneratedScene(Scene):
+    def construct(self):
+        self.camera.background_color = "#0f172a"
+        BG_DEFAULT = "#1e293b"
+        STROKE_DEFAULT = "#64748b"
+        BG_PIVOT = "#78350f"
+        STROKE_PIVOT = "#f59e0b"
+        BG_LE = "#1e3a5f"
+        STROKE_LE = "#38bdf8"
+        BG_SORTED = "#064e3b"
+        STROKE_SORTED = "#10b981"
+        TEXT_WHITE = "#f8fafc"
+        TEXT_MUTED = "#94a3b8"
+
+        P = {pace!r}
+        values = {arr!r}
+        n = len(values)
+        box_w = min(1.15, 8.8 / max(n, 1))
+        box_h = box_w
+        gap = 0.25
+        step_x = box_w + gap
+        start_x = -((n - 1) * step_x) / 2.0
+        base_y = -0.2
+
+        def slot_pos(idx):
+            return np.array([start_x + idx * step_x, base_y, 0.0])
+
+        title = Text({title_text!r}, font_size=30, weight=BOLD, color=TEXT_WHITE).to_edge(UP, buff=0.35)
+        if title.width > 12.2:
+            title.scale_to_fit_width(12.2)
+
+        def make_banner(txt, col=STROKE_LE):
+            b = Text(txt, font_size=22, color=col).next_to(title, DOWN, buff=0.25)
+            if b.width > 12.2:
+                b.scale_to_fit_width(12.2)
+            return b
+
+        cells = []
+        idx_labels = VGroup()
+        for i, v in enumerate(values):
+            rect = RoundedRectangle(width=box_w, height=box_h, corner_radius=0.14, fill_color=BG_DEFAULT, fill_opacity=1.0, stroke_color=STROKE_DEFAULT, stroke_width=2.5)
+            num = Text(str(v), font_size=28, weight=BOLD, color=TEXT_WHITE)
+            cells.append(VGroup(rect, num).move_to(slot_pos(i)))
+            idx_labels.add(Text(str(i), font_size=18, color=TEXT_MUTED).next_to(slot_pos(i), DOWN, buff=box_h / 2 + 0.2))
+
+        banner = make_banner(f"Input array: {{values}} -> recursive Lomuto Partition")
+        self.play(FadeIn(title), FadeIn(banner), FadeIn(VGroup(*cells)), FadeIn(idx_labels), run_time=1.2 * P)
+        self.wait(1.0 * P)
+
+        arr_state = list(values)
+        locked = set()
+
+        def qsort(lo, hi):
+            nonlocal banner
+            if lo > hi:
+                return
+            if lo == hi:
+                locked.add(lo)
+                cells[lo][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                self.play(Indicate(cells[lo], color=STROKE_SORTED, scale_factor=1.08), run_time=0.5 * P)
+                self.wait(0.35 * P)
+                return
+
+            pivot_val = arr_state[hi]
+            cells[hi][0].set_fill(BG_PIVOT).set_stroke(STROKE_PIVOT, width=4.0)
+            pivot_tag = Text("pivot", font_size=18, weight=BOLD, color=STROKE_PIVOT).next_to(slot_pos(hi), UP, buff=box_h / 2 + 0.16)
+            b_pv = make_banner(f"Partition [{{lo}}..{{hi}}]: Choose pivot = {{pivot_val}} (index {{hi}})", STROKE_PIVOT)
+            self.play(FadeTransform(banner, b_pv), FadeIn(pivot_tag), run_time=0.7 * P)
+            banner = b_pv
+            self.wait(0.75 * P)
+
+            i = lo - 1
+            for j in range(lo, hi):
+                cells[j][0].set_stroke(STROKE_PIVOT, width=3.4)
+                self.wait(0.4 * P)
+                if arr_state[j] <= pivot_val:
+                    i += 1
+                    cells[j][0].set_fill(BG_LE).set_stroke(STROKE_LE, width=3.2)
+                    if i != j:
+                        arr_state[i], arr_state[j] = arr_state[j], arr_state[i]
+                        cells[i], cells[j] = cells[j], cells[i]
+                        self.play(
+                            cells[i].animate(path_arc=-0.8).move_to(slot_pos(i)),
+                            cells[j].animate(path_arc=-0.8).move_to(slot_pos(j)),
+                            run_time=0.85 * P,
+                        )
+                        self.wait(0.35 * P)
+                    else:
+                        self.wait(0.4 * P)
+                else:
+                    cells[j][0].set_stroke(STROKE_DEFAULT, width=2.5)
+                    self.wait(0.25 * P)
+
+            p_idx = i + 1
+            if p_idx != hi:
+                arr_state[p_idx], arr_state[hi] = arr_state[hi], arr_state[p_idx]
+                cells[p_idx], cells[hi] = cells[hi], cells[p_idx]
+                self.play(
+                    cells[p_idx].animate(path_arc=-0.8).move_to(slot_pos(p_idx)),
+                    cells[hi].animate(path_arc=-0.8).move_to(slot_pos(hi)),
+                    pivot_tag.animate.next_to(slot_pos(p_idx), UP, buff=box_h / 2 + 0.16),
+                    run_time=0.95 * P,
+                )
+                self.wait(0.35 * P)
+
+            locked.add(p_idx)
+            for k in range(lo, hi + 1):
+                if k in locked:
+                    cells[k][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+                else:
+                    cells[k][0].set_fill(BG_DEFAULT).set_stroke(STROKE_DEFAULT, width=2.5)
+
+            b_pl = make_banner(f"Pivot {{pivot_val}} placed at final index [{{p_idx}}]  ->  {{arr_state}}", STROKE_SORTED)
+            self.play(FadeTransform(banner, b_pl), FadeOut(pivot_tag), run_time=0.65 * P)
+            banner = b_pl
+            self.wait(0.9 * P)
+
+            qsort(lo, p_idx - 1)
+            qsort(p_idx + 1, hi)
+
+        qsort(0, n - 1)
+        for k in range(n):
+            cells[k][0].set_fill(BG_SORTED).set_stroke(STROKE_SORTED, width=3.0)
+
+        b_done = make_banner(f"Sorted Complete — QuickSort O(n log n) avg: {{arr_state}}", STROKE_SORTED)
+        self.play(FadeTransform(banner, b_done), run_time=0.65 * P)
+        self.play(*[Indicate(c, color=STROKE_SORTED, scale_factor=1.06) for c in cells], run_time=0.75 * P)
+        self.wait(1.8 * P)
 '''
 
 
@@ -509,6 +1236,10 @@ TEMPLATE_REGISTRY: dict[str, Any] = {
     "insertion_sort": render_insertion_sort_template,
     "straight_insertion_sort": render_insertion_sort_template,
     "merge_sort": render_merge_sort_template,
+    "selection_sort": render_selection_sort_template,
+    "bubble_sort": render_bubble_sort_template,
+    "quicksort": render_quicksort_template,
+    "quick_sort": render_quicksort_template,
 }
 
 

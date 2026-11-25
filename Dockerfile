@@ -52,9 +52,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libmagic1 \
-        # Render video micro-content: ffmpeg ghép cảnh, DejaVu cho chữ trên slide.
+        # Render video micro-content: ffmpeg ghép cảnh, DejaVu cho chữ trên slide,
+        # Cairo + Pango cho engine hoạt họa Manim (không cài LaTeX/texlive).
         ffmpeg \
         fonts-dejavu-core \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
         # opencv-python (docling OCR) needs these at import time; without
         # them OCR fails with "libGL.so.1: cannot open shared object file".
         libgl1 \

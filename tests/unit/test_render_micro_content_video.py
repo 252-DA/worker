@@ -402,6 +402,7 @@ async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
     from worker.services.tts_client import EdgeTtsClient
 
     monkeypatch.delenv("MICRO_CONTENT_ALLOW_MOCK_TTS", raising=False)
+    monkeypatch.delenv("MICRO_CONTENT_GOOGLE_TTS_FALLBACK", raising=False)
     fake_edge = SimpleNamespace(
         Communicate=MagicMock(side_effect=RuntimeError("network unreachable"))
     )
@@ -419,6 +420,7 @@ async def test_edge_tts_allows_fallback_only_with_env_flag(tmp_path, monkeypatch
     from worker.services.tts_client import EdgeTtsClient
 
     monkeypatch.setenv("MICRO_CONTENT_ALLOW_MOCK_TTS", "true")
+    monkeypatch.delenv("MICRO_CONTENT_GOOGLE_TTS_FALLBACK", raising=False)
     fake_edge = SimpleNamespace(
         Communicate=MagicMock(side_effect=RuntimeError("network unreachable"))
     )

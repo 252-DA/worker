@@ -8,6 +8,7 @@ import pytest
 from document_chunk.shared.result import Err, Ok
 
 from worker.services.manim_generator import (
+    TEMPLATE_REGISTRY,
     ManimGenerationRequest,
     ManimGenerationResult,
     ManimGenerator,
@@ -64,12 +65,71 @@ def test_ast_guard_rejects_unsafe_or_invalid_code(bad_code: str, expected_cat: s
 
 
 def test_templates_pass_ast_guard():
-    ins_code = render_insertion_sort_template({"array": [10, 5, 2, 8]})
-    merge_code = render_merge_sort_template({"array": [38, 27, 43, 3, 9, 82]})
-    assert validate_manim_source_code(ins_code).valid is True
-    assert validate_manim_source_code(merge_code).valid is True
-    assert "[10, 5, 2, 8]" in ins_code
-    assert "[38, 27, 43, 3, 9, 82]" in merge_code
+    for name in ("insertion_sort", "merge_sort", "selection_sort", "bubble_sort", "quicksort"):
+        code = TEMPLATE_REGISTRY[name]({"array": [38, 27, 43, 3, 9, 82], "pace": 1.35})
+        res = validate_manim_source_code(code)
+        assert res.valid is True, f"Template {name} failed AST guard: {res.error}"
+        assert "[38, 27, 43, 3, 9, 82]" in code
+        assert "P = 1.35" in code
+
+
+def test_manim_preview_payload_endpoint_uses_template_and_cache(monkeypatch, tmp_path: Path):
+    """Kiểm chứng endpoint /manim-preview trả về MP4 base64, duration và bật cache ở lần gọi thứ 2."""
+    from worker import health as health_mod
+
+    health_mod._MANIM_PREVIEW_CACHE.clear()
+    monkeypatch.setattr(health_mod, "_MANIM_PREVIEW_DISK_DIR", str(tmp_path / "preview_cache"))
+    calls = {"count": 0}
+
+    async def fake_generate(self, request, output_mp4_path):
+        calls["count"] += 1
+        assert request.resolution == (640, 360)
+        assert request.fps == 12
+        Path(output_mp4_path).write_bytes(b"FAKE_PREVIEW_MP4")
+        return ManimGenerationResult(
+            success=True,
+            clip_path=output_mp4_path,
+            source_code=VALID_SCENE_CODE,
+            tier_used="TEMPLATE",
+            attempts=1,
+            duration_seconds=24.5,
+        )
+
+    monkeypatch.setattr(ManimGenerator, "generate_scene_clip", fake_generate)
+    monkeypatch.setattr(health_mod, "_probe_video_duration", lambda _p: 24.5)
+
+    body = {
+        "visual_mode": "MANIM_TEMPLATE",
+        "title": "Cảnh 1: Bubble Sort",
+        "manim_template": "bubble_sort",
+        "manim_params": {"array": [52, 18, 41, 9, 33, 24], "pace": 1.0},
+    }
+    payload1, status1 = health_mod.render_manim_preview_payload(body)
+    assert status1 == 200
+    assert payload1["cached"] is False
+    assert payload1["duration"] == 24.5
+    assert payload1["tier_used"] == "TEMPLATE"
+    assert payload1["video_base64"]
+    assert calls["count"] == 1
+
+    # Gọi lại với tiêu đề cảnh khác nhưng cùng mẫu + mảng phải hit cache tức thì!
+    body_other_title = {**body, "title": "Cảnh 6: Ví dụ minh họa"}
+    payload2, status2 = health_mod.render_manim_preview_payload(body_other_title)
+    assert status2 == 200
+    assert payload2["cached"] is True
+    assert calls["count"] == 1
+
+    # Xóa RAM cache vẫn phải hit disk cache
+    health_mod._MANIM_PREVIEW_CACHE.clear()
+    payload3, status3 = health_mod.render_manim_preview_payload(body_other_title)
+    assert status3 == 200
+    assert payload3["cached"] is True
+    assert calls["count"] == 1
+
+    # Từ chối SLIDE_STATIC
+    err_payload, err_status = health_mod.render_manim_preview_payload({"visual_mode": "SLIDE_STATIC"})
+    assert err_status == 400
+    assert "error" in err_payload
 
 
 def test_classify_runtime_error():

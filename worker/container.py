@@ -607,7 +607,7 @@ class MicroContentVideoContainer(BaseWorkerContainer):
 
     def __init__(self, settings: WorkerSettings) -> None:
         super().__init__(settings)
-        from worker.services.manim_generator import ManimGenerator
+        from worker.services.manim_generator import ManimGenerator, build_default_manim_llm_client
         from worker.services.slide_generator import SlideGenerator
         from worker.services.tts_client import get_default_tts_client
         from worker.services.video_composer import VideoComposer
@@ -617,7 +617,7 @@ class MicroContentVideoContainer(BaseWorkerContainer):
         self.tts_client = get_default_tts_client()
         self.slide_generator = SlideGenerator()
         self.video_composer = VideoComposer()
-        self.manim_generator = ManimGenerator()
+        self.manim_generator = ManimGenerator(llm_client=build_default_manim_llm_client())
 
     @property
     def render_micro_content_video_use_case(self):
