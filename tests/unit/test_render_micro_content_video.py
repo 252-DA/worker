@@ -419,7 +419,7 @@ async def test_published_results_and_parsed_command_match_contract_schemas():
 async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
     import sys
 
-    from worker.services.tts_client import EdgeTtsClient
+    from worker.services.video.tts_client import EdgeTtsClient
 
     monkeypatch.delenv("MICRO_CONTENT_ALLOW_MOCK_TTS", raising=False)
     fake_edge = SimpleNamespace(
@@ -438,7 +438,7 @@ async def test_edge_tts_strict_failure_without_opt_in(tmp_path, monkeypatch):
 async def test_edge_tts_allows_fallback_only_with_env_flag(tmp_path, monkeypatch):
     import sys
 
-    from worker.services.tts_client import EdgeTtsClient
+    from worker.services.video.tts_client import EdgeTtsClient
 
     monkeypatch.setenv("MICRO_CONTENT_ALLOW_MOCK_TTS", "true")
     fake_edge = SimpleNamespace(
@@ -453,7 +453,7 @@ async def test_edge_tts_allows_fallback_only_with_env_flag(tmp_path, monkeypatch
 
 
 def test_build_webvtt_and_timeline_proportional_and_cues():
-    from worker.services.micro_content_subtitles import SubtitleCue, build_webvtt_and_timeline
+    from worker.services.video.micro_content_subtitles import SubtitleCue, build_webvtt_and_timeline
 
     vtt, transcript, timeline = build_webvtt_and_timeline(
         scenes=[
@@ -479,7 +479,7 @@ def test_build_webvtt_and_timeline_proportional_and_cues():
 
 
 def test_video_composer_builds_bullet_reveal_with_subtle_zoom():
-    from worker.services.video_composer import SceneMedia, VideoComposer
+    from worker.services.video.video_composer import SceneMedia, VideoComposer
 
     composer = VideoComposer()
     inputs, video_filter, audio_index = composer._visual_inputs(
@@ -505,7 +505,7 @@ def test_video_composer_builds_bullet_reveal_with_subtle_zoom():
 
 
 def test_video_composer_supports_static_legacy_scene():
-    from worker.services.video_composer import SceneMedia, VideoComposer
+    from worker.services.video.video_composer import SceneMedia, VideoComposer
 
     composer = VideoComposer()
     inputs, video_filter, audio_index = composer._visual_inputs(
@@ -530,7 +530,7 @@ def test_video_composer_supports_static_legacy_scene():
 async def test_edge_tts_retries_the_same_voice_after_transient_failure(tmp_path, monkeypatch):
     import sys
 
-    from worker.services.tts_client import EdgeTtsClient
+    from worker.services.video.tts_client import EdgeTtsClient
 
     class SuccessfulCommunication:
         async def stream(self):
@@ -618,7 +618,7 @@ async def test_invalid_manim_spec_is_permanent_render_error(visual):
 
 
 def test_video_composer_accepts_manim_movie():
-    from worker.services.video_composer import SceneMedia, VideoComposer
+    from worker.services.video.video_composer import SceneMedia, VideoComposer
 
     inputs, video_filter, audio_index = VideoComposer()._visual_inputs(
         SceneMedia(
@@ -642,7 +642,7 @@ def test_video_composer_accepts_manim_movie():
 async def test_manim_generator_invokes_cli_with_validated_json(tmp_path, monkeypatch):
     import json
 
-    from worker.services import manim_generator as module
+    from worker.services.video import manim_generator as module
 
     monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: object())
     captured = {}

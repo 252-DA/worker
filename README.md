@@ -62,6 +62,27 @@ DeepSeek is also available as a first-class provider: set
 `LLM__PROVIDER=deepseek`, `LLM__MODEL=deepseek-chat`, and `LLM__API_KEY`.
 `LLM__BASE_URL` is optional and defaults to `https://api.deepseek.com`.
 
+## Layout
+
+Dependencies point one way (enforced by `tests/unit/test_package_layout.py`):
+
+```
+runners -> container -> use_cases -> reporters, services -> adapters
+                        use_cases -> use_cases/shared
+```
+
+- `worker/runners/` — one BullMQ consumer per queue; parses jobs and drives use cases.
+- `worker/container/` — dependency wiring, one module per runner (`base.py`, `llm.py` shared).
+- `worker/use_cases/` — the work itself; shared pieces live in `use_cases/shared/`,
+  use cases never import each other.
+- `worker/reporters/` — every result sent back to core-api on `worker_results`,
+  one module per result kind (kind, `result_id`, payload shape).
+- `worker/services/` — helpers that are not use cases; `services/video/` holds the
+  slide/Manim/TTS/ffmpeg pipeline.
+- `worker/adapters/` — worker-specific I/O (BullMQ result queue, read-only Postgres,
+  ai-runtime LLM client); imports nothing else from `worker`.
+- `worker/prompts/` — prompt text per task.
+
 ## Test
 
 ```bash

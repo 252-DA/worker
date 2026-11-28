@@ -1,30 +1,30 @@
 """
-Tests for worker/container.py — container builders and dependency wiring.
+Tests for worker/container/ — container builders and dependency wiring.
 """
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from worker.config import WorkerSettings
-from worker.container import (
+from worker.container.base import (
     BaseWorkerContainer,
-    DocumentWorkerContainer,
-    EnrichmentWorkerContainer,
-    OutboxWorkerContainer,
-    build_chunker,
-    build_document_container,
-    build_embedder,
-    build_enrichment_container,
     build_file_storage,
     build_graph_store,
     build_job_queue,
     build_learning_context_client,
-    build_llm_client,
     build_metadata_store,
-    build_outbox_container,
-    build_parsers,
     build_vector_store,
 )
+from worker.container.document import (
+    DocumentWorkerContainer,
+    build_chunker,
+    build_document_container,
+    build_embedder,
+    build_parsers,
+)
+from worker.container.enrichment import EnrichmentWorkerContainer, build_enrichment_container
+from worker.container.llm import build_llm_client
+from worker.container.outbox import OutboxWorkerContainer, build_outbox_container
 
 
 class TestBaseWorkerContainer:
@@ -202,7 +202,7 @@ class TestBuilderShortcuts:
 def test_structural_chunker_selected_from_settings(tmp_path, monkeypatch):
     from tokenizers import Tokenizer, models
     from worker.config import WorkerSettings
-    from worker.container import build_chunker
+    from worker.container.document import build_chunker
     from document_chunk.adapters.chunkers.structural import StructuralChunker
     path = tmp_path/'tokenizer.json'
     Tokenizer(models.WordLevel({'[UNK]': 0}, unk_token='[UNK]')).save(str(path))

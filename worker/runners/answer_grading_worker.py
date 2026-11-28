@@ -24,7 +24,7 @@ Run:
 """
 import asyncio
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from typing import Any
 
 from ai_runtime.catalog import QUIZ_VERIFICATION
@@ -35,7 +35,9 @@ from document_chunk.domain.ports.job_queue import ANSWER_GRADING_QUEUE_NAME
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
-from worker.container import build_answer_grading_container
+from worker.container.answer_grading import build_answer_grading_container
+from worker.reporters.grading import GradingReporter
+from worker.runners.bullmq_jobs import is_final_attempt
 from worker.runtime import (
     build_redis_options,
     drain_bullmq_worker,
@@ -44,23 +46,10 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
-from worker.services.result_publisher import (
-    ESSAY_GRADING_RESULT,
-    MICRO_CONTENT_GRADING_RESULT,
-    QUIZ_GRADING_RESULT,
-    make_result_id,
-)
 from worker.use_cases.grade_essay_submission import EssayGradingRequest
-from worker.use_cases.grade_micro_content_answers import (
-    GradeMicroContentAnswersRequest,
-    micro_content_result_payload,
-)
-from worker.use_cases.grade_short_answers import (
-    AnswerGrade,
-    AnswerToGrade,
-    GradeShortAnswersRequest,
-    quiz_result_payload,
-)
+from worker.use_cases.grade_micro_content_answers import GradeMicroContentAnswersRequest
+from worker.use_cases.grade_short_answers import GradeShortAnswersRequest
+from worker.use_cases.shared.rubric_grading import AnswerGrade, AnswerToGrade
 
 logger = get_logger(__name__)
 
@@ -206,13 +195,6 @@ def parse_essay_job(data: Any, job_id: Any = None) -> EssayGradingRequest:
     )
 
 
-def is_final_attempt(bull_job: Any) -> bool:
-    """``attemptsMade`` đếm số lần đã thất bại, nên lần đang chạy là lần thứ +1."""
-    opts = getattr(bull_job, "opts", None) or {}
-    attempts = int(opts.get("attempts") or 1)
-    return int(getattr(bull_job, "attemptsMade", 0) or 0) + 1 >= attempts
-
-
 def load_answer_progress(bull_job: Any, answer_ids: set[str]) -> dict[str, AnswerGrade]:
     """Kết quả từng câu đã tính ở lượt thử trước; mục hỏng hay lạ thì bỏ (chấm lại câu đó)."""
     data = getattr(bull_job, "data", None)
@@ -239,15 +221,10 @@ async def save_progress(bull_job: Any, progress: Any) -> None:
                        error=str(exc))
 
 
-async def _publish_or_keep(container, bull_job, kind: str, payload: dict, *, source_event_id: str,
-                           progress: Any) -> str:
+async def _publish_or_keep(bull_job, publish: Awaitable[str], *, progress: Any) -> str:
     """Gửi kết quả; Redis không nhận thì giữ kết quả trong job rồi ném lỗi để BullMQ thử lại."""
     try:
-        return await container.result_publisher.publish(
-            kind, payload,
-            result_id=make_result_id(kind, source_event_id),
-            source_event_id=source_event_id,
-        )
+        return await publish
     except Exception:
         await save_progress(bull_job, progress)
         raise
@@ -259,24 +236,25 @@ async def process_grading_job(container, bull_job, job_token):
     event_type = data.get("event_type") if isinstance(data, dict) else None
     job_id = getattr(bull_job, "id", None)
     final = is_final_attempt(bull_job)
+    reporter = GradingReporter(container.result_publisher)
 
     if event_type == MICRO_CONTENT_GRADING_REQUESTED:
-        kind, label = MICRO_CONTENT_GRADING_RESULT, "micro-content"
+        label = "micro-content"
         try:
             request = parse_micro_content_grading_job(data, job_id)
         except (KeyError, TypeError, ValueError) as exc:
             raise UnrecoverableError(f"invalid micro-content grading job: {exc}") from exc
         use_case = container.grade_micro_content_answers_use_case
-        build_payload = micro_content_result_payload
+        report = reporter.micro_content
         ref = {"attempt_id": request.attempt_id}
     else:
-        kind, label = QUIZ_GRADING_RESULT, "answer-grading"
+        label = "answer-grading"
         try:
             request = parse_grading_job(data, job_id)
         except (KeyError, TypeError, ValueError) as exc:
             raise UnrecoverableError(f"invalid answer-grading job: {exc}") from exc
         use_case = container.grade_short_answers_use_case
-        build_payload = quiz_result_payload
+        report = reporter.quiz
         ref = {"submission_id": request.submission_id}
 
     # Use case gọi LLM đồng bộ: chạy ngoài event loop.
@@ -291,10 +269,7 @@ async def process_grading_job(container, bull_job, job_token):
         await save_progress(bull_job, progress)
         raise ProcessingError(f"{label}: {outcome.retry} câu tự luận chưa chấm được ({ref})")
 
-    result_id = await _publish_or_keep(
-        container, bull_job, kind, build_payload(request, outcome.grades),
-        source_event_id=request.event_id, progress=progress,
-    )
+    result_id = await _publish_or_keep(bull_job, report(request, outcome.grades), progress=progress)
     return {**ref, "graded": outcome.graded, "needs_review": outcome.needs_review, "result_id": result_id}
 
 
@@ -326,8 +301,7 @@ async def process_essay_job(container, bull_job, job_token):
         payload = result.unwrap().payload
 
     result_id = await _publish_or_keep(
-        container, bull_job, ESSAY_GRADING_RESULT, payload,
-        source_event_id=request.event_id, progress=payload,
+        bull_job, GradingReporter(container.result_publisher).essay(payload, request.event_id), progress=payload,
     )
     graded = payload.get("result") if payload["status"] == "GRADED" else None
     return {

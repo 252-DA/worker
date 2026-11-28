@@ -12,7 +12,8 @@ from document_chunk.domain.ports.job_queue import DOCUMENT_ENRICHMENT_QUEUE_NAME
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
-from worker.container import build_enrichment_container
+from worker.container.enrichment import build_enrichment_container
+from worker.runners.bullmq_jobs import job_attempt
 from worker.runtime import (
     build_redis_options,
     install_signal_handlers,
@@ -20,7 +21,6 @@ from worker.runtime import (
     setup_worker_runtime,
     shutdown_runtime,
 )
-from worker.services.document_reporter import job_attempt
 from worker.services.processing_generation import newer_generation
 from worker.use_cases.run_enrichment import RunEnrichmentRequest
 

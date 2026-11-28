@@ -37,14 +37,15 @@ from document_chunk.domain.ports.metadata_store import (
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
-from worker.services.document_reporter import (
+from document_chunk.shared.tracing import get_tracer
+
+from worker.prompts import enrichment as prompts
+from worker.reporters.document_processing import (
     STAGE_ENRICHMENT,
     PublishingDocumentStatusReporter,
 )
-from worker.services.result_publisher import ENRICHMENT_CONTENT_RESULT, make_result_id
-from worker.prompts import enrichment as prompts
-from document_chunk.shared.tracing import get_tracer
+from worker.reporters.enrichment_content import EnrichmentContentReporter
+from worker.use_cases.shared.llm_role import LlmRole
 
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -140,9 +141,6 @@ class RunEnrichmentResponse:
     quiz_count: int
 
 
-# lesson_cards.title là VARCHAR(255); LLM thỉnh thoảng trả tiêu đề dài hơn.
-_MAX_CARD_TITLE = 255
-
 # llm_usage_logs.status CHECK chỉ nhận ba giá trị này, phân biệt hoa thường.
 _USAGE_OK = "OK"
 _USAGE_ERROR = "ERROR"
@@ -171,6 +169,7 @@ class RunEnrichmentUseCase:
         self._metadata_store = metadata_store
         self._llm_client = llm_client
         self._publisher = result_publisher
+        self._content_reporter = EnrichmentContentReporter(result_publisher)
         self._max_section_chars = max_section_chars
         self._role = LlmRole(client=llm_client, provider=llm_provider, profile=llm_profile)
 
@@ -360,57 +359,14 @@ class RunEnrichmentUseCase:
         lesson_cards: list[StoredLessonCard],
         quiz_items: list[StoredQuizItem],
     ) -> Result[None, Exception]:
-        """
-        ENRICHMENT_CONTENT_RESULT: core-api thay toàn bộ học liệu nháp của tài
-        liệu bằng bộ này (danh sách rỗng = xoá nháp), đúng ngữ nghĩa cũ của
-        persist_enrichment_batch. Một kết quả cho mỗi lượt xử lý tài liệu.
-        """
-        payload = {
-            "document_id": str(document_id),
-            "processing_generation": processing_generation,
-            "model_id": self._llm_client.model_id,
-            "lesson_cards": [
-                {
-                    "card_id": card.card_id,
-                    # list_chunks trả chunk_id kiểu uuid.UUID: JSON chỉ nhận str.
-                    "primary_chunk_id": str(card.primary_chunk_id),
-                    "source_chunk_ids": [
-                        str(chunk_id)
-                        for chunk_id in (card.source_chunk_ids or (card.primary_chunk_id,))
-                    ],
-                    "heading_path": list(card.heading_path),
-                    "title": card.title[:_MAX_CARD_TITLE],
-                    "bullets": list(card.bullets),
-                    "key_insight": card.key_insight,
-                    "card_index": card.card_index,
-                }
-                for card in lesson_cards
-            ],
-            "quiz_items": [
-                {
-                    "quiz_id": item.question_id,
-                    "primary_chunk_id": str(item.primary_chunk_id),
-                    "source_chunk_ids": [
-                        str(chunk_id)
-                        for chunk_id in (item.source_chunk_ids or (item.primary_chunk_id,))
-                    ],
-                    "question": item.question,
-                    "choices": list(item.choices),
-                    "correct_index": item.correct_index,
-                    "explanation": item.explanation,
-                }
-                for item in quiz_items
-            ],
-        }
+        """Gửi học liệu nháp (ENRICHMENT_CONTENT_RESULT, reporters/enrichment_content.py)."""
         try:
-            self._publisher.publish_sync(
-                ENRICHMENT_CONTENT_RESULT,
-                payload,
-                result_id=make_result_id(
-                    ENRICHMENT_CONTENT_RESULT,
-                    str(document_id),
-                    f"g{processing_generation}",
-                ),
+            self._content_reporter.report(
+                document_id=document_id,
+                processing_generation=processing_generation,
+                model_id=self._llm_client.model_id,
+                lesson_cards=lesson_cards,
+                quiz_items=quiz_items,
             )
         except Exception as exc:  # noqa: BLE001 -- Redis/hợp đồng: job phải lỗi để retry
             return Err(exc)

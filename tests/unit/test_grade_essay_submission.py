@@ -10,7 +10,6 @@ from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.shared.result import Err, Ok
 from tests.support import RecordingResultPublisher
 from tests.unit.grading_contract import FakeBullJob, assert_matches_contract, new_id
-from worker.llm_role import LlmRole
 from worker.runners.answer_grading_worker import parse_essay_job, process_essay_job
 from worker.services.essay_text import UnsupportedAsset, extract_text
 from worker.use_cases.grade_essay_submission import (
@@ -20,6 +19,7 @@ from worker.use_cases.grade_essay_submission import (
     EssayGradingRequest,
     GradeEssaySubmissionUseCase,
 )
+from worker.use_cases.shared.llm_role import LlmRole
 
 RUBRIC = [
     {"criterion": "Nội dung", "description": "Đúng trọng tâm", "points": 6},

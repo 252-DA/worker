@@ -32,7 +32,7 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore, Ingestion
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.services.result_publisher import (
+from worker.adapters.result_publisher import (
     DOCUMENT_PROCESSING_RESULT,
     InvalidWorkerResult,
     make_result_id,
@@ -67,25 +67,6 @@ STAGE_STATUSES: dict[str, frozenset[IngestionStatus]] = {
 MAX_ERROR_CHARS = 1000
 MAX_REASON_CHARS = 255
 MAX_CHAPTER_CODE_CHARS = 20
-
-
-def job_attempt(job: Any) -> int:
-    """
-    Lần chạy thứ mấy (từ 1) của job BullMQ đang xử lý. ``attemptsStarted`` tăng
-    cả khi job bị chạy lại sau stall (worker chết giữa chừng), ``attemptsMade``
-    chỉ tăng khi job lỗi; lấy số lớn hơn để lần chạy sau luôn lớn hơn lần trước.
-    """
-    started = _non_negative_int(getattr(job, "attemptsStarted", 0))
-    made = _non_negative_int(getattr(job, "attemptsMade", 0))
-    return max(started, made + 1, 1)
-
-
-def _non_negative_int(value: Any) -> int:
-    try:
-        number = int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-    return max(number, 0)
 
 
 class PublishingDocumentStatusReporter(IDocumentStatusReporter):

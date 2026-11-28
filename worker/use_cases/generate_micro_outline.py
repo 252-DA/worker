@@ -29,9 +29,9 @@ from document_chunk.domain.ports.metadata_store import (
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import micro_content as prompts
-from worker.use_cases._chunk_text import format_page_chunks_text, resolve_course_title
+from worker.use_cases.shared.chunk_text import format_page_chunks_text, resolve_course_title
+from worker.use_cases.shared.llm_role import LlmRole
 
 logger = get_logger(__name__)
 

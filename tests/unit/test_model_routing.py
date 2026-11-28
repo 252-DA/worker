@@ -18,10 +18,10 @@ from tests.support import RecordingResultPublisher, as_llm_client
 from tests.unit.test_quizgen_phase0 import _all_supported, _curriculum, _questions_json
 from worker.adapters.ai_runtime_llm_client import AIRuntimeLLMClient
 from worker.config import WorkerSettings
-from worker.container import build_llm_client, build_llm_client_for, build_model_registry
-from worker.llm_role import LlmRole
+from worker.container.llm import build_llm_client, build_llm_client_for, build_model_registry
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizUseCase
 from worker.use_cases.run_enrichment import RunEnrichmentRequest, RunEnrichmentUseCase
+from worker.use_cases.shared.llm_role import LlmRole
 
 _LEGACY_ENV = ("LLM__PROVIDER", "LLM__MODEL", "LLM__BASE_URL", "LLM__API_KEY")
 _PROFILE_ENV = (
@@ -131,8 +131,8 @@ class _Bindings:
 @pytest.fixture
 def db_bindings(monkeypatch):
     """Settings có SQL bật, bảng binding giả, TTL 0 để mỗi lần hỏi đọc lại bảng."""
-    import worker.container as container_module
-    import worker.services.model_binding_store as store_module
+    import worker.container.llm as container_module
+    import worker.adapters.model_binding_store as store_module
 
     _Bindings.rows = {}
     monkeypatch.setattr(store_module, "ModelBindingStore", _Bindings)
@@ -163,7 +163,7 @@ class TestBindingsFromDatabase:
         assert resolved.profile.name == "gemini-flash-lite"
 
     def test_sql_disabled_never_reads_the_table(self, monkeypatch):
-        import worker.services.model_binding_store as store_module
+        import worker.adapters.model_binding_store as store_module
 
         monkeypatch.setattr(store_module, "ModelBindingStore", MagicMock(side_effect=AssertionError))
         build_model_registry(WorkerSettings()).resolve("enrichment")
@@ -171,7 +171,7 @@ class TestBindingsFromDatabase:
 
 class TestModelChangeWithoutRestart:
     def test_task_roles_follow_the_table_between_jobs(self, db_bindings):
-        from worker.container import TaskRoles
+        from worker.container.llm import TaskRoles
 
         roles = TaskRoles(build_model_registry(db_bindings))
         first = roles.role("enrichment")
@@ -181,14 +181,14 @@ class TestModelChangeWithoutRestart:
         assert (first.profile, second.profile) == ("gemini-flash-lite", "gemini-pro")
 
     def test_same_profile_reuses_one_client(self, db_bindings):
-        from worker.container import TaskRoles
+        from worker.container.llm import TaskRoles
 
         roles = TaskRoles(build_model_registry(db_bindings))
 
         assert roles.role("enrichment").client is roles.role("enrichment").client
 
     def test_grading_container_picks_up_a_new_judge(self, db_bindings):
-        from worker.container import AnswerGradingContainer
+        from worker.container.answer_grading import AnswerGradingContainer
 
         container = AnswerGradingContainer(db_bindings)
         before = container.grade_short_answers_use_case._grader.profile
@@ -199,7 +199,7 @@ class TestModelChangeWithoutRestart:
         container.close()
 
     def test_quiz_container_builds_each_job_with_current_writer_and_judge(self, db_bindings):
-        from worker.container import CurriculumQuizContainer
+        from worker.container.content_generation import CurriculumQuizContainer
 
         container = CurriculumQuizContainer(db_bindings)
         _Bindings.rows = {"quiz_generation": "gemini-pro", "quiz_verification": "deepseek-chat"}
@@ -210,7 +210,7 @@ class TestModelChangeWithoutRestart:
         container.close()
 
     def test_enrichment_container_rebuilds_with_the_new_model(self, db_bindings):
-        from worker.container import EnrichmentWorkerContainer
+        from worker.container.enrichment import EnrichmentWorkerContainer
 
         container = EnrichmentWorkerContainer(db_bindings)
         _Bindings.rows = {"enrichment": "deepseek-chat"}

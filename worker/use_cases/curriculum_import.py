@@ -29,11 +29,8 @@ from document_chunk.domain.entities.curriculum import Curriculum, SourceRef
 from document_chunk.domain.exceptions import DocumentStaleError
 from document_chunk.shared.logger import get_logger
 
-from worker.services.result_publisher import (
-    CURRICULUM_IMPORT_RESULT,
-    InvalidWorkerResult,
-    make_result_id,
-)
+from worker.adapters.result_publisher import InvalidWorkerResult
+from worker.reporters.curriculum_import import CurriculumImportReporter
 
 logger = get_logger(__name__)
 
@@ -44,7 +41,6 @@ CURRICULUM_JOB_NAMES = frozenset(
     {CURRICULUM_PREVIEW_JOB, LEGACY_CURRICULUM_APPLY_JOB, COURSE_CHUNK_LO_REMAP_REQUESTED}
 )
 
-_MAX_ERROR_CHARS = 2000
 # Job xếp trước khi đổi luồng chỉ mang import_id; worker không còn đọc
 # curriculum_imports để lấy phần còn lại.
 _LEGACY_PREVIEW_ERROR = (
@@ -306,7 +302,7 @@ class CurriculumImportUseCase:
         map_chunks_to_los_use_case,
         course_documents,
     ) -> None:
-        self._publisher = publisher
+        self._report = CurriculumImportReporter(publisher)
         self._file_storage = file_storage
         self._ingest = ingest_curriculum_use_case
         self._map_chunks_to_los = map_chunks_to_los_use_case
@@ -354,13 +350,7 @@ class CurriculumImportUseCase:
                 raise result.error
             curriculum: Curriculum = result.unwrap()
             preview = curriculum_preview(curriculum)
-            payload = {
-                "import_id": import_id,
-                "status": "BLOCKED" if preview["blocking"] else "READY",
-                "preview": preview,
-                "curriculum": curriculum_payload(curriculum),
-                "error": None,
-            }
+            full = curriculum_payload(curriculum)
         except Exception as exc:  # noqa: BLE001 -- lỗi parse là kết quả FAILED, không phải job lỗi
             logger.exception(
                 "curriculum_import.preview.failed",
@@ -373,11 +363,7 @@ class CurriculumImportUseCase:
         # Lỗi gửi (Redis) để nổi lên: job gốc fail và BullMQ chạy lại; parse lại
         # cho cùng kết quả và cùng result_id nên không sinh bản trùng.
         try:
-            self._publisher.publish_sync(
-                CURRICULUM_IMPORT_RESULT,
-                payload,
-                result_id=make_result_id(CURRICULUM_IMPORT_RESULT, import_id),
-            )
+            status = self._report.preview(import_id, preview, full)
         except InvalidWorkerResult as exc:
             # Đề cương không đóng gói được thành JSON (ví dụ trọng số NaN): chạy
             # lại cũng vậy, nên báo FAILED thay vì để lần nạp treo ở QUEUED.
@@ -387,11 +373,11 @@ class CurriculumImportUseCase:
             "curriculum_import.preview.done",
             import_id=import_id,
             course_id=job.course_id,
-            status=payload["status"],
+            status=status,
             **preview["counts"],
             issues=len(preview["issues"]),
         )
-        return {"import_id": import_id, "status": payload["status"], **preview["counts"]}
+        return {"import_id": import_id, "status": status, **preview["counts"]}
 
     def reject_legacy_apply(self, data: Mapping[str, Any]) -> dict[str, Any]:
         import_id = _uuid_field(data, "import_id")
@@ -401,17 +387,7 @@ class CurriculumImportUseCase:
     def _publish_failure(
         self, import_id: str, error: str, *, attempt: str | None = None
     ) -> dict[str, Any]:
-        self._publisher.publish_sync(
-            CURRICULUM_IMPORT_RESULT,
-            {
-                "import_id": import_id,
-                "status": "FAILED",
-                "preview": None,
-                "curriculum": None,
-                "error": error[:_MAX_ERROR_CHARS],
-            },
-            result_id=make_result_id(CURRICULUM_IMPORT_RESULT, import_id, attempt),
-        )
+        self._report.failure(import_id, error, attempt=attempt)
         return {"import_id": import_id, "status": "FAILED"}
 
     # ------------------------------------------------------------------

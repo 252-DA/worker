@@ -8,15 +8,20 @@ from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.shared.result import Err, Ok
 from tests.support import RecordingResultPublisher
 from tests.unit.grading_contract import FakeBullJob, assert_matches_contract, new_id
-from worker.llm_role import LlmRole
 from worker.runners.answer_grading_worker import parse_micro_content_grading_job, process_grading_job
 from worker.use_cases.grade_micro_content_answers import (
     GradeMicroContentAnswersRequest,
     GradeMicroContentAnswersUseCase,
-    REVIEW_FEEDBACK,
-    _GradePayload,
 )
-from worker.use_cases.grade_short_answers import LEGACY_COMMAND, MODEL_ERROR, AnswerToGrade, _PointVerdict
+from worker.use_cases.shared.llm_role import LlmRole
+from worker.use_cases.shared.rubric_grading import (
+    LEGACY_COMMAND,
+    MODEL_ERROR,
+    REVIEW_FEEDBACK,
+    AnswerToGrade,
+    GradePayload,
+    PointVerdict,
+)
 
 EVENT, ATTEMPT, COURSE, MICRO, ANSWER_ID = new_id(), new_id(), new_id(), new_id(), new_id()
 GRADING_INPUT = {
@@ -65,10 +70,10 @@ def test_grades_micro_content_answer_successfully():
     grader = MagicMock()
     grader.client.model_id = "test-model"
     use_case = GradeMicroContentAnswersUseCase(metadata_store=_store(), grader=grader)
-    payload = _GradePayload(
+    payload = GradePayload(
         points=[
-            _PointVerdict(index=0, met=True, comment="Ý 1 đúng"),
-            _PointVerdict(index=1, met=True, comment="Ý 2 đúng"),
+            PointVerdict(index=0, met=True, comment="Ý 1 đúng"),
+            PointVerdict(index=1, met=True, comment="Ý 2 đúng"),
         ],
         feedback="Bài làm chính xác.",
     )

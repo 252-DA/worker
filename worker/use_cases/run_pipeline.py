@@ -29,7 +29,7 @@ from document_chunk.shared.metrics import ACTIVE_REQUESTS
 from document_chunk.shared.result import Err, Ok, Result
 from document_chunk.shared.tracing import get_tracer
 
-from worker.services.document_reporter import (
+from worker.reporters.document_processing import (
     STAGE_PROCESSING,
     PublishingDocumentStatusReporter,
 )

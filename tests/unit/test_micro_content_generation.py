@@ -15,9 +15,8 @@ from document_chunk.domain.ports.metadata_store import (
     StoredLearningOutcome,
 )
 from document_chunk.shared.result import Ok
-from worker.llm_role import LlmRole
 from worker.runners.content_generation_worker import _process_job
-from worker.services.micro_content_subtitles import normalize_for_tts
+from worker.services.video.micro_content_subtitles import normalize_for_tts
 from worker.use_cases.generate_micro_outline import (
     GenerateMicroOutlineRequest,
     GenerateMicroOutlineUseCase,
@@ -30,6 +29,7 @@ from worker.use_cases.generate_video_script import (
     GenerateVideoScriptRequest,
     GenerateVideoScriptUseCase,
 )
+from worker.use_cases.shared.llm_role import LlmRole
 
 from tests.support import RecordingResultPublisher, as_llm_client, assert_store_made_no_writes
 
@@ -457,8 +457,8 @@ async def test_content_generation_worker_micro_types_match_contract_schema():
     from worker.use_cases.generate_micro_outline import GenerateMicroOutlineResponse, OutlineSection
     from worker.use_cases.generate_micro_quiz import GenerateMicroQuizResponse
     from worker.use_cases.generate_video_script import GenerateVideoScriptResponse
-    from worker.use_cases.generated_content import GeneratedQuizItem
-    from worker.use_cases.verification import Verification
+    from worker.use_cases.shared.generated_content import GeneratedQuizItem
+    from worker.use_cases.shared.verification import Verification
 
     # 1. micro_outline
     c1 = MagicMock()

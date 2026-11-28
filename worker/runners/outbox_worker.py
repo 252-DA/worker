@@ -13,7 +13,7 @@ from document_chunk.domain.ports.job_queue import OUTBOX_RELAY_QUEUE_NAME
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
-from worker.container import build_outbox_container
+from worker.container.outbox import build_outbox_container
 from worker.runtime import (
     build_redis_options,
     install_signal_handlers,

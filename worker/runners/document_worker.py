@@ -15,7 +15,8 @@ from document_chunk.domain.ports.metadata_store import IngestionStatus
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
-from worker.container import build_document_container
+from worker.container.document import build_document_container
+from worker.runners.bullmq_jobs import job_attempt
 from worker.runtime import (
     build_redis_options,
     install_signal_handlers,
@@ -25,7 +26,6 @@ from worker.runtime import (
 )
 from document_chunk.application.use_cases.map_chunks_to_los import MapChunksToLosRequest
 
-from worker.services.document_reporter import job_attempt
 from worker.services.processing_generation import newer_generation
 from worker.use_cases.curriculum_import import CURRICULUM_JOB_NAMES, InvalidCurriculumJob
 from worker.use_cases.run_pipeline import RunPipelineRequest

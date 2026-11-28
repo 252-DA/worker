@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from worker.use_cases.verification import Verification
+from worker.use_cases.shared.verification import Verification
 
 # Lý do loại là văn bản của judge; chỉ cần đủ để đọc lướt ở kết quả.
 _MAX_REJECT_REASON_CHARS = 300

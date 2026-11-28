@@ -6,7 +6,6 @@ import pytest
 
 from document_chunk.domain.ports.course_knowledge_store import KnowledgeChunk
 from document_chunk.shared.result import Err, Ok
-from worker.llm_role import LlmRole
 from worker.prompts import relations as prompts
 from worker.use_cases.extract_relations import (
     ExtractRelationsRequest,
@@ -15,6 +14,7 @@ from worker.use_cases.extract_relations import (
     _RawRelation,
     clean_relations,
 )
+from worker.use_cases.shared.llm_role import LlmRole
 
 TEXT_A = (
     "Deadlock xảy ra khi bốn điều kiện cùng đúng. Điều kiện giữ và chờ (hold and wait) "
