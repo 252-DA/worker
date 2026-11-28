@@ -31,8 +31,8 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import relations as prompts
+from worker.use_cases.shared.llm_role import LlmRole
 
 logger = get_logger(__name__)
 

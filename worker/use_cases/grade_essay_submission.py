@@ -31,10 +31,10 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import essay_grading as prompts
 from worker.services.essay_text import UnsupportedAsset, extract_text
-from worker.use_cases.grading_verdicts import MalformedGrade, check_verdict_indices
+from worker.use_cases.shared.grading_verdicts import MalformedGrade, check_verdict_indices
+from worker.use_cases.shared.llm_role import LlmRole
 
 logger = get_logger(__name__)
 

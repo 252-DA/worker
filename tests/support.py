@@ -34,7 +34,7 @@ class RecordingResultPublisher:
         self.fail_with = fail_with
 
     def publish_sync(self, kind, payload, *, result_id, source_event_id=None, occurred_at=None) -> str:
-        from worker.services.result_publisher import build_envelope
+        from worker.adapters.result_publisher import build_envelope
 
         envelope = build_envelope(
             kind, payload, result_id=result_id,

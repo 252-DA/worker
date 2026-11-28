@@ -27,10 +27,10 @@ from document_chunk.domain.ports.metadata_store import (
     StoredLearningOutcome,
 )
 from document_chunk.shared.result import Err, Ok
-from worker.runners.content_generation_worker import ContentGenerationJob, _video_script_request
+from worker.runners.content_generation_jobs import ContentGenerationJob, video_script_request
 from worker.runners.micro_content_video_worker import parse_render_job
-from worker.services.micro_content_subtitles import SubtitleCue, build_webvtt_and_timeline
-from worker.services.slide_generator import SlideGenerator, render_pdf_slide_page
+from worker.services.video.micro_content_subtitles import SubtitleCue, build_webvtt_and_timeline
+from worker.services.video.slide_generator import SlideGenerator, render_pdf_slide_page
 from worker.use_cases.generate_micro_outline import GenerateMicroOutlineRequest, GenerateMicroOutlineUseCase
 from worker.use_cases.generate_micro_quiz import (
     GenerateMicroQuizRequest,
@@ -367,7 +367,7 @@ def test_video_script_request_extracts_instructor_prompt_from_scope():
             "low_text": True,
         },
     )
-    req = _video_script_request(job)
+    req = video_script_request(job)
     assert req.instructor_prompt == "Tập trung ví dụ thực tế"
     assert req.low_text is True
 

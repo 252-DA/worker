@@ -2,7 +2,7 @@
 GenerateMicroQuizUseCase — sinh 2–4 câu hỏi củng cố cho một micro-content (B5).
 
 Tái sử dụng hoàn toàn prompt sinh/chấm/sửa câu hỏi, bảng schema theo kiểu câu,
-``_answer_layout`` / ``_answer_key_problem`` và vòng ``verify_and_refine`` của
+``answer_layout`` / ``answer_key_problem`` và vòng ``verify_and_refine`` của
 ``GenerateCurriculumQuizUseCase``, nhưng thu hẹp nguồn vào đúng dải trang
 [source_page_from, source_page_to] (kèm kịch bản video nếu đã có).
 """
@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from document_chunk.application.services.answer_layout import balanced_positions
 from document_chunk.application.services.structured_output import generate_structured_payload
 from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.domain.ports.llm_client import ILLMClient, LLMUsage
@@ -21,25 +22,23 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredChu
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import micro_content as micro_prompts
-from worker.use_cases._chunk_text import (
+from worker.use_cases.shared.chunk_text import (
     filter_chunks_in_page_range,
     format_chunk_with_heading,
     resolve_course_title,
 )
-from worker.use_cases.generate_curriculum_quiz import (
-    _QUESTION_MODELS,
-    _CurriculumQuizPayload,
-    _QuestionBase,
-    _QuestionVerdict,
-    _QuizVerificationPayload,
-    _answer_key_problem,
-    _answer_layout,
-    balanced_positions,
+from worker.use_cases.shared.generated_content import GeneratedQuizItem, RejectedDraft
+from worker.use_cases.shared.llm_role import LlmRole
+from worker.use_cases.shared.quiz_schema import (
+    QUESTION_MODELS,
+    CurriculumQuizPayload,
+    QuestionBase,
+    QuizVerificationPayload,
+    answer_key_problem,
+    answer_layout,
 )
-from worker.use_cases.generated_content import GeneratedQuizItem, RejectedDraft
-from worker.use_cases.verification import (
+from worker.use_cases.shared.verification import (
     JudgeVerdict,
     RefineResult,
     collect_verdicts,
@@ -136,7 +135,7 @@ class GenerateMicroQuizResponse:
 
 
 def _allocate_counts(total: int, question_types: tuple[str, ...]) -> list[tuple[str, int]]:
-    valid_types = [t for t in question_types if t in _QUESTION_MODELS]
+    valid_types = [t for t in question_types if t in QUESTION_MODELS]
     if not valid_types:
         valid_types = list(DEFAULT_MICRO_QUIZ_TYPES)
     n = len(valid_types)
@@ -188,8 +187,8 @@ class GenerateMicroQuizUseCase:
         judge_model = self._verifier.client.model_id
 
         for question_type, sub_count in _allocate_counts(count, request.question_types):
-            question_model, schema_name = _QUESTION_MODELS[question_type]
-            payload_model = _CurriculumQuizPayload[question_model]  # type: ignore[valid-type]
+            question_model, schema_name = QUESTION_MODELS[question_type]
+            payload_model = CurriculumQuizPayload[question_model]  # type: ignore[valid-type]
 
             gen_prompt = micro_prompts.micro_quiz_generation(
                 course_title=course_title,
@@ -226,7 +225,7 @@ class GenerateMicroQuizUseCase:
             if gen_res.is_err():
                 return Err(gen_res.error)
 
-            raw_questions: list[_QuestionBase] = list(gen_res.unwrap().questions[:sub_count])
+            raw_questions: list[QuestionBase] = list(gen_res.unwrap().questions[:sub_count])
             refined = self._verify_and_refine(
                 questions=raw_questions,
                 context_parts=context_parts,
@@ -257,12 +256,12 @@ class GenerateMicroQuizUseCase:
                 if qid in seen_ids:
                     continue
                 valid_cids = tuple(c for c in q.source_chunk_ids if c in source_chunk_ids)
-                choices, correct_index, correct_answer = _answer_layout(
+                choices, correct_index, correct_answer = answer_layout(
                     q, question_type, seed=qid, target_index=targets[idx]
                 )
                 if correct_answer is None and 0 <= correct_index < len(choices):
                     correct_answer = choices[correct_index]
-                problem = _answer_key_problem(question_type, q.question, choices, correct_answer)
+                problem = answer_key_problem(question_type, q.question, choices, correct_answer)
                 if problem is not None:
                     all_rejected.append(
                         RejectedDraft(
@@ -400,16 +399,16 @@ class GenerateMicroQuizUseCase:
     def _verify_and_refine(
         self,
         *,
-        questions: list[_QuestionBase],
+        questions: list[QuestionBase],
         context_parts: list[str],
         page_from: int = 1,
         page_to: int = 1,
         trace_id: str,
         course_id: str,
         question_type: str,
-        schema: tuple[type[_QuestionBase], str],
-    ) -> RefineResult[_QuestionBase]:
-        def judge(current: list[_QuestionBase]) -> dict[int, JudgeVerdict] | None:
+        schema: tuple[type[QuestionBase], str],
+    ) -> RefineResult[QuestionBase]:
+        def judge(current: list[QuestionBase]) -> dict[int, JudgeVerdict] | None:
             prompt = micro_prompts.micro_quiz_verification(
                 page_from=page_from,
                 page_to=page_to,
@@ -423,7 +422,7 @@ class GenerateMicroQuizUseCase:
                 llm_client=self._verifier.client,
                 prompt=prompt.user,
                 system=prompt.system,
-                schema_model=_QuizVerificationPayload,
+                schema_model=QuizVerificationPayload,
                 repair_schema_name="MicroQuizVerification",
                 on_usage=usage,
             )
@@ -442,7 +441,7 @@ class GenerateMicroQuizUseCase:
                 (v.question_index, v.verdict, v.reason) for v in res.unwrap().verdicts
             )
 
-        def regenerate(original: _QuestionBase, reason: str) -> _QuestionBase | None:
+        def regenerate(original: QuestionBase, reason: str) -> QuestionBase | None:
             prompt = micro_prompts.micro_quiz_regeneration(
                 page_from=page_from,
                 page_to=page_to,

@@ -100,7 +100,7 @@ class HealthServer:
                         target_scenes = int(data.get("target_scenes") or 5)
                         topic = data.get("topic")
 
-                        from worker.services.pdf_script_extractor import extract_script_from_pdf
+                        from worker.services.video.pdf_script_extractor import extract_script_from_pdf
 
                         result = extract_script_from_pdf(
                             pdf_bytes=pdf_bytes,
@@ -133,7 +133,7 @@ class HealthServer:
                         text = data.get("text") or default_sample
 
                         import asyncio
-                        from worker.services.tts_client import get_default_tts_client
+                        from worker.services.video.tts_client import get_default_tts_client
 
                         tts = get_default_tts_client()
                         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:

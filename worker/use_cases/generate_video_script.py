@@ -27,16 +27,16 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore, StoredChu
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import micro_content as prompts
 from worker.prompts._common import lo_line
-from worker.use_cases._chunk_text import (
+from worker.use_cases.shared.chunk_text import (
     filter_chunks_in_page_range,
     format_page_chunks_text,
     resolve_course_title,
 )
-from worker.use_cases.generated_content import RejectedDraft
-from worker.use_cases.verification import (
+from worker.use_cases.shared.generated_content import RejectedDraft
+from worker.use_cases.shared.llm_role import LlmRole
+from worker.use_cases.shared.verification import (
     FLAGGED,
     JudgeVerdict,
     collect_verdicts,

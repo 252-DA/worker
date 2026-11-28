@@ -7,19 +7,16 @@ câu (micro-content-attempt.service.ts). Chấm đúng như tự luận ngắn c
 MICRO_CONTENT_GRADING_RESULT, core-api ghi điểm câu và tính lại điểm lượt nộp
 (submissionScore — không còn round() của Python làm tròn về số chẵn).
 """
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 from document_chunk.shared.logger import get_logger
 
-from worker.use_cases.grade_short_answers import (
-    REVIEW_FEEDBACK,
+from worker.use_cases.shared.rubric_grading import (
     AnswerGrade,
     AnswerToGrade,
     GradingOutcome,
     RubricAnswerGrader,
-    _GradePayload,
 )
 
 logger = get_logger(__name__)
@@ -65,22 +62,7 @@ class GradeMicroContentAnswersUseCase(RubricAnswerGrader):
         return outcome
 
 
-def micro_content_result_payload(
-    request: GradeMicroContentAnswersRequest, grades: Sequence[AnswerGrade]
-) -> dict[str, Any]:
-    """Payload MICRO_CONTENT_GRADING_RESULT (contracts/integration-events/v1/micro-content-grading-result.json)."""
-    return {
-        "attempt_id": request.attempt_id,
-        "course_id": request.course_id,
-        "micro_content_id": request.micro_content_id,
-        "answers": [grade.to_payload("answer_id") for grade in grades],
-    }
-
-
 __all__ = [
-    "REVIEW_FEEDBACK",
     "GradeMicroContentAnswersRequest",
     "GradeMicroContentAnswersUseCase",
-    "_GradePayload",
-    "micro_content_result_payload",
 ]

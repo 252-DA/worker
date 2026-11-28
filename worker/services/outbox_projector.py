@@ -17,7 +17,7 @@ from document_chunk.domain.ports.vector_store import IVectorStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.services.document_reporter import (
+from worker.reporters.document_processing import (
     STAGE_ENRICHMENT,
     PublishingDocumentStatusReporter,
 )

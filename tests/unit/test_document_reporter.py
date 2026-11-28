@@ -14,12 +14,12 @@ from document_chunk.domain.ports.metadata_store import IngestionStatus
 from document_chunk.shared.result import Err, Ok
 
 from tests.support import RecordingResultPublisher
-from worker.services.document_reporter import (
+from worker.adapters.result_publisher import InvalidWorkerResult
+from worker.reporters.document_processing import (
     PublishingDocumentChapterReporter,
     PublishingDocumentStatusReporter,
-    job_attempt,
 )
-from worker.services.result_publisher import InvalidWorkerResult
+from worker.runners.bullmq_jobs import job_attempt
 
 DOC = "019fdbaa-c096-78e5-a91a-982998d5b5b0"
 
@@ -209,7 +209,7 @@ class TestWorkerNoLongerWritesCoreTables:
 
     def test_document_container_wires_publishing_reporters(self):
         from worker.config import WorkerSettings
-        from worker.container import build_document_container
+        from worker.container.document import build_document_container
 
         container = build_document_container(WorkerSettings())
         try:
@@ -222,7 +222,7 @@ class TestWorkerNoLongerWritesCoreTables:
 
     def test_enrichment_container_wires_the_publisher(self):
         from worker.config import WorkerSettings
-        from worker.container import build_enrichment_container
+        from worker.container.enrichment import build_enrichment_container
 
         container = build_enrichment_container(WorkerSettings())
         try:
@@ -232,7 +232,7 @@ class TestWorkerNoLongerWritesCoreTables:
 
     def test_outbox_container_wires_the_publisher(self):
         from worker.config import WorkerSettings
-        from worker.container import build_outbox_container
+        from worker.container.outbox import build_outbox_container
 
         container = build_outbox_container(WorkerSettings())
         try:

@@ -21,7 +21,8 @@ from bullmq.custom_errors import UnrecoverableError
 from document_chunk.shared.logger import get_logger
 
 from worker.config import get_worker_settings
-from worker.container import build_micro_content_video_container
+from worker.container.micro_content_video import build_micro_content_video_container
+from worker.runners.bullmq_jobs import is_final_attempt
 from worker.runtime import (
     build_redis_options,
     install_signal_handlers,
@@ -37,12 +38,6 @@ from worker.use_cases.render_micro_content_video import (
 logger = get_logger(__name__)
 
 MICRO_CONTENT_VIDEO_QUEUE_NAME = "micro_content_video"
-
-
-def is_final_attempt(bull_job: Any) -> bool:
-    opts = getattr(bull_job, "opts", None) or {}
-    attempts = int(opts.get("attempts") or 1)
-    return int(getattr(bull_job, "attemptsMade", 0) or 0) + 1 >= attempts
 
 
 def _uuid_field(payload: dict, key: str) -> str:

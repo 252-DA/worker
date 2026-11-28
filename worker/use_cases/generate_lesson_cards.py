@@ -28,11 +28,11 @@ from document_chunk.domain.ports.metadata_store import IMetadataStore
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.llm_role import LlmRole
 from worker.prompts import lesson_cards as prompts
-from worker.use_cases.generated_content import GeneratedLessonCard, RejectedDraft
-from worker.use_cases.lo_context import LoContextLoader, QuizContextClient
-from worker.use_cases.verification import (
+from worker.use_cases.shared.generated_content import GeneratedLessonCard, RejectedDraft
+from worker.use_cases.shared.llm_role import LlmRole
+from worker.use_cases.shared.lo_context import LoContextLoader, QuizContextClient
+from worker.use_cases.shared.verification import (
     JudgeVerdict,
     Kept,
     collect_verdicts,

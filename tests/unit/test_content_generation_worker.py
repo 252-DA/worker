@@ -13,25 +13,25 @@ from document_chunk.domain.ports.metadata_store import (
 )
 from document_chunk.shared.result import Err, Ok
 from tests.support import RecordingResultPublisher, assert_store_made_no_writes
-from worker.runners.content_generation_worker import (
-    _card_request,
-    _parse_job,
-    _process_job,
-    _quiz_request,
-    _relations_request,
+from worker.runners.content_generation_jobs import (
+    card_request,
+    parse_job,
+    quiz_request,
+    relations_request,
 )
+from worker.runners.content_generation_worker import _process_job
 from worker.use_cases.extract_relations import ExtractRelationsResponse
 from worker.use_cases.generate_curriculum_quiz import GenerateCurriculumQuizResponse
 from worker.use_cases.generate_lesson_cards import (
     DEFAULT_CARD_COUNT,
     GenerateLessonCardsResponse,
 )
-from worker.use_cases.generated_content import (
+from worker.use_cases.shared.generated_content import (
     GeneratedLessonCard,
     GeneratedQuizItem,
     RejectedDraft,
 )
-from worker.use_cases.verification import Verification
+from worker.use_cases.shared.verification import Verification
 
 
 def _job_data():
@@ -53,8 +53,8 @@ def _job_data():
 
 
 def test_parse_job_and_scope():
-    job = _parse_job(_job_data())
-    request = _quiz_request(job)
+    job = parse_job(_job_data())
+    request = quiz_request(job)
 
     assert job.request_id == "request-1"
     assert request.target_kind == "lo"
@@ -69,7 +69,7 @@ def test_quiz_request_reads_question_type():
     data = _job_data()
     data["payload"]["scope"]["question_type"] = "FILL_BLANK"
 
-    assert _quiz_request(_parse_job(data)).question_type == "FILL_BLANK"
+    assert quiz_request(parse_job(data)).question_type == "FILL_BLANK"
 
 
 def _verification(status="VERIFIED"):
@@ -262,7 +262,7 @@ def _card_job_data(**scope):
 
 
 def test_card_request_reads_target_and_defaults_count():
-    request = _card_request(_parse_job(_card_job_data(source_document_ids=["doc-1"])))
+    request = card_request(parse_job(_card_job_data(source_document_ids=["doc-1"])))
 
     assert request.target_kind == "lo"
     assert request.target_code == "lo-uuid"
@@ -272,7 +272,7 @@ def test_card_request_reads_target_and_defaults_count():
 
 def test_card_request_rejects_count_out_of_range():
     with pytest.raises(ValueError, match="card count"):
-        _card_request(_parse_job(_card_job_data(count=50)))
+        card_request(parse_job(_card_job_data(count=50)))
 
 
 @pytest.mark.asyncio
@@ -325,7 +325,7 @@ def _relations_job_data(**scope):
 
 
 def test_relations_request_reads_documents():
-    request = _relations_request(_parse_job(_relations_job_data()))
+    request = relations_request(parse_job(_relations_job_data()))
 
     assert request.course_id == "course-1"
     assert request.document_ids == ["doc-1", "doc-2"]
@@ -336,7 +336,7 @@ def test_relations_request_needs_a_document_list(scope):
     data = _relations_job_data()
     data["payload"]["scope"] = scope
     with pytest.raises(ValueError, match="source_document_ids"):
-        _relations_request(_parse_job(data))
+        relations_request(parse_job(data))
 
 
 @pytest.mark.asyncio

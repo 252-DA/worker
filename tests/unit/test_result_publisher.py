@@ -1,5 +1,5 @@
 """
-Tests for worker/services/result_publisher.py — producer của hàng đợi worker_results.
+Tests for worker/adapters/result_publisher.py — producer của hàng đợi worker_results.
 
 Queue của bullmq được thay bằng FakeQueue; phần được thử thật là thread + event
 loop riêng của publisher, vì đó là chỗ dễ sai (deadlock, nuốt lỗi, loop sai).
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from worker.services.result_publisher import (
+from worker.adapters.result_publisher import (
     DEFAULT_JOB_OPTIONS,
     ESSAY_GRADING_RESULT,
     QUIZ_GRADING_RESULT,
@@ -396,7 +396,8 @@ def test_recording_publisher_validates_like_the_real_one():
 
 def test_container_registers_publisher_with_worker_redis_settings(monkeypatch):
     from worker.config import WorkerSettings
-    from worker.container import EnrichmentWorkerContainer, build_result_publisher
+    from worker.container.base import build_result_publisher
+    from worker.container.enrichment import EnrichmentWorkerContainer
 
     monkeypatch.setenv("REDIS__HOST", "redis.internal")
     monkeypatch.setenv("REDIS__PORT", "6390")

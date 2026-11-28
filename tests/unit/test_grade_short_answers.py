@@ -12,22 +12,21 @@ from document_chunk.domain.exceptions import ProcessingError
 from document_chunk.shared.result import Err, Ok
 from tests.support import RecordingResultPublisher
 from tests.unit.grading_contract import FakeBullJob, assert_matches_contract, new_id
-from worker.llm_role import LlmRole
 from worker.runners.answer_grading_worker import (
     PROGRESS_KEY,
-    is_final_attempt,
     parse_grading_job,
     process_grading_job,
 )
-from worker.use_cases.grade_short_answers import (
+from worker.runners.bullmq_jobs import is_final_attempt
+from worker.use_cases.grade_short_answers import GradeShortAnswersRequest, GradeShortAnswersUseCase
+from worker.use_cases.shared.llm_role import LlmRole
+from worker.use_cases.shared.rubric_grading import (
     LEGACY_COMMAND,
     MODEL_ERROR,
     NO_GRADING_INPUT,
     REVIEW_FEEDBACK,
     AnswerGrade,
     AnswerToGrade,
-    GradeShortAnswersRequest,
-    GradeShortAnswersUseCase,
 )
 
 KEY = {"model_answer": "Vì mỗi đỉnh mới cần đúng một cạnh.", "rubric": ["Ý 1", "Ý 2", "Ý 3", "Ý 4"]}

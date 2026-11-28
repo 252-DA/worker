@@ -14,36 +14,26 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from document_chunk.domain.ports.file_storage import IFileStorage
 from document_chunk.shared.logger import get_logger
 from document_chunk.shared.result import Err, Ok, Result
 
-from worker.services.manim_generator import ManimGenerator, parse_manim_visual
-from worker.services.micro_content_subtitles import (
+from worker.reporters.micro_content_video import MicroContentVideoReporter, ResultPublisher
+from worker.services.video.manim_generator import ManimGenerator, parse_manim_visual
+from worker.services.video.micro_content_subtitles import (
     SubtitleCue,
     build_webvtt_and_timeline,
     normalize_for_tts,
 )
-from worker.services.result_publisher import MICRO_CONTENT_VIDEO_RESULT, make_result_id
-from worker.services.slide_generator import SlideGenerator, render_pdf_slide_page
-from worker.services.tts_client import TtsClient, get_default_tts_client
-from worker.services.video_composer import SceneMedia, VideoComposer
+from worker.services.video.slide_generator import SlideGenerator, render_pdf_slide_page
+from worker.services.video.tts_client import TtsClient, get_default_tts_client
+from worker.services.video.video_composer import SceneMedia, VideoComposer
 
 logger = get_logger(__name__)
 
 DEFAULT_VOICE = "vi-VN-HoaiMyNeural"
-VIDEO_MIME_TYPE = "video/mp4"
-# Khớp maxLength của `error` trong micro-content-video-result.json (trước đây
-# store cắt cùng độ dài khi ghi micro_contents.video_error).
-MAX_ERROR_CHARS = 1000
-
-
-class ResultPublisher(Protocol):
-    async def publish(
-        self, kind: str, payload: dict[str, Any], *, result_id: str, source_event_id: str | None = None
-    ) -> str: ...
 
 
 class InvalidRenderRequest(ValueError):
@@ -143,6 +133,7 @@ class RenderMicroContentVideoUseCase:
         manim_generator: ManimGenerator | None = None,
     ) -> None:
         self.result_publisher = result_publisher
+        self._report = MicroContentVideoReporter(result_publisher)
         self.file_storage = file_storage
         self.tts_client = tts_client or get_default_tts_client()
         self.slide_generator = slide_generator or SlideGenerator()
@@ -363,7 +354,7 @@ class RenderMicroContentVideoUseCase:
             # Chỉ báo READY khi file đã nằm trên storage. Gửi lỗi thì nổi lên
             # thành Err: job gốc lỗi và BullMQ render lại, không hoàn tất khi
             # core-api chưa nhận được kết quả.
-            await self._publish_ready(request, response)
+            await self._report.ready(request, response)
 
             logger.info(
                 "render_micro_content_video.succeeded",
@@ -391,44 +382,4 @@ class RenderMicroContentVideoUseCase:
         Gửi FAILED cho lần render này (micro_contents.video_error hiện cho giảng
         viên). Lỗi gửi nổi lên cho người gọi: job gốc phải lỗi theo.
         """
-        message = (str(error) or type(error).__name__)[:MAX_ERROR_CHARS]
-        return await self.result_publisher.publish(
-            MICRO_CONTENT_VIDEO_RESULT,
-            {
-                "micro_content_id": request.micro_content_id,
-                "asset_id": request.asset_id,
-                "render_id": request.render_id,
-                "status": "FAILED",
-                "error": message,
-            },
-            result_id=make_result_id(MICRO_CONTENT_VIDEO_RESULT, request.render_id, "failed"),
-            source_event_id=request.source_event_id,
-        )
-
-    async def _publish_ready(
-        self, request: RenderMicroContentVideoRequest, response: RenderMicroContentVideoResponse
-    ) -> str:
-        payload: dict[str, Any] = {
-            "micro_content_id": response.micro_content_id,
-            "asset_id": response.asset_id,
-            "render_id": response.render_id,
-            "status": "READY",
-            "object_key": response.video_object_key,
-            "duration_ms": max(0, int(response.duration_seconds * 1000)),
-            "size_bytes": response.size_bytes,
-            "mime_type": VIDEO_MIME_TYPE,
-        }
-        if response.vtt_object_key:
-            payload["vtt_object_key"] = response.vtt_object_key
-        if response.transcript_text:
-            payload["transcript_text"] = response.transcript_text
-        if response.scene_timeline:
-            payload["scene_timeline"] = response.scene_timeline
-        return await self.result_publisher.publish(
-            MICRO_CONTENT_VIDEO_RESULT,
-            payload,
-            # Tất định theo lần render: job gốc retry sau khi đã gửi sinh lại
-            # đúng id, BullMQ bỏ bản trùng.
-            result_id=make_result_id(MICRO_CONTENT_VIDEO_RESULT, request.render_id, "ready"),
-            source_event_id=request.source_event_id,
-        )
+        return await self._report.failed(request, error)

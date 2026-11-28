@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from document_chunk.shared.logger import get_logger
-from worker.services.micro_content_subtitles import SubtitleCue
+from worker.services.video.micro_content_subtitles import SubtitleCue
 
 logger = get_logger(__name__)
 

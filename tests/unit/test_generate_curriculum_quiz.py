@@ -13,11 +13,11 @@ from document_chunk.domain.ports.metadata_store import (
 )
 from document_chunk.domain.ports.llm_client import LLMUsage
 from document_chunk.shared.result import Err, Ok
-from worker.llm_role import LlmRole
 from worker.use_cases.generate_curriculum_quiz import (
     GenerateCurriculumQuizRequest,
     GenerateCurriculumQuizUseCase,
 )
+from worker.use_cases.shared.llm_role import LlmRole
 
 
 class TestGenerateCurriculumQuizRequest:

@@ -1,5 +1,5 @@
 """verify_and_refine: quyết định giữ/loại và kết luận lưu vào hồ sơ kiểm chứng."""
-from worker.use_cases.verification import (
+from worker.use_cases.shared.verification import (
     FLAGGED,
     INCONCLUSIVE,
     JUDGE_FAILED,
